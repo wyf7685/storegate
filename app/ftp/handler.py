@@ -411,11 +411,13 @@ class FTPHandler:
                 await self._storage.upload_stream(dc.receive_chunks(), target, overwrite=True)
                 tg.cancel_scope.cancel()
         except* TimeoutError, OSError:
-            return reply(R_NO_DATA_CONN, "Failed to establish data connection")
+            response = reply(R_NO_DATA_CONN, "Failed to establish data connection")
+        else:
+            response = reply(R_TRANSFER_OK, "Transfer complete")
         finally:
             self._session.reset_data_state()
 
-        return reply(R_TRANSFER_OK, "Transfer complete")
+        return response
 
     async def _handle_abor(self, arg: str) -> str:
         self._abort_event.set()

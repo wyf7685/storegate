@@ -2,7 +2,7 @@ import contextlib
 import functools
 import inspect
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Sequence
 from json import JSONEncoder
 from types import CoroutineType
 from typing import TYPE_CHECKING, Any, Concatenate, Literal, cast, overload
@@ -194,3 +194,14 @@ class SecretStrEncoder(JSONEncoder):
         if isinstance(o, SecretStr):
             return o.get_secret_value()
         return super().default(o)
+
+
+async def abatched[T](ait: AsyncIterable[T], n: int) -> AsyncGenerator[Sequence[T]]:
+    batch: list[T] = []
+    async for item in aiter(ait):
+        batch.append(item)
+        if len(batch) == n:
+            yield tuple(batch)
+            batch = []
+    if batch:
+        yield tuple(batch)

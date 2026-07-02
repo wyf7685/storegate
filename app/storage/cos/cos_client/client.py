@@ -1,5 +1,5 @@
 import xml.etree.ElementTree as ET
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from datetime import datetime
 from types import TracebackType
 from typing import Literal, Self
@@ -270,6 +270,32 @@ class AsyncCosClient:
 
     async def delete_object(self, key: str) -> None:
         await self._request(method="DELETE", key=key)
+
+    async def delete_objects(self, keys: Iterable[str]) -> list[str]:
+        if not keys:
+            return []
+
+        root = ET.Element("Delete")
+        for key in keys:
+            ET.SubElement(ET.SubElement(root, "Object"), "Key").text = key
+        content = ET.tostring(root, encoding="utf-8")
+        response = await self._request(
+            method="POST",
+            key="",
+            params={"delete": ""},
+            headers={"Content-Type": "application/xml"},
+            content=content,
+        )
+
+        root = _parse_xml(response.content)
+        if error_nodes := root.findall(".//Error"):
+            errors: list[str] = []
+            for error_node in error_nodes:
+                code = _find_required_text(error_node, "Code")
+                message = _find_required_text(error_node, "Message")
+                errors.append(f"{code}: {message}")
+            raise CosResponseParseError(f"Failed to delete objects: {", ".join(errors)}")
+        return [_find_required_text(deleted_node, "Key") for deleted_node in root.findall(".//Deleted")]
 
     async def get_presigned_url(self, key: str, method: str, expired: int) -> str:
         query: dict[str, str] = {}

@@ -18,7 +18,7 @@ def format_list_line(info: FileInfo) -> str:
         else modified.strftime("%b %d  %Y")
     )
 
-    return f"{mode}{perms} 1 ftp ftp {size:>12} {timestamp} {info.name}"
+    return f"{mode}{perms} 1 none none {size:>12} {timestamp} {info.name}"
 
 
 def format_list(items: list[FileInfo]) -> str:

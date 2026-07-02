@@ -92,9 +92,8 @@ class DataConnection:
 
     def detach_listener(self) -> SocketListener | None:
         """Return and relinquish the current listener for ownership transfer."""
-        result = self._listener
-        self._listener = None
-        return result
+        listener, self._listener = self._listener, None
+        return listener
 
     @classmethod
     def from_session_state(

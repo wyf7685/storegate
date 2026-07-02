@@ -1,3 +1,4 @@
+import itertools
 from collections.abc import AsyncIterable, AsyncIterator
 from pathlib import PurePosixPath
 from typing import final, override
@@ -164,9 +165,10 @@ class CosStorage(AbstractStorage):
     @override
     async def rmtree(self, path: str) -> None:
         client = self._ensure_client()
+
         async for _, files in self.walk(path):
-            for file in files:
-                await client.delete_object(key=self._remote_path_to_key(file.path))
+            for batch in itertools.batched(files, 100):
+                await client.delete_objects(self._remote_path_to_key(file.path) for file in batch)
 
     @override
     async def exists(self, path: str) -> bool:
