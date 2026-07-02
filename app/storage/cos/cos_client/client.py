@@ -5,6 +5,7 @@ from types import TracebackType
 from typing import Literal, Self
 from urllib.parse import quote, urlencode
 
+import anyio.lowlevel
 import httpx
 
 from .auth import CosV5Signer
@@ -215,6 +216,7 @@ class AsyncCosClient:
             for common_prefix in root.findall(".//CommonPrefixes"):
                 prefix_text = _find_required_text(common_prefix, "Prefix")
                 yield ListObjectsDir(prefix=prefix_text)
+                await anyio.lowlevel.checkpoint()
             for contents in root.findall(".//Contents"):
                 key = _find_required_text(contents, "Key")
                 last_modified = _find_required_text(contents, "LastModified")
@@ -227,6 +229,7 @@ class AsyncCosClient:
                 yield ListObjectsItem(
                     key=key, size=size, etag=etag, last_modified=datetime.fromisoformat(last_modified)
                 )
+                await anyio.lowlevel.checkpoint()
 
             if not is_truncated:
                 break

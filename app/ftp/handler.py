@@ -1,8 +1,8 @@
 """FTP command handler — parses, dispatches, and responds to FTP commands."""
 # ruff: noqa: ARG002
 
-from collections.abc import AsyncIterable, Callable
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, ClassVar
 
 import anyio
 from anyio.abc import SocketStream
@@ -76,7 +76,7 @@ class FTPHandler:
     and processes FTP commands arriving on the control ``SocketStream``.
     """
 
-    _COMMAND_MAP: dict[str, str] = {  # noqa: RUF012
+    _COMMAND_MAP: ClassVar[dict[str, str]] = {
         "USER": "_handle_user",
         "PASS": "_handle_pass",
         "QUIT": "_handle_quit",
@@ -398,24 +398,19 @@ class FTPHandler:
 
     async def _transfer_upload(self, target: str) -> str:
         self._abort_event = anyio.Event()
+
+        async def wait_for_abort():
+            await self._abort_event.wait()
+            _logger.info("Upload aborted by client")
+            tg.cancel_scope.cancel()
+
         try:
             await self._send(reply(R_DATA_OPEN, "Opening data connection for upload"))
-            async with self._make_data_connection() as dc:
-
-                async def stream_from_client() -> AsyncIterable[bytes]:
-                    try:
-                        while True:
-                            if self._abort_event.is_set():
-                                break
-                            chunk = await dc.receive(65536)
-                            if not chunk:
-                                break
-                            yield chunk
-                    except anyio.EndOfStream:
-                        pass
-
-                await self._storage.upload_stream(stream_from_client(), target, overwrite=True)
-        except TimeoutError, OSError:
+            async with self._make_data_connection() as dc, anyio.create_task_group() as tg:
+                tg.start_soon(wait_for_abort)
+                await self._storage.upload_stream(dc.receive_chunks(), target, overwrite=True)
+                tg.cancel_scope.cancel()
+        except* TimeoutError, OSError:
             return reply(R_NO_DATA_CONN, "Failed to establish data connection")
         finally:
             self._session.reset_data_state()
