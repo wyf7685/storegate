@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from app.storage.abstract import FileInfo
+from app.storage import FileInfo
 
 
 def format_list_line(info: FileInfo) -> str:

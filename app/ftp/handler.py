@@ -8,7 +8,7 @@ import anyio
 from anyio.abc import SocketStream
 
 from app.log import logger
-from app.storage.abstract import FileInfo
+from app.storage import FileInfo
 from app.utils import logger_wrapper
 
 from .data import DataConnection
