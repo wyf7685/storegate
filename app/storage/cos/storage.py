@@ -1,14 +1,13 @@
 import contextlib
 import itertools
 from collections.abc import AsyncIterable, AsyncIterator
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import final, override
 
 import anyio
 import anyio.lowlevel
 
 from app.config import CosConfig
-from app.log import logger
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
 from app.storage.cos.cos_client.models import ListObjectsDir, MultipartUploadPart
 from app.utils import coalesce_chunks
@@ -34,6 +33,11 @@ class CosStorage(AbstractStorage):
         """Create a ``CosStorage`` from a ``CosConfig``."""
         return cls(config)
 
+    @classmethod
+    def from_file(cls, path: str | Path) -> CosStorage:
+        """Create a ``CosStorage`` from a JSON config file."""
+        return cls.from_config(CosConfig.from_file(path))
+
     @override
     @property
     def id(self) -> str:
@@ -43,13 +47,19 @@ class CosStorage(AbstractStorage):
     async def connect(self) -> None:
         self._client = create_client(self._config)
         await self._client.__aenter__()
-        await self.ping()
+        if not await self.ping():
+            raise RuntimeError("Failed to connect to COS bucket. Please check your configuration.")
+        self.log.info(
+            f"Connected to bucket <c>{self._config.bucket}</c> "
+            f"in region <c>{self._config.region}</c>"
+        )
 
     @override
     async def close(self) -> None:
         if self._client is not None:
             await self._client.__aexit__(None, None, None)
             self._client = None
+        self.log.debug("Disconnected")
 
     @override
     async def ping(self) -> bool:
@@ -89,17 +99,22 @@ class CosStorage(AbstractStorage):
 
         client = self._ensure_client()
         key = self._remote_path_to_key(remote_path)
+        self.log.info(f"Upload: <y>{key}</y>")
+
         chunk_iter = aiter(coalesce_chunks(stream))
         first_chunk = await anext(chunk_iter, None)
         if first_chunk is None:
+            self.log.debug(f"Upload: <y>{key}</y> — empty object")
             await client.put_object(key=key, data=b"")
             return
 
         second_chunk = await anext(chunk_iter, None)
         if second_chunk is None:
+            self.log.debug(f"Upload: <y>{key}</y> — single chunk (<g>{len(first_chunk)}</g> bytes)")
             await client.put_object(key=key, data=first_chunk)
             return
 
+        self.log.debug(f"Upload: <y>{key}</y> — multipart upload")
         async with (
             MultipartUploadTask.create(client, key) as task,
             anyio.create_task_group() as tg,
@@ -122,6 +137,8 @@ class CosStorage(AbstractStorage):
         total_size = head.content_length
         num_chunks = (total_size + UPLOAD_CHUNK_SIZE - 1) // UPLOAD_CHUNK_SIZE
 
+        self.log.debug(f"Download: <y>{key}</y> (<g>{total_size}</g> bytes in <g>{num_chunks}</g> chunks)")
+
         for i in range(num_chunks):
             start = i * UPLOAD_CHUNK_SIZE
             end = min(start + UPLOAD_CHUNK_SIZE - 1, total_size - 1)
@@ -132,6 +149,7 @@ class CosStorage(AbstractStorage):
     async def delete(self, path: str) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        self.log.info(f"Delete: <y>{key}</y>")
         await client.delete_object(key=key)
 
     @override
@@ -140,6 +158,9 @@ class CosStorage(AbstractStorage):
         src: str,
         dst: str,
     ) -> None:
+        src_key = self._remote_path_to_key(src)
+        dst_key = self._remote_path_to_key(dst)
+        self.log.info(f"Move: <y>{src_key}</y> → <y>{dst_key}</y>")
         await self.copy(src, dst)
         await self.delete(src)
 
@@ -158,8 +179,10 @@ class CosStorage(AbstractStorage):
             raise FileNotFoundError(f"Source not found: {src}")
 
         if head.content_length <= COPY_MULTIPART_THRESHOLD:
+            self.log.debug(f"Copy: <y>{src_key}</y> → <y>{dst_key}</y> (PUT Object - Copy)")
             await client.put_object_copy(src_key, dst_key)
         else:
+            self.log.debug(f"Copy: <y>{src_key}</y> → <y>{dst_key}</y> (multipart copy)")
             await self._copy_multipart(src_key, dst_key, head.content_length)
 
     @override
@@ -170,19 +193,28 @@ class CosStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
-        logger.debug(f"COS is flat — skipping mkdir for '{path}'")
+        self.log.debug(
+            f"COS is flat — skipping mkdir for <y>{self._remote_path_to_key(path)}</y>"
+        )
 
     @override
     async def rmtree(self, path: str) -> None:
         client = self._ensure_client()
+        key = self._remote_path_to_key(path)
+        self.log.info(f"RmTree: <y>{key}</y>")
 
+        deleted = 0
         async for _, _, files in self.walk(path):
             for batch in itertools.batched(files, 100):
                 await client.delete_objects(self._remote_path_to_key(file.path) for file in batch)
+                deleted += len(batch)
 
         # Also delete the object at the path itself (COS "directory marker" object).
         if await self.is_file(path):
-            await client.delete_object(self._remote_path_to_key(path))
+            await client.delete_object(key)
+            deleted += 1
+
+        self.log.info(f"RmTree complete: <y>{key}</y> (<g>{deleted}</g> objects deleted)")
 
     @override
     async def exists(self, path: str) -> bool:
@@ -196,9 +228,12 @@ class CosStorage(AbstractStorage):
 
     @override
     async def is_dir(self, path: str) -> bool:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
-        prefix = (key + "/") if key else None
+        # Root of a bucket is always a valid "directory".
+        if key == "":
+            return True
+        client = self._ensure_client()
+        prefix = key + "/"
         async for _ in client.list_objects(prefix=prefix, delimiter="/", max_keys=1):
             return True
         return False
@@ -271,6 +306,12 @@ class CosStorage(AbstractStorage):
     async def _copy_multipart(self, src_key: str, dst_key: str, src_size: int) -> None:
         """Server-side copy via multipart upload for objects above the threshold."""
         client = self._ensure_client()
+        num_parts = (src_size + UPLOAD_CHUNK_SIZE - 1) // UPLOAD_CHUNK_SIZE
+        self.log.debug(
+            f"Multipart copy: <y>{src_key}</y> → <y>{dst_key}</y> "
+            f"(<g>{src_size}</g> bytes in <g>{num_parts}</g> parts)"
+        )
+
         upload_id = await client.create_multipart_upload(dst_key)
 
         try:
@@ -293,6 +334,7 @@ class CosStorage(AbstractStorage):
                 await anyio.lowlevel.checkpoint()
 
             await client.complete_multipart_upload(dst_key, upload_id, parts)
+            self.log.debug(f"Multipart copy complete: <y>{dst_key}</y>")
         except Exception:
             with contextlib.suppress(Exception):
                 await client.abort_multipart_upload(dst_key, upload_id)

@@ -147,7 +147,10 @@ class _DataStreamReader:
         return self
 
     async def __anext__(self) -> bytes:
-        chunk = await self._stream.receive(self._chunk_size)
+        try:
+            chunk = await self._stream.receive(self._chunk_size)
+        except anyio.EndOfStream:
+            raise StopAsyncIteration from None
         if not chunk:
             raise StopAsyncIteration
         await anyio.lowlevel.checkpoint()
@@ -157,6 +160,12 @@ class _DataStreamReader:
 async def read_all_from_stream(stream: SocketStream, chunk_size: int = 65536) -> bytearray:
     """Read all data from a socket stream into a bytearray."""
     buf = bytearray()
-    while chunk := await stream.receive(chunk_size):
+    while True:
+        try:
+            chunk = await stream.receive(chunk_size)
+        except anyio.EndOfStream:
+            break
+        if not chunk:
+            break
         buf.extend(chunk)
     return buf

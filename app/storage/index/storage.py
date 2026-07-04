@@ -256,28 +256,29 @@ class IndexStorage(AbstractStorage):
                             if current_chunk_size < self._block_size:
                                 current_chunk_hash.update(chunk)
                                 await c_send.send(chunk)
-                            else:
-                                chunk = memoryview(chunk)
-                                remaining = self._block_size - (current_chunk_size - len(chunk))
-                                current_chunk_hash.update(chunk[:remaining])
-                                await c_send.send(chunk[:remaining])
-                                chunk_hash = current_chunk_hash.hexdigest()
-                                chunk_hashes.append(chunk_hash)
-                                chunk_index += 1
-                                await chunk_lock.enter_async_context(self._lock_chunk(chunk_hash))
-                                await c_send.send(chunk_hash)
-                                c_send.close()
-                                self.log.debug(
-                                    f"Chunk #{chunk_index} <c>{chunk_hash[:8]}</c> "
-                                    f"complete for {_colored_path}"
-                                    f" (<g>{self._block_size}</g> bytes)"
-                                )
-                                current_chunk_size = len(chunk) - remaining
-                                current_chunk_hash = hashlib.sha256()
-                                current_chunk_hash.update(chunk[remaining:])
-                                c_send, c_recv = anyio.create_memory_object_stream[str | BytesLike](4)
-                                tg.start_soon(stream_chunk, chunk_index + 1, c_recv)
-                                await c_send.send(chunk[remaining:])
+                                continue
+                            chunk = memoryview(chunk)
+                            remaining = self._block_size - (current_chunk_size - len(chunk))
+                            current_chunk_hash.update(chunk[:remaining])
+                            await c_send.send(chunk[:remaining])
+                            chunk_hash = current_chunk_hash.hexdigest()
+                            chunk_hashes.append(chunk_hash)
+                            chunk_index += 1
+                            await chunk_lock.enter_async_context(self._lock_chunk(chunk_hash))
+                            await c_send.send(chunk_hash)
+                            c_send.close()
+                            self.log.debug(
+                                f"Chunk #{chunk_index} <c>{chunk_hash[:8]}</c> "
+                                f"complete for {_colored_path}"
+                                f" (<g>{self._block_size}</g> bytes)"
+                            )
+                            current_chunk_size = len(chunk) - remaining
+                            current_chunk_hash = hashlib.sha256()
+                            current_chunk_hash.update(chunk[remaining:])
+                            c_send, c_recv = anyio.create_memory_object_stream[str | BytesLike](4)
+                            tg.start_soon(stream_chunk, chunk_index + 1, c_recv)
+                            await c_send.send(chunk[remaining:])
+
                         if current_chunk_size > 0:
                             chunk_hash = current_chunk_hash.hexdigest()
                             chunk_hashes.append(chunk_hash)

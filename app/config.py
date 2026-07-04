@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from pydantic import BaseModel, SecretStr
 
@@ -12,6 +13,10 @@ class CosConfig(BaseModel):
     region: str
     bucket: str
     is_internal: bool
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> CosConfig:
+        return cls.model_validate_json(Path(path).read_bytes())
 
 
 class Config(BaseModel):
