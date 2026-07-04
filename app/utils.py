@@ -2,7 +2,7 @@ import contextlib
 import functools
 import inspect
 import threading
-from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from json import JSONEncoder
 from types import CoroutineType
 from typing import TYPE_CHECKING, Any, Concatenate, Literal, cast, overload
@@ -10,7 +10,9 @@ from typing import TYPE_CHECKING, Any, Concatenate, Literal, cast, overload
 import anyio
 from pydantic import SecretStr
 
-from .log import escape_tag, logger
+from app.const import DEFAULT_CHUNK_SIZE
+
+from .log import logger
 
 type Supplier[T] = Callable[[], T]
 type Decorator[
@@ -46,7 +48,7 @@ type _LogException = Exception | bool | None
 class LoggerWrapper:
     def __init__(self, logger_name: str) -> None:
         self.logger = logger.patch(lambda r: r.update(name="app"))
-        self.logger_name = escape_tag(logger_name)
+        self.logger_name = logger_name
 
     def log(
         self,
@@ -205,3 +207,22 @@ async def abatched[T](ait: AsyncIterable[T], n: int) -> AsyncGenerator[Sequence[
             batch = []
     if batch:
         yield tuple(batch)
+
+
+async def coalesce_chunks(
+    aiterable: AsyncIterable[Iterable[int]],
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> AsyncIterator[bytes]:
+    buffer = bytearray()
+
+    async for chunk in aiterable:
+        if not chunk:
+            continue
+
+        buffer.extend(chunk)
+        while len(buffer) >= chunk_size:
+            yield bytes(buffer[:chunk_size])
+            del buffer[:chunk_size]
+
+    if buffer:
+        yield bytes(buffer)

@@ -1,3 +1,4 @@
+import functools
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass
@@ -6,7 +7,11 @@ from pathlib import Path
 from typing import Self
 
 import anyio
+import anyio.lowlevel
 import ayafileio
+
+from app.log import escape_tag
+from app.utils import LoggerWrapper, logger_wrapper
 
 
 @dataclass(slots=True, frozen=True)
@@ -24,6 +29,16 @@ type BytesLike = bytes | bytearray | memoryview
 
 class AbstractStorage(ABC):
     """Abstract storage interface."""
+
+    @functools.cached_property
+    def log(self) -> LoggerWrapper:
+        return logger_wrapper(f"{self.__class__.__name__} <c><i>{escape_tag(self.id)}</></>")
+
+    @property
+    @abstractmethod
+    def id(self) -> str:
+        """Return a unique identifier for this storage instance."""
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -57,17 +72,6 @@ class AbstractStorage(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def upload_bytes(
-        self,
-        data: BytesLike,
-        remote_path: str,
-        *,
-        overwrite: bool = True,
-    ) -> None:
-        """Upload bytes."""
-        raise NotImplementedError
-
-    @abstractmethod
     async def upload_stream(
         self,
         stream: AsyncIterable[BytesLike],
@@ -77,6 +81,25 @@ class AbstractStorage(ABC):
     ) -> None:
         """Upload from a binary stream."""
         raise NotImplementedError
+
+    async def upload_bytes(
+        self,
+        data: BytesLike,
+        remote_path: str,
+        *,
+        overwrite: bool = True,
+    ) -> None:
+        """Upload bytes."""
+        buf = memoryview(data).toreadonly()
+
+        async def aiterable() -> AsyncIterable[memoryview[int]]:
+            ptr = 0
+            while ptr < len(buf):
+                yield buf[ptr : ptr + 8192]
+                ptr += 8192
+                await anyio.lowlevel.checkpoint()
+
+        await self.upload_stream(aiterable(), remote_path, overwrite=overwrite)
 
     async def upload_file(
         self,
@@ -95,14 +118,6 @@ class AbstractStorage(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def download_bytes(
-        self,
-        remote_path: str,
-    ) -> bytes:
-        """Download as bytes."""
-        raise NotImplementedError
-
-    @abstractmethod
     async def download_stream(
         self,
         remote_path: str,
@@ -110,6 +125,16 @@ class AbstractStorage(ABC):
         """Download as an async byte stream."""
         raise NotImplementedError
         yield
+
+    async def download_bytes(
+        self,
+        remote_path: str,
+    ) -> bytes:
+        """Download as bytes."""
+        buffer = bytearray()
+        async for chunk in self.download_stream(remote_path):
+            buffer.extend(chunk)
+        return bytes(buffer)
 
     async def download_file(
         self,
@@ -201,10 +226,9 @@ class AbstractStorage(ABC):
     # Listing
     # ------------------------------------------------------------------
 
-    @abstractmethod
     async def list_(self, path: str) -> list[FileInfo]:
         """List directory."""
-        raise NotImplementedError
+        return [item async for item in self.iterdir(path)]
 
     @abstractmethod
     async def iterdir(self, path: str) -> AsyncIterator[FileInfo]:
@@ -213,7 +237,7 @@ class AbstractStorage(ABC):
         yield
 
     @abstractmethod
-    async def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo]]]:
+    async def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         """Recursively walk a directory tree."""
         raise NotImplementedError
         yield

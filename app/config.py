@@ -31,5 +31,6 @@ def get_config() -> Config:
     global _config
     if _config is None:
         _config = _load_config()
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_FILE.write_text(json.dumps(_config.model_dump(), indent=2, cls=SecretStrEncoder), encoding="utf-8")
     return _config
