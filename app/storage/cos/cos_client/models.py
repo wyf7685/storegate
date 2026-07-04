@@ -31,3 +31,16 @@ class ListObjectsItem:
 class ListObjectsDir:
     prefix: str
     is_dir: Literal[True] = True
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CopyObjectResult:
+    etag: str
+    crc64: int
+    last_modified: datetime
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CopyPartResult:
+    etag: str
+    last_modified: datetime

@@ -1,3 +1,4 @@
+import contextlib
 import itertools
 from collections.abc import AsyncIterable, AsyncIterator
 from pathlib import PurePosixPath
@@ -6,30 +7,43 @@ from typing import final, override
 import anyio
 import anyio.lowlevel
 
+from app.config import CosConfig
+from app.log import logger
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
-from app.storage.cos.cos_client.models import ListObjectsDir
+from app.storage.cos.cos_client.models import ListObjectsDir, MultipartUploadPart
 from app.utils import coalesce_chunks
 
 from .cos_client import AsyncCosClient
-from .utils import UPLOAD_CHUNK_SIZE, MultipartUploadTask, create_client, get_cos_config
+from .utils import UPLOAD_CHUNK_SIZE, MultipartUploadTask, create_client
+
+# Files larger than this are copied via multipart upload to stay within
+# the PUT Object - Copy 5 GiB limit and to allow parallel part copies.
+COPY_MULTIPART_THRESHOLD = 4 * 1024 * 1024  # 4 MiB
 
 
 @final
 class CosStorage(AbstractStorage):
     _client: AsyncCosClient | None = None
+    _config: CosConfig
+
+    def __init__(self, config: CosConfig) -> None:
+        self._config = config
+
+    @classmethod
+    def from_config(cls, config: CosConfig) -> CosStorage:
+        """Create a ``CosStorage`` from a ``CosConfig``."""
+        return cls(config)
 
     @override
     @property
     def id(self) -> str:
-        config = get_cos_config()
-        return f"cos:{config.bucket}:{config.region}"
+        return f"cos:{self._config.bucket}:{self._config.region}"
 
     @override
     async def connect(self) -> None:
-        self._client = create_client()
+        self._client = create_client(self._config)
         await self._client.__aenter__()
-        if not await self._client.head_bucket():
-            raise RuntimeError("Failed to connect to COS bucket. Please check your configuration.")
+        await self.ping()
 
     @override
     async def close(self) -> None:
@@ -42,9 +56,14 @@ class CosStorage(AbstractStorage):
         if self._client is None:
             return False
         try:
-            return await self._client.head_bucket()
+            # Use list_objects instead of head_bucket to work with minimal
+            # IAM policies (head_bucket requires GetBucket permission).
+            with contextlib.suppress(StopAsyncIteration):  # bucket exists but is empty — still healthy
+                await anext(self._client.list_objects(max_keys=1))
         except Exception:
             return False
+        else:
+            return True
 
     def _ensure_client(self) -> AsyncCosClient:
         if self._client is None:
@@ -110,15 +129,6 @@ class CosStorage(AbstractStorage):
             yield chunk
 
     @override
-    async def download_bytes(
-        self,
-        remote_path: str,
-    ) -> bytes:
-        client = self._ensure_client()
-        key = self._remote_path_to_key(remote_path)
-        return await client.get_object(key=key)
-
-    @override
     async def delete(self, path: str) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
@@ -130,7 +140,8 @@ class CosStorage(AbstractStorage):
         src: str,
         dst: str,
     ) -> None:
-        raise NotImplementedError
+        await self.copy(src, dst)
+        await self.delete(src)
 
     @override
     async def copy(
@@ -138,7 +149,18 @@ class CosStorage(AbstractStorage):
         src: str,
         dst: str,
     ) -> None:
-        raise NotImplementedError
+        src_key = self._remote_path_to_key(src)
+        dst_key = self._remote_path_to_key(dst)
+        client = self._ensure_client()
+
+        head = await client.head_object(key=src_key)
+        if head is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+
+        if head.content_length <= COPY_MULTIPART_THRESHOLD:
+            await client.put_object_copy(src_key, dst_key)
+        else:
+            await self._copy_multipart(src_key, dst_key, head.content_length)
 
     @override
     async def mkdir(
@@ -148,7 +170,7 @@ class CosStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
-        return
+        logger.debug(f"COS is flat — skipping mkdir for '{path}'")
 
     @override
     async def rmtree(self, path: str) -> None:
@@ -158,24 +180,26 @@ class CosStorage(AbstractStorage):
             for batch in itertools.batched(files, 100):
                 await client.delete_objects(self._remote_path_to_key(file.path) for file in batch)
 
+        # Also delete the object at the path itself (COS "directory marker" object).
+        if await self.is_file(path):
+            await client.delete_object(self._remote_path_to_key(path))
+
     @override
     async def exists(self, path: str) -> bool:
-        try:
-            await self.stat(path)
-        except FileNotFoundError:
-            return False
-        else:
-            return True
+        return await self.is_file(path) or await self.is_dir(path)
 
     @override
     async def is_file(self, path: str) -> bool:
-        return await self.exists(path)
+        client = self._ensure_client()
+        key = self._remote_path_to_key(path)
+        return await client.head_object(key=key) is not None
 
     @override
     async def is_dir(self, path: str) -> bool:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
-        async for _ in client.list_objects(prefix=key or None, delimiter="/"):
+        prefix = (key + "/") if key else None
+        async for _ in client.list_objects(prefix=prefix, delimiter="/", max_keys=1):
             return True
         return False
 
@@ -205,15 +229,33 @@ class CosStorage(AbstractStorage):
 
     async def _iterdir(self, key: str) -> AsyncIterator[FileInfo]:
         client = self._ensure_client()
-        async for obj in client.list_objects(prefix=key or None, delimiter="/"):
+        prefix = (key + "/") if key else None
+        async for obj in client.list_objects(prefix=prefix, delimiter="/"):
             if isinstance(obj, ListObjectsDir):
-                yield FileInfo(path=obj.prefix, name=PurePosixPath(obj.prefix).name, size=0, is_dir=True)
+                yield FileInfo(
+                    path=obj.prefix.rstrip("/"),
+                    name=PurePosixPath(obj.prefix.rstrip("/")).name,
+                    size=0,
+                    is_dir=True,
+                )
                 continue
 
-            rel_path = PurePosixPath(obj.key).relative_to(key)
-            if len(rel_path.parts) > 1 or not rel_path.name:
-                continue
-            yield (FileInfo(path=obj.key, name=rel_path.name, is_dir=False, size=obj.size, modified=obj.last_modified))
+            # Extract the immediate child name from the full COS key.
+            if key:  # noqa: SIM108
+                rest = obj.key[len(key) + 1 :]  # "test/foo/bar.txt" → "foo/bar.txt"
+            else:
+                rest = obj.key  # "foo/bar.txt" → "foo/bar.txt"
+
+            if "/" in rest:
+                continue  # not an immediate child
+
+            yield FileInfo(
+                path=obj.key,
+                name=rest,
+                is_dir=False,
+                size=obj.size,
+                modified=obj.last_modified,
+            )
 
     async def _walk(self, key: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         dirs: list[FileInfo] = []
@@ -225,3 +267,33 @@ class CosStorage(AbstractStorage):
         for dir in dirs:
             async for sub_path, sub_dirs, sub_files in self._walk(dir.path):
                 yield sub_path, sub_dirs, sub_files
+
+    async def _copy_multipart(self, src_key: str, dst_key: str, src_size: int) -> None:
+        """Server-side copy via multipart upload for objects above the threshold."""
+        client = self._ensure_client()
+        upload_id = await client.create_multipart_upload(dst_key)
+
+        try:
+            parts: list[MultipartUploadPart] = []
+            offset = 0
+            part_number = 1
+
+            while offset < src_size:
+                end = min(offset + UPLOAD_CHUNK_SIZE - 1, src_size - 1)
+                result = await client.upload_part_copy(
+                    source_key=src_key,
+                    target_key=dst_key,
+                    upload_id=upload_id,
+                    part_number=part_number,
+                    byte_range=(offset, end),
+                )
+                parts.append({"PartNumber": part_number, "ETag": result.etag})
+                offset = end + 1
+                part_number += 1
+                await anyio.lowlevel.checkpoint()
+
+            await client.complete_multipart_upload(dst_key, upload_id, parts)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await client.abort_multipart_upload(dst_key, upload_id)
+            raise

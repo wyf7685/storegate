@@ -10,7 +10,14 @@ import httpx
 
 from .auth import CosV5Signer
 from .errors import CosClientError, CosHttpStatusError, CosResponseParseError
-from .models import HeadObjectResponse, ListObjectsDir, ListObjectsItem, MultipartUploadPart
+from .models import (
+    CopyObjectResult,
+    CopyPartResult,
+    HeadObjectResponse,
+    ListObjectsDir,
+    ListObjectsItem,
+    MultipartUploadPart,
+)
 
 
 def _parse_xml(content: bytes) -> ET.Element:
@@ -34,6 +41,45 @@ def _build_complete_multipart_xml(parts: Sequence[MultipartUploadPart]) -> bytes
         ET.SubElement(node, "PartNumber").text = str(part["PartNumber"])
         ET.SubElement(node, "ETag").text = part["ETag"]
     return ET.tostring(root, encoding="utf-8")
+
+
+def _check_copy_error(root: ET.Element, method: str) -> None:
+    """Raise CosResponseParseError if the XML body contains an ``<Error>`` node.
+
+    PUT Object - Copy can return HTTP 200 with ``<Error>`` in the body when
+    the copy fails *during* execution (not at initiation time).
+    """
+    if error_nodes := root.findall(".//Error"):
+        errors: list[str] = []
+        for error_node in error_nodes:
+            code = _find_required_text(error_node, "Code")
+            message = _find_required_text(error_node, "Message")
+            errors.append(f"{code}: {message}")
+        raise CosResponseParseError(f"{method} failed: {", ".join(errors)}")
+
+
+def _parse_copy_object_result(content: bytes) -> CopyObjectResult:
+    root = _parse_xml(content)
+    _check_copy_error(root, "PUT Object - Copy")
+    etag = _find_required_text(root, "ETag")
+    crc64_str = _find_required_text(root, "CRC64")
+    last_modified_str = _find_required_text(root, "LastModified")
+    return CopyObjectResult(
+        etag=etag,
+        crc64=int(crc64_str),
+        last_modified=datetime.fromisoformat(last_modified_str),
+    )
+
+
+def _parse_copy_part_result(content: bytes) -> CopyPartResult:
+    root = _parse_xml(content)
+    _check_copy_error(root, "Upload Part - Copy")
+    etag = _find_required_text(root, "ETag")
+    last_modified_str = _find_required_text(root, "LastModified")
+    return CopyPartResult(
+        etag=etag,
+        last_modified=datetime.fromisoformat(last_modified_str),
+    )
 
 
 class AsyncCosClient:
@@ -99,6 +145,16 @@ class AsyncCosClient:
         encoded = quote(normalized, safe="/-_.~")
         encoded = encoded.replace("./", ".%2F")
         return f"/{encoded}" if encoded else "/"
+
+    def _build_copy_source(self, source_key: str) -> str:
+        """Build the ``x-cos-copy-source`` header value.
+
+        Format: ``{host}/{url-encoded-key}`` (no scheme, key is URL-encoded
+        with the same rules as ``_build_request_path``).
+        """
+        normalized = self._normalize_key(source_key)
+        encoded = quote(normalized, safe="/-_.~")
+        return f"{self._host}/{encoded}"
 
     @staticmethod
     def _normalize_params(params: Mapping[str, str | int] | None) -> dict[str, str]:
@@ -198,11 +254,11 @@ class AsyncCosClient:
         self,
         prefix: str | None = None,
         delimiter: str = "/",
-        max_keys: int = 100,
+        max_keys: int = 1000,
     ) -> AsyncGenerator[ListObjectsItem | ListObjectsDir]:
         params = {"max-keys": max_keys}
         if prefix is not None:
-            if not prefix.endswith(delimiter):
+            if prefix and not prefix.endswith(delimiter):
                 prefix += delimiter
             params["prefix"] = prefix
         if delimiter is not None:
@@ -267,6 +323,31 @@ class AsyncCosClient:
 
     async def put_object(self, key: str, data: bytes) -> None:
         await self._request(method="PUT", key=key, content=data)
+
+    async def put_object_copy(
+        self,
+        source_key: str,
+        target_key: str,
+        *,
+        forbid_overwrite: bool = False,
+    ) -> CopyObjectResult:
+        """Copy an existing COS object to a new key (server-side, no data transfer).
+
+        Suitable for objects up to 5 GiB.  For larger sources use
+        :meth:`upload_part_copy` via a multipart upload.
+        """
+        headers: dict[str, str] = {
+            "x-cos-copy-source": self._build_copy_source(source_key),
+        }
+        if forbid_overwrite:
+            headers["x-cos-forbid-overwrite"] = "true"
+        response = await self._request(
+            method="PUT",
+            key=target_key,
+            headers=headers,
+            content=b"",
+        )
+        return _parse_copy_object_result(response.content)
 
     async def delete_object(self, key: str) -> None:
         await self._request(method="DELETE", key=key)
@@ -337,6 +418,30 @@ class AsyncCosClient:
         if etag is None or etag == "":
             raise CosResponseParseError("Missing ETag in upload_part response")
         return etag
+
+    async def upload_part_copy(
+        self,
+        source_key: str,
+        target_key: str,
+        upload_id: str,
+        part_number: int,
+        byte_range: tuple[int, int],
+    ) -> CopyPartResult:
+        """Copy a byte range from an existing COS object as a multipart upload part.
+
+        *byte_range* is an inclusive ``(first, last)`` pair (0-based).
+        """
+        headers: dict[str, str] = {
+            "x-cos-copy-source": self._build_copy_source(source_key),
+            "x-cos-copy-source-range": f"bytes={byte_range[0]}-{byte_range[1]}",
+        }
+        response = await self._request(
+            method="PUT",
+            key=target_key,
+            params={"partNumber": part_number, "uploadId": upload_id},
+            headers=headers,
+        )
+        return _parse_copy_part_result(response.content)
 
     async def complete_multipart_upload(
         self,

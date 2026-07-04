@@ -23,8 +23,9 @@ def get_cos_config() -> CosConfig:
     return config
 
 
-def create_client() -> AsyncCosClient:
-    config = get_cos_config()
+def create_client(config: CosConfig | None = None) -> AsyncCosClient:
+    if config is None:
+        config = get_cos_config()
 
     return AsyncCosClient(
         region=config.region,
