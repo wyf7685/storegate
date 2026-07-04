@@ -8,14 +8,21 @@ import anyio.lowlevel
 
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
 from app.storage.cos.cos_client.models import ListObjectsDir
+from app.utils import coalesce_chunks
 
 from .cos_client import AsyncCosClient
-from .utils import UPLOAD_CHUNK_SIZE, MultipartUploadTask, coalesce_chunks, create_client
+from .utils import UPLOAD_CHUNK_SIZE, MultipartUploadTask, create_client, get_cos_config
 
 
 @final
 class CosStorage(AbstractStorage):
     _client: AsyncCosClient | None = None
+
+    @override
+    @property
+    def id(self) -> str:
+        config = get_cos_config()
+        return f"cos:{config.bucket}:{config.region}"
 
     @override
     async def connect(self) -> None:
@@ -51,25 +58,6 @@ class CosStorage(AbstractStorage):
         return str(path) if path != PurePosixPath(".") else ""
 
     @override
-    async def upload_bytes(
-        self,
-        data: BytesLike,
-        remote_path: str,
-        *,
-        overwrite: bool = True,
-    ) -> None:
-        buf = memoryview(data).toreadonly()
-
-        async def aiterable() -> AsyncIterable[memoryview[int]]:
-            ptr = 0
-            while ptr < len(buf):
-                yield buf[ptr : ptr + UPLOAD_CHUNK_SIZE]
-                ptr += UPLOAD_CHUNK_SIZE
-                await anyio.lowlevel.checkpoint()
-
-        await self.upload_stream(aiterable(), remote_path, overwrite=overwrite)
-
-    @override
     async def upload_stream(
         self,
         stream: AsyncIterable[BytesLike],
@@ -103,15 +91,6 @@ class CosStorage(AbstractStorage):
             await task.upload_from(chunk_iter)
 
     @override
-    async def download_bytes(
-        self,
-        remote_path: str,
-    ) -> bytes:
-        client = self._ensure_client()
-        key = self._remote_path_to_key(remote_path)
-        return await client.get_object(key=key)
-
-    @override
     async def download_stream(
         self,
         remote_path: str,
@@ -129,6 +108,15 @@ class CosStorage(AbstractStorage):
             end = min(start + UPLOAD_CHUNK_SIZE - 1, total_size - 1)
             chunk = await client.get_object(key=key, range=(start, end))
             yield chunk
+
+    @override
+    async def download_bytes(
+        self,
+        remote_path: str,
+    ) -> bytes:
+        client = self._ensure_client()
+        key = self._remote_path_to_key(remote_path)
+        return await client.get_object(key=key)
 
     @override
     async def delete(self, path: str) -> None:
@@ -166,7 +154,7 @@ class CosStorage(AbstractStorage):
     async def rmtree(self, path: str) -> None:
         client = self._ensure_client()
 
-        async for _, files in self.walk(path):
+        async for _, _, files in self.walk(path):
             for batch in itertools.batched(files, 100):
                 await client.delete_objects(self._remote_path_to_key(file.path) for file in batch)
 
@@ -206,16 +194,12 @@ class CosStorage(AbstractStorage):
         )
 
     @override
-    async def list_(self, path: str) -> list[FileInfo]:
-        return [item async for item in self.iterdir(path)]
-
-    @override
     def iterdir(self, path: str) -> AsyncIterator[FileInfo]:
         key = self._remote_path_to_key(path)
         return self._iterdir(key)
 
     @override
-    def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo]]]:
+    def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         key = self._remote_path_to_key(path)
         return self._walk(key)
 
@@ -231,13 +215,13 @@ class CosStorage(AbstractStorage):
                 continue
             yield (FileInfo(path=obj.key, name=rel_path.name, is_dir=False, size=obj.size, modified=obj.last_modified))
 
-    async def _walk(self, key: str) -> AsyncIterator[tuple[str, list[FileInfo]]]:
+    async def _walk(self, key: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         dirs: list[FileInfo] = []
         files: list[FileInfo] = []
         async for file in self._iterdir(key):
             (dirs if file.is_dir else files).append(file)
 
-        yield key, files
+        yield key, dirs, files
         for dir in dirs:
-            async for sub_path, sub_files in self._walk(dir.path):
-                yield sub_path, sub_files
+            async for sub_path, sub_dirs, sub_files in self._walk(dir.path):
+                yield sub_path, sub_dirs, sub_files

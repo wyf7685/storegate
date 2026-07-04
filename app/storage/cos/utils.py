@@ -1,5 +1,5 @@
 import contextlib
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable
 from typing import Self
 
 import anyio
@@ -146,22 +146,3 @@ class MultipartUploadTask:
             recv.close()
             async for chunk in aiterable:
                 await send.send((self.next_part_number(), chunk))
-
-
-async def coalesce_chunks(
-    aiterable: AsyncIterable[Iterable[int]],
-    chunk_size: int = UPLOAD_CHUNK_SIZE,
-) -> AsyncIterator[bytes]:
-    buffer = bytearray()
-
-    async for chunk in aiterable:
-        if not chunk:
-            continue
-
-        buffer.extend(chunk)
-        while len(buffer) >= chunk_size:
-            yield bytes(buffer[:chunk_size])
-            del buffer[:chunk_size]
-
-    if buffer:
-        yield bytes(buffer)
