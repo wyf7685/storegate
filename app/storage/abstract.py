@@ -30,6 +30,9 @@ type BytesLike = bytes | bytearray | memoryview
 class AbstractStorage(ABC):
     """Abstract storage interface."""
 
+    def __init__(self) -> None:
+        self.__ctx = 0
+
     @functools.cached_property
     def log(self) -> LoggerWrapper:
         return logger_wrapper(f"{self.__class__.__name__} <c><i>{escape_tag(self.id)}</></>")
@@ -60,10 +63,14 @@ class AbstractStorage(ABC):
         raise NotImplementedError
 
     async def __aenter__(self) -> Self:
+        self.__ctx += 1
         await self.connect()
         return self
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.__ctx = max(0, self.__ctx - 1)
+        if self.__ctx:
+            return
         with anyio.CancelScope(shield=True):
             await self.close()
 

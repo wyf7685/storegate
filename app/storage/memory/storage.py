@@ -21,6 +21,7 @@ class MemoryStorage(AbstractStorage):
     """
 
     def __init__(self, root: str) -> None:
+        super().__init__()
         _root = PurePosixPath("/", root)
         # Normalise away double-leading-slash when root == "/".
         self._root: PurePosixPath = PurePosixPath(str(_root).replace("//", "/"))

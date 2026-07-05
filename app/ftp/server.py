@@ -14,15 +14,15 @@ from .session import FTPSession
 if TYPE_CHECKING:
     from app.storage.abstract import AbstractStorage
 
-_logger = logger_wrapper("ftp.server")
+logger = logger_wrapper("ftp.server")
 
 
 class FTPServer:
-    """Asynchronous FTP server backed by an ``FTPStorage`` implementation.
+    """Asynchronous FTP server backed by an ``AbstractStorage`` implementation.
 
     Usage::
 
-        storage = CosFTPStorage()
+        storage = MemoryStorage()
         server = FTPServer(storage, host="127.0.0.1", port=2121)
         await server.serve()
     """
@@ -40,14 +40,14 @@ class FTPServer:
         """Start the FTP server. Blocks until cancelled."""
         async with self._storage:
             listener = await anyio.create_tcp_listener(local_host=self._host, local_port=self._port)
-            _logger.info(f"FTP server listening on {self._host}:{self._port}")
+            logger.info(f"FTP server listening on <g><b>{self._host}</>:{self._port}</>")
             async with listener:
                 await listener.serve(self._handle_client)
 
     async def _handle_client(self, stream: SocketStream) -> None:
         """Handle a single client connection."""
         peer = stream.extra_attributes.get(anyio.abc.SocketAttribute.remote_address, lambda: ("unknown", 0))()
-        _logger.info(f"New connection from {peer[0]}:{peer[1]}")
+        logger.info(f"New connection from <g><b>{peer[0]}</>:{peer[1]}</>")
 
         session = FTPSession()
         handler = FTPHandler(storage=self._storage, session=session, stream=stream, host=self._host)
@@ -56,9 +56,9 @@ class FTPServer:
             async with stream:
                 await handler.run()
         except Exception:
-            _logger.exception("Unhandled client error")
+            logger.exception("Unhandled client error")
         finally:
             # Clean up any lingering PASV listener
             if session.pasv_listener is not None:
                 await session.pasv_listener.aclose()
-            _logger.info(f"Connection closed: {peer[0]}:{peer[1]}")
+            logger.info(f"Connection closed: <g><b>{peer[0]}</>:{peer[1]}</>")

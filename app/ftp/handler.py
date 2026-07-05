@@ -7,41 +7,18 @@ from typing import TYPE_CHECKING, ClassVar
 import anyio
 from anyio.abc import SocketStream
 
-from app.log import logger
 from app.storage import FileInfo
 from app.utils import logger_wrapper
 
 from .data import DataConnection
 from .listing import format_list, format_nlst
-from .response import (
-    R_ACTION_OK,
-    R_BAD_SEQUENCE,
-    R_CLOSING,
-    R_DATA_OPEN,
-    R_FILE_STATUS,
-    R_LOGGED_IN,
-    R_NEED_PASSWORD,
-    R_NO_DATA_CONN,
-    R_NOT_AVAILABLE,
-    R_NOT_IMPLEMENTED,
-    R_NOT_LOGGED_IN,
-    R_PASSIVE_MODE,
-    R_PATH_CREATED,
-    R_PENDING_INFO,
-    R_READY,
-    R_SYNTAX_ERROR,
-    R_SYSTEM_STATUS,
-    R_SYSTEM_TYPE,
-    R_TRANSFER_ABORTED,
-    R_TRANSFER_OK,
-    reply,
-)
+from .response import R
 from .session import FTPSession
 
 if TYPE_CHECKING:
     from app.storage.abstract import AbstractStorage
 
-_logger = logger_wrapper("ftp.handler")
+logger = logger_wrapper("ftp.handler")
 
 # Commands that require authentication
 _REQUIRES_AUTH: frozenset[str] = frozenset(
@@ -81,8 +58,11 @@ class FTPHandler:
         "PASS": "_handle_pass",
         "QUIT": "_handle_quit",
         "PWD": "_handle_pwd",
+        "XPWD": "_handle_pwd",
         "CWD": "_handle_cwd",
+        "XCWD": "_handle_cwd",
         "CDUP": "_handle_cdup",
+        "XCDUP": "_handle_cdup",
         "TYPE": "_handle_type",
         "PASV": "_handle_pasv",
         "PORT": "_handle_port",
@@ -92,7 +72,9 @@ class FTPHandler:
         "STOR": "_handle_stor",
         "DELE": "_handle_dele",
         "RMD": "_handle_rmd",
+        "XRMD": "_handle_rmd",
         "MKD": "_handle_mkd",
+        "XMKD": "_handle_mkd",
         "RNFR": "_handle_rnfr",
         "RNTO": "_handle_rnto",
         "SIZE": "_handle_size",
@@ -132,22 +114,22 @@ class FTPHandler:
 
     async def run(self) -> None:
         """Run the main command loop. Blocks until QUIT or disconnect."""
-        await self._send(reply(R_READY, "cos-ftp ready"))
+        await self._send(R.READY("cos-ftp ready"))
         try:
             while True:
                 line = await self._read_line()
                 if not line:
                     continue
                 cmd, arg = self._parse(line)
-                logger.debug(f"Received command: {cmd} {arg}")
+                logger.debug(f"Received command: <c>{cmd}</> {arg}")
                 response = await self._dispatch(cmd, arg)
                 await self._send(response)
                 if cmd == "QUIT":
                     break
         except EOFError, anyio.EndOfStream:
-            _logger.info("Client closed connection")
+            logger.info("Client closed connection")
         except anyio.ClosedResourceError:
-            _logger.info("Control connection closed")
+            logger.info("Control connection closed")
 
     # ------------------------------------------------------------------
     # I/O helpers
@@ -190,15 +172,16 @@ class FTPHandler:
         """Route command to handler method, enforcing authentication."""
         method_name = self._COMMAND_MAP.get(cmd)
         if method_name is None:
-            return reply(R_NOT_IMPLEMENTED, f"Command {cmd} not implemented")
+            logger.warning(f"Unrecognized command: <c>{cmd}</> {arg}")
+            return R.NOT_IMPLEMENTED(f"Command {cmd} not implemented")
         if cmd in _REQUIRES_AUTH and not self._session.authenticated:
-            return reply(R_NOT_LOGGED_IN, "Please login with USER and PASS")
+            return R.NOT_LOGGED_IN("Please login with USER and PASS")
         method = getattr(self, method_name)
         try:
             return await method(arg)
         except Exception:
-            _logger.exception(f"Unhandled error processing {cmd} {arg}")
-            return reply(R_NOT_AVAILABLE, f"Internal error processing {cmd}")
+            logger.exception(f"Unhandled error processing <c>{cmd}</> {arg}")
+            return R.LOCAL_ERROR(f"Internal error processing <c>{cmd}</>")
 
     # ------------------------------------------------------------------
     # Path resolution
@@ -236,37 +219,37 @@ class FTPHandler:
 
     async def _handle_user(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "USER requires a username")
+            return R.SYNTAX_ERROR("USER requires a username")
         self._session.user = arg
-        return reply(R_NEED_PASSWORD, "Password required")
+        return R.NEED_PASSWORD("Password required")
 
     async def _handle_pass(self, arg: str) -> str:
         if self._session.user is None:
-            return reply(R_BAD_SEQUENCE, "Login with USER first")
+            return R.BAD_SEQUENCE("Login with USER first")
         if not arg:
-            return reply(R_NEED_PASSWORD, "Password required")
+            return R.NEED_PASSWORD("Password required")
         self._session.authenticated = True
-        _logger.info(f"User '{self._session.user}' authenticated")
-        return reply(R_LOGGED_IN, "Login successful")
+        logger.info(f"User '<y>{self._session.user}</>' authenticated")
+        return R.LOGGED_IN("Login successful")
 
     async def _handle_quit(self, arg: str) -> str:
-        return reply(R_CLOSING, "Goodbye")
+        return R.CLOSING("Goodbye")
 
     # ------------------------------------------------------------------
     # Directory navigation
     # ------------------------------------------------------------------
 
     async def _handle_pwd(self, arg: str) -> str:
-        return reply(R_PATH_CREATED, f'"{self._session.cwd}" is current directory')
+        return R.PATH_CREATED(f'"{self._session.cwd}" is current directory')
 
     async def _handle_cwd(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "CWD requires a path")
+            return R.SYNTAX_ERROR("CWD requires a path")
         target = self._resolve_path(arg)
         if target == "/" or await self._storage.is_dir(target):
             self._session.cwd = target
-            return reply(R_ACTION_OK, f"Directory changed to {target}")
-        return reply(R_NOT_AVAILABLE, f"Directory not found: {arg}")
+            return R.ACTION_OK(f"Directory changed to {target}")
+        return R.NOT_AVAILABLE(f"Directory not found: {arg}")
 
     async def _handle_cdup(self, arg: str) -> str:
         return await self._handle_cwd("..")
@@ -279,8 +262,8 @@ class FTPHandler:
         arg_upper = arg.upper()
         if arg_upper in ("I", "A", "L8"):
             self._session.transfer_type = arg_upper
-            return reply("200", f"Type set to {self._session.transfer_type}")
-        return reply(R_SYNTAX_ERROR, "TYPE must be I, A, or L8")
+            return R.SUCCESS(f"Type set to {self._session.transfer_type}")
+        return R.SYNTAX_ERROR("TYPE must be I, A, or L8")
 
     # ------------------------------------------------------------------
     # PASV / PORT — data channel setup
@@ -301,11 +284,11 @@ class FTPHandler:
         host_parts = ",".join(self._host.split("."))
         p1 = (port >> 8) & 0xFF
         p2 = port & 0xFF
-        return reply(R_PASSIVE_MODE, f"Entering Passive Mode ({host_parts},{p1},{p2})")
+        return R.PASSIVE_MODE(f"Entering Passive Mode ({host_parts},{p1},{p2})")
 
     async def _handle_port(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "PORT requires address specification")
+            return R.SYNTAX_ERROR("PORT requires address specification")
         try:
             parts = arg.split(",")
             if len(parts) != 6:
@@ -315,7 +298,7 @@ class FTPHandler:
             host = f"{h1}.{h2}.{h3}.{h4}"
             port = (p1 << 8) | p2
         except ValueError, IndexError:
-            return reply(R_SYNTAX_ERROR, "Invalid PORT format (h1,h2,h3,h4,p1,p2)")
+            return R.SYNTAX_ERROR("Invalid PORT format (h1,h2,h3,h4,p1,p2)")
 
         # Clean up any previous PASV listener
         if self._session.pasv_listener is not None:
@@ -324,7 +307,7 @@ class FTPHandler:
 
         self._session.data_mode = "port"
         self._session.port_addr = (host, port)
-        return reply("200", "PORT command successful")
+        return R.SUCCESS("PORT command successful")
 
     # ------------------------------------------------------------------
     # LIST / NLST — directory listing via data channel
@@ -341,21 +324,21 @@ class FTPHandler:
     async def _send_dir_listing(self, target: str, fmt: Callable[[list[FileInfo]], str]) -> str:
         """Shared implementation for LIST and NLST."""
         if target != "/" and not await self._storage.is_dir(target):
-            return reply(R_NOT_AVAILABLE, f"Not a directory: {target}")
+            return R.NOT_AVAILABLE(f"Not a directory: {target}")
 
         items = await self._storage.list_(target)
         text = fmt(items)
 
         try:
-            await self._send(reply(R_DATA_OPEN, "Opening data connection for directory listing"))
+            await self._send(R.DATA_OPEN("Opening data connection for directory listing"))
             async with self._make_data_connection() as dc:
                 await dc.send_all(text)
         except TimeoutError, OSError:
-            return reply(R_NO_DATA_CONN, "Failed to establish data connection")
+            return R.NO_DATA_CONN("Failed to establish data connection")
         finally:
             self._session.reset_data_state()
 
-        return reply(R_TRANSFER_OK, "Directory send OK")
+        return R.TRANSFER_OK("Directory send OK")
 
     # ------------------------------------------------------------------
     # RETR / STOR — file transfer via data channel
@@ -363,36 +346,36 @@ class FTPHandler:
 
     async def _handle_retr(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "RETR requires a filename")
+            return R.SYNTAX_ERROR("RETR requires a filename")
         target = self._resolve_path(arg)
 
         try:
             await self._storage.stat(target)
         except FileNotFoundError:
-            return reply(R_NOT_AVAILABLE, f"File not found: {arg}")
+            return R.NOT_AVAILABLE(f"File not found: {arg}")
 
         return await self._transfer_download(target)
 
     async def _transfer_download(self, target: str) -> str:
         self._abort_event = anyio.Event()
         try:
-            await self._send(reply(R_DATA_OPEN, "Opening data connection for download"))
+            await self._send(R.DATA_OPEN("Opening data connection for download"))
             async with self._make_data_connection() as dc:
                 async for chunk in self._storage.download_stream(target):
                     if self._abort_event.is_set():
                         await dc.close()
-                        return reply(R_TRANSFER_ABORTED, "Transfer aborted")
+                        return R.TRANSFER_ABORTED("Transfer aborted")
                     await dc.send(chunk)
         except TimeoutError, OSError:
-            return reply(R_NO_DATA_CONN, "Failed to establish data connection")
+            return R.NO_DATA_CONN("Failed to establish data connection")
         finally:
             self._session.reset_data_state()
 
-        return reply(R_TRANSFER_OK, "Transfer complete")
+        return R.TRANSFER_OK("Transfer complete")
 
     async def _handle_stor(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "STOR requires a filename")
+            return R.SYNTAX_ERROR("STOR requires a filename")
         target = self._resolve_path(arg)
         return await self._transfer_upload(target)
 
@@ -401,19 +384,19 @@ class FTPHandler:
 
         async def wait_for_abort():
             await self._abort_event.wait()
-            _logger.info("Upload aborted by client")
+            logger.info("Upload aborted by client")
             tg.cancel_scope.cancel()
 
         try:
-            await self._send(reply(R_DATA_OPEN, "Opening data connection for upload"))
+            await self._send(R.DATA_OPEN("Opening data connection for upload"))
             async with self._make_data_connection() as dc, anyio.create_task_group() as tg:
                 tg.start_soon(wait_for_abort)
                 await self._storage.upload_stream(dc.receive_chunks(), target, overwrite=True)
                 tg.cancel_scope.cancel()
         except* TimeoutError, OSError:
-            response = reply(R_NO_DATA_CONN, "Failed to establish data connection")
+            response = R.NO_DATA_CONN("Failed to establish data connection")
         else:
-            response = reply(R_TRANSFER_OK, "Transfer complete")
+            response = R.TRANSFER_OK("Transfer complete")
         finally:
             self._session.reset_data_state()
 
@@ -422,7 +405,7 @@ class FTPHandler:
     async def _handle_abor(self, arg: str) -> str:
         self._abort_event.set()
         self._session.reset_data_state()
-        return reply(R_TRANSFER_ABORTED, "Transfer aborted")
+        return R.TRANSFER_ABORTED("Transfer aborted")
 
     # ------------------------------------------------------------------
     # File operations
@@ -430,41 +413,44 @@ class FTPHandler:
 
     async def _handle_dele(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "DELE requires a filename")
+            return R.SYNTAX_ERROR("DELE requires a filename")
         target = self._resolve_path(arg)
         await self._storage.delete(target)
-        return reply(R_ACTION_OK, f"Deleted {arg}")
+        return R.ACTION_OK(f"Deleted {arg}")
 
     async def _handle_rmd(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "RMD requires a directory name")
+            return R.SYNTAX_ERROR("RMD requires a directory name")
         target = self._resolve_path(arg)
-        await self._storage.rmtree(target)
-        return reply(R_ACTION_OK, f"Removed directory {arg}")
+        try:
+            await self._storage.delete(target)
+            return R.ACTION_OK(f"Removed directory {arg}")
+        except OSError as e:
+            return R.NOT_AVAILABLE(f"Failed to remove directory {arg}: {e}")
 
     async def _handle_mkd(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "MKD requires a directory name")
+            return R.SYNTAX_ERROR("MKD requires a directory name")
         target = self._resolve_path(arg)
         await self._storage.mkdir(target, parents=False, exist_ok=False)
-        return reply(R_PATH_CREATED, f'"{target}" created')
+        return R.PATH_CREATED(f'"{target}" created')
 
     async def _handle_rnfr(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "RNFR requires a filename")
+            return R.SYNTAX_ERROR("RNFR requires a filename")
         target = self._resolve_path(arg)
         self._session.rename_from = target
-        return reply(R_PENDING_INFO, "Ready for RNTO")
+        return R.PENDING_INFO("Ready for RNTO")
 
     async def _handle_rnto(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "RNTO requires a filename")
+            return R.SYNTAX_ERROR("RNTO requires a filename")
         if self._session.rename_from is None:
-            return reply(R_BAD_SEQUENCE, "Use RNFR first")
+            return R.BAD_SEQUENCE("Use RNFR first")
         target = self._resolve_path(arg)
         await self._storage.move(self._session.rename_from, target)
         self._session.rename_from = None
-        return reply(R_ACTION_OK, "Rename successful")
+        return R.ACTION_OK("Rename successful")
 
     # ------------------------------------------------------------------
     # Metadata
@@ -472,31 +458,31 @@ class FTPHandler:
 
     async def _handle_size(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "SIZE requires a filename")
+            return R.SYNTAX_ERROR("SIZE requires a filename")
         target = self._resolve_path(arg)
         try:
             info = await self._storage.stat(target)
         except FileNotFoundError:
-            return reply(R_NOT_AVAILABLE, f"File not found: {arg}")
-        return reply(R_FILE_STATUS, str(info.size or 0))
+            return R.NOT_AVAILABLE(f"File not found: {arg}")
+        return R.FILE_STATUS(str(info.size or 0))
 
     async def _handle_mdtm(self, arg: str) -> str:
         if not arg:
-            return reply(R_SYNTAX_ERROR, "MDTM requires a filename")
+            return R.SYNTAX_ERROR("MDTM requires a filename")
         target = self._resolve_path(arg)
         try:
             info = await self._storage.stat(target)
         except FileNotFoundError:
-            return reply(R_NOT_AVAILABLE, f"File not found: {arg}")
+            return R.NOT_AVAILABLE(f"File not found: {arg}")
         timestamp = info.modified.strftime("%Y%m%d%H%M%S") if info.modified is not None else "19700101000000"
-        return reply(R_FILE_STATUS, timestamp)
+        return R.FILE_STATUS(timestamp)
 
     # ------------------------------------------------------------------
     # System / misc
     # ------------------------------------------------------------------
 
     async def _handle_syst(self, arg: str) -> str:
-        return reply(R_SYSTEM_TYPE, "UNIX Type: L8")
+        return R.SYSTEM_TYPE("UNIX Type: L8")
 
     async def _handle_feat(self, arg: str) -> str:
         features = [
@@ -508,17 +494,17 @@ class FTPHandler:
             " EPSV",
         ]
         lines = "\r\n".join(f" {f}" for f in features)
-        return f"{R_SYSTEM_STATUS}-Features\r\n{lines}\r\n{R_SYSTEM_STATUS} End"
+        return f"{R.SYSTEM_STATUS.value}-Features\r\n{lines}\r\n{R.SYSTEM_STATUS.value} End"
 
     async def _handle_opts(self, arg: str) -> str:
         """Handle OPTS command (RFC 2389)."""
         arg_upper = arg.upper()
         if arg_upper in ("UTF8", "UTF8 ON"):
-            return reply("200", "UTF8 mode enabled")
-        return reply(R_SYNTAX_ERROR, f"Option not supported: {arg}")
+            return R.SUCCESS("UTF8 mode enabled")
+        return R.SYNTAX_ERROR(f"Option not supported: {arg}")
 
     async def _handle_noop(self, arg: str) -> str:
-        return reply("200", "NOOP command successful")
+        return R.SUCCESS("NOOP command successful")
 
     async def _handle_stat(self, arg: str) -> str:
         if arg:
@@ -526,12 +512,11 @@ class FTPHandler:
             try:
                 info = await self._storage.stat(target)
             except FileNotFoundError:
-                return reply(R_NOT_AVAILABLE, f"File not found: {arg}")
-            return reply(
-                R_SYSTEM_STATUS,
+                return R.NOT_AVAILABLE(f"File not found: {arg}")
+            return R.SYSTEM_STATUS(
                 f"{info.name}: size={info.size}, type={"dir" if info.is_dir else "file"}",
             )
-        return reply(R_SYSTEM_STATUS, "cos-ftp server running")
+        return R.SYSTEM_STATUS("cos-ftp server running")
 
     # ------------------------------------------------------------------
     # Data connection factory

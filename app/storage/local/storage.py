@@ -25,6 +25,7 @@ class LocalStorage(AbstractStorage):
     """
 
     def __init__(self, root: str | Path) -> None:
+        super().__init__()
         self._root: Path = Path(root).absolute()
 
     # ------------------------------------------------------------------

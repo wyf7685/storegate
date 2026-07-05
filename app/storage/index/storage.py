@@ -1,7 +1,7 @@
 import contextlib
 import hashlib
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import final, override
@@ -144,12 +144,28 @@ class IndexStorage(AbstractStorage):
         ):
             yield
 
+    @contextlib.asynccontextmanager
+    async def _lock_indexes(self, *index_paths: str) -> AsyncGenerator[None]:
+        async with contextlib.AsyncExitStack() as stack:
+            for index_path in sorted(set(index_paths)):
+                await stack.enter_async_context(self._lock_index(index_path))
+            yield
+
+    @contextlib.asynccontextmanager
+    async def _lock_chunks(self, chunk_hashes: Iterable[str]) -> AsyncGenerator[None]:
+        async with contextlib.AsyncExitStack() as stack:
+            for chunk_hash in sorted(set(chunk_hashes)):
+                await stack.enter_async_context(self._lock_chunk(chunk_hash))
+            yield
+
     async def _get_file_meta(self, path: str, lock: bool = True) -> FileMeta | None:
         index = self._ensure_index()
         async with self._lock_index(path) if lock else contextlib.nullcontext():
             if not await index.exists(path):
                 return None
             meta_bytes = await index.download_bytes(path)
+            if not meta_bytes:
+                return None
             return FileMeta.model_validate_json(meta_bytes.decode())
 
     async def _chunk_incref(self, chunk_hash: str, remote_path: str) -> None:
@@ -347,16 +363,24 @@ class IndexStorage(AbstractStorage):
     async def delete(self, path: str) -> None:
         _colored_path = f"<y>{escape_tag(path)}</y>"
         index = self._ensure_index()
-        async with self._lock_index(path), contextlib.AsyncExitStack() as chunk_lock:
+        if await index.is_dir(path):
+            try:
+                await anext(index.iterdir(path))
+                raise OSError(f"Directory not empty: {path}")
+            except StopAsyncIteration:
+                pass
+            await index.delete(path)
+            return
+
+        async with self._lock_index(path):
             meta = await self._get_file_meta(path, lock=False)
             if meta is None:
-                raise FileNotFoundError(f"File not found: {path}")
-            for chunk_hash in sorted(set(meta.chunks)):
-                await chunk_lock.enter_async_context(self._lock_chunk(chunk_hash))
-            async with anyio.create_task_group() as tg:
-                for chunk_hash in meta.chunks:
-                    tg.start_soon(self._chunk_decref, chunk_hash, path)
-            await index.delete(path)
+                return
+            async with self._lock_chunks(meta.chunks):
+                async with anyio.create_task_group() as tg:
+                    for chunk_hash in meta.chunks:
+                        tg.start_soon(self._chunk_decref, chunk_hash, path)
+                await index.delete(path)
         self.log.info(f"Deleted: {_colored_path} (<g>{meta.info.size}</g> bytes, <g>{len(meta.chunks)}</g> chunks)")
 
     @override
@@ -373,12 +397,7 @@ class IndexStorage(AbstractStorage):
         self.log.info(f"Move: {_colored_src} → {_colored_dst}")
 
         index = self._ensure_index()
-        async with (
-            contextlib.AsyncExitStack() as index_lock,
-            contextlib.AsyncExitStack() as chunk_lock,
-        ):
-            for path in sorted((src, dst)):
-                await index_lock.enter_async_context(self._lock_index(path))
+        async with self._lock_indexes(src, dst):
             src_meta = await self._get_file_meta(src, lock=False)
             if src_meta is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
@@ -397,16 +416,16 @@ class IndexStorage(AbstractStorage):
                 ),
                 chunks=src_meta.chunks,
             )
-            for chunk_hash in sorted(set(src_meta.chunks)):
-                await chunk_lock.enter_async_context(self._lock_chunk(chunk_hash))
-            await index.mkdir(Path(dst).parent.as_posix(), parents=True, exist_ok=True)
-            await index.upload_bytes(new_dst_meta.model_dump_json().encode(), dst, overwrite=True)
-            async with anyio.create_task_group() as tg:
-                for chunk_hash in src_meta.chunks:
-                    tg.start_soon(self._chunk_incref, chunk_hash, dst)
-            async with anyio.create_task_group() as tg:
-                for chunk_hash in src_meta.chunks:
-                    tg.start_soon(self._chunk_decref, chunk_hash, src)
+            new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
+            async with self._lock_chunks(src_meta.chunks):
+                await index.mkdir(Path(dst).parent.as_posix(), parents=True, exist_ok=True)
+                await index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
+                async with anyio.create_task_group() as tg:
+                    for chunk_hash in src_meta.chunks:
+                        tg.start_soon(self._chunk_incref, chunk_hash, dst)
+                async with anyio.create_task_group() as tg:
+                    for chunk_hash in src_meta.chunks:
+                        tg.start_soon(self._chunk_decref, chunk_hash, src)
             await index.delete(src)
 
         self.log.info(
@@ -428,12 +447,7 @@ class IndexStorage(AbstractStorage):
         self.log.info(f"Copy: {_colored_src} → {_colored_dst}")
 
         index = self._ensure_index()
-        async with (
-            contextlib.AsyncExitStack() as index_lock,
-            contextlib.AsyncExitStack() as chunk_lock,
-        ):
-            for path in sorted((src, dst)):
-                await index_lock.enter_async_context(self._lock_index(path))
+        async with self._lock_indexes(src, dst):
             src_meta = await self._get_file_meta(src, lock=False)
             if src_meta is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
@@ -452,13 +466,12 @@ class IndexStorage(AbstractStorage):
                 ),
                 chunks=src_meta.chunks,
             )
-            for chunk_hash in sorted(set(src_meta.chunks)):
-                await chunk_lock.enter_async_context(self._lock_chunk(chunk_hash))
-            await index.mkdir(Path(dst).parent.as_posix(), parents=True, exist_ok=True)
-            await index.upload_bytes(new_dst_meta.model_dump_json().encode(), dst, overwrite=True)
-            async with anyio.create_task_group() as tg:
-                for chunk_hash in src_meta.chunks:
-                    tg.start_soon(self._chunk_incref, chunk_hash, dst)
+            async with self._lock_chunks(src_meta.chunks):
+                await index.mkdir(Path(dst).parent.as_posix(), parents=True, exist_ok=True)
+                await index.upload_bytes(new_dst_meta.model_dump_json().encode(), dst, overwrite=True)
+                async with anyio.create_task_group() as tg:
+                    for chunk_hash in src_meta.chunks:
+                        tg.start_soon(self._chunk_incref, chunk_hash, dst)
 
         self.log.info(
             f"Copied: {_colored_src} → {_colored_dst} "

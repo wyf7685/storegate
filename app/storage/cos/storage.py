@@ -26,6 +26,7 @@ class CosStorage(AbstractStorage):
     _config: CosConfig
 
     def __init__(self, config: CosConfig) -> None:
+        super().__init__()
         self._config = config
 
     @classmethod
@@ -147,6 +148,13 @@ class CosStorage(AbstractStorage):
 
     @override
     async def delete(self, path: str) -> None:
+        if await self.is_dir(path):
+            # COS is flat, so we can't delete a "directory" if it has any objects under it.
+            raise OSError(f"Directory not empty: {path}")
+
+        if not await self.is_file(path):
+            return
+
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
         self.log.info(f"Delete: <y>{key}</y>")
