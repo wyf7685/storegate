@@ -6,7 +6,6 @@ import anyio
 import anyio.lowlevel
 import httpx
 
-from app.config import CosConfig, get_config
 from app.log import escape_tag, logger
 
 from .cos_client import AsyncCosClient, MultipartUploadPart
@@ -14,26 +13,6 @@ from .cos_client import AsyncCosClient, MultipartUploadPart
 UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 DEFAULT_TTL_SECS = 3600  # 1 hour
-
-
-def get_cos_config() -> CosConfig:
-    config = get_config().cos
-    if config is None:
-        raise RuntimeError("COS configuration is not set")
-    return config
-
-
-def create_client(config: CosConfig | None = None) -> AsyncCosClient:
-    if config is None:
-        config = get_cos_config()
-
-    return AsyncCosClient(
-        region=config.region,
-        bucket=config.bucket,
-        is_internal=config.is_internal,
-        secret_id=config.secret_id.get_secret_value(),
-        secret_key=config.secret_key.get_secret_value(),
-    )
 
 
 def get_object_key(key: str) -> str:

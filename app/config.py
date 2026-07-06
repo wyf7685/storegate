@@ -1,10 +1,6 @@
-import json
 from pathlib import Path
 
 from pydantic import BaseModel, SecretStr
-
-from app.const import CONFIG_FILE
-from app.utils import SecretStrEncoder
 
 
 class CosConfig(BaseModel):
@@ -12,30 +8,12 @@ class CosConfig(BaseModel):
     secret_key: SecretStr
     region: str
     bucket: str
-    is_internal: bool
+    is_internal: bool = False
+    max_concurrency: int = 16
+    token: str | None = None
+    scheme: str = "https"
+    timeout: float = 30
 
     @classmethod
     def from_file(cls, path: str | Path) -> CosConfig:
         return cls.model_validate_json(Path(path).read_bytes())
-
-
-class Config(BaseModel):
-    cos: CosConfig | None = None
-
-
-def _load_config() -> Config:
-    if not CONFIG_FILE.exists():
-        return Config()
-    return Config.model_validate_json(CONFIG_FILE.read_bytes())
-
-
-_config: Config | None = None
-
-
-def get_config() -> Config:
-    global _config
-    if _config is None:
-        _config = _load_config()
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(_config.model_dump(), indent=2, cls=SecretStrEncoder), encoding="utf-8")
-    return _config

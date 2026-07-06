@@ -7,13 +7,11 @@ from typing import final, override
 import anyio
 import anyio.lowlevel
 
-from app.config import CosConfig
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
-from app.storage.cos.cos_client.models import ListObjectsDir, MultipartUploadPart
 from app.utils import coalesce_chunks
 
-from .cos_client import AsyncCosClient
-from .utils import UPLOAD_CHUNK_SIZE, MultipartUploadTask, create_client
+from .cos_client import AsyncCosClient, CosConfig, ListObjectsDir, MultipartUploadPart
+from .utils import UPLOAD_CHUNK_SIZE, MultipartUploadTask
 
 # Files larger than this are copied via multipart upload to stay within
 # the PUT Object - Copy 5 GiB limit and to allow parallel part copies.
@@ -46,7 +44,7 @@ class CosStorage(AbstractStorage):
 
     @override
     async def connect(self) -> None:
-        self._client = create_client(self._config)
+        self._client = AsyncCosClient(self._config)
         await self._client.__aenter__()
         if not await self.ping():
             raise RuntimeError("Failed to connect to COS bucket. Please check your configuration.")

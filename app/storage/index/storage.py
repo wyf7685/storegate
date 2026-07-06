@@ -15,13 +15,13 @@ from app.utils import LoggerWrapper
 
 from ..abstract import AbstractStorage, BytesLike, FileInfo
 
-BLOCK_SIZE = 256 * 1024 * 1024  # 256 MB
+BLOCK_SIZE = 64 * 1024 * 1024  # 64 MB
 CHUNKS_INDEX_FILE = "__chunks_index_id__"
 
 
 def hash_to_path(hash_str: str, suffix: str | None = None) -> str:
     """Convert a hash string to a path with subdirectories."""
-    return f"{hash_str[:2]}/{hash_str[2:4]}/{hash_str[4:]}{f".{suffix}" if suffix else ""}"
+    return f"{hash_str[:2]}/{hash_str[2:6]}/{hash_str[6:]}{f".{suffix}" if suffix else ""}"
 
 
 @contextlib.asynccontextmanager
@@ -100,6 +100,7 @@ class IndexStorage(AbstractStorage):
         self.log.info(f"Connecting IndexStorage (index=<c>{index.id}</c>, chunks=<c>{chunks.id}</c>)")
         await index.connect()
         await chunks.connect()
+
         if not await chunks.exists(CHUNKS_INDEX_FILE):
             await chunks.upload_bytes(index.id.encode(), CHUNKS_INDEX_FILE, overwrite=True)
             self.log.debug(f"Registered chunks storage <c>{chunks.id}</c> → index <c>{index.id}</c>")
@@ -244,8 +245,8 @@ class IndexStorage(AbstractStorage):
 
             bin_path = hash_to_path(chunk_hash, "bin")
             await chunks.move(temp_path, bin_path)
-            await self._chunk_incref(chunk_hash, remote_path)
             chunk_decref.push_async_callback(self._chunk_decref, chunk_hash, remote_path)
+            await self._chunk_incref(chunk_hash, remote_path)
             self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> saved for {_colored_path}")
 
         index = self._ensure_index()
@@ -350,13 +351,25 @@ class IndexStorage(AbstractStorage):
             meta = await self._get_file_meta(remote_path, lock=False)
             if meta is None:
                 raise FileNotFoundError(f"File not found: {remote_path}")
-            for chunk_hash in meta.chunks:
+            for idx, chunk_hash in enumerate(meta.chunks):
                 bin_path = hash_to_path(chunk_hash, "bin")
                 async with self._lock_chunk(chunk_hash):
                     if not await chunks.exists(bin_path):
                         raise FileNotFoundError(f"Chunk not found: {chunk_hash}")
+                    hasher = hashlib.sha256()
                     async for chunk in chunks.download_stream(bin_path):
+                        hasher.update(chunk)
                         yield chunk
+                    actual_hash = hasher.hexdigest()
+                    if actual_hash != chunk_hash:
+                        self.log.error(
+                            f"Chunk hash mismatch for <c>{chunk_hash[:8]}</c> (got <r>{actual_hash[:8]}</r>) "
+                            f"for Chunk #{idx + 1} of {_colored_path}"
+                        )
+                        raise ValueError(
+                            f"Chunk hash mismatch for {chunk_hash} (got {actual_hash}) "
+                            f"for Chunk #{idx + 1} of {remote_path}"
+                        )
 
     @override
     async def delete(self, path: str) -> None:
@@ -502,7 +515,7 @@ class IndexStorage(AbstractStorage):
                     tg.start_soon(self.rmtree, info.path)
                 else:
                     tg.start_soon(self.delete, info.path)
-
+        await index.delete(path)
         self.log.info(f"RmTree complete: {_colored_path} (<g>{count}</g> entries removed)")
 
     @override
@@ -520,14 +533,13 @@ class IndexStorage(AbstractStorage):
     @override
     async def stat(self, path: str) -> FileInfo:
         index = self._ensure_index()
-        async with self._lock_index(path):
-            if await self.is_dir(path):
-                return await index.stat(path)
-            if not await index.is_file(path):
-                raise FileNotFoundError(f"File not found: {path}")
-            meta_bytes = await index.download_bytes(path)
-            meta = FileMeta.model_validate_json(meta_bytes.decode())
-            return meta.info
+        if await self.is_dir(path):
+            return await index.stat(path)
+        if not await index.is_file(path):
+            raise FileNotFoundError(f"File not found: {path}")
+        meta_bytes = await index.download_bytes(path)
+        meta = FileMeta.model_validate_json(meta_bytes.decode())
+        return meta.info
 
     @override
     async def iterdir(self, path: str) -> AsyncIterator[FileInfo]:

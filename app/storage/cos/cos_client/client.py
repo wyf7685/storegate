@@ -13,6 +13,7 @@ from .errors import CosClientError, CosHttpStatusError, CosResponseParseError
 from .models import (
     CopyObjectResult,
     CopyPartResult,
+    CosConfig,
     HeadObjectResponse,
     ListObjectsDir,
     ListObjectsItem,
@@ -83,26 +84,20 @@ def _parse_copy_part_result(content: bytes) -> CopyPartResult:
 
 
 class AsyncCosClient:
-    def __init__(
-        self,
-        *,
-        region: str,
-        bucket: str,
-        secret_id: str,
-        secret_key: str,
-        is_internal: bool = False,
-        token: str | None = None,
-        scheme: str = "https",
-        timeout: float = 30,
-    ) -> None:
-        self._host = f"{bucket}.cos{"-internal" if is_internal else ""}.{region}.myqcloud.com"
-        self._base_url = f"{scheme}://{self._host}"
-        self._public_host = f"{bucket}.cos.{region}.myqcloud.com"
-        self._presign_base_url = f"{scheme}://{self._public_host}"
-        self._token = token
-        self._timeout = timeout
+    def __init__(self, config: CosConfig) -> None:
+        self._config = config
+        self._host = f"{config.bucket}.cos{"-internal" if config.is_internal else ""}.{config.region}.myqcloud.com"
+        self._base_url = f"{config.scheme}://{self._host}"
+        self._public_host = f"{config.bucket}.cos.{config.region}.myqcloud.com"
+        self._presign_base_url = f"{config.scheme}://{self._public_host}"
+        self._token = config.token
+        self._timeout = config.timeout
         self._client: httpx.AsyncClient | None = None
-        self._signer = CosV5Signer(secret_id=secret_id, secret_key=secret_key)
+        self._signer = CosV5Signer(
+            secret_id=config.secret_id.get_secret_value(),
+            secret_key=config.secret_key.get_secret_value(),
+        )
+        self._semaphore = anyio.Semaphore(config.max_concurrency)
 
     async def __aenter__(self) -> Self:
         if self._client is None:
@@ -222,13 +217,14 @@ class AsyncCosClient:
             expired=expired,
         )
 
-        response = await self._require_client().request(
-            method=method,
-            url=request_path,
-            params=query,
-            headers=signed_headers,
-            content=content,
-        )
+        async with self._semaphore:
+            response = await self._require_client().request(
+                method=method,
+                url=request_path,
+                params=query,
+                headers=signed_headers,
+                content=content,
+            )
 
         if response.status_code >= 400:
             body = response.text.strip() or "<empty body>"
