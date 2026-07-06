@@ -50,10 +50,7 @@ class CosStorage(AbstractStorage):
         await self._client.__aenter__()
         if not await self.ping():
             raise RuntimeError("Failed to connect to COS bucket. Please check your configuration.")
-        self.log.info(
-            f"Connected to bucket <c>{self._config.bucket}</c> "
-            f"in region <c>{self._config.region}</c>"
-        )
+        self.log.info(f"Connected to bucket <c>{self._config.bucket}</c> in region <c>{self._config.region}</c>")
 
     @override
     async def close(self) -> None:
@@ -66,15 +63,18 @@ class CosStorage(AbstractStorage):
     async def ping(self) -> bool:
         if self._client is None:
             return False
+        agen = self._client.list_objects(max_keys=1)
         try:
             # Use list_objects instead of head_bucket to work with minimal
             # IAM policies (head_bucket requires GetBucket permission).
             with contextlib.suppress(StopAsyncIteration):  # bucket exists but is empty — still healthy
-                await anext(self._client.list_objects(max_keys=1))
+                await anext(agen)
         except Exception:
             return False
         else:
             return True
+        finally:
+            await agen.aclose()
 
     def _ensure_client(self) -> AsyncCosClient:
         if self._client is None:
@@ -201,9 +201,7 @@ class CosStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
-        self.log.debug(
-            f"COS is flat — skipping mkdir for <y>{self._remote_path_to_key(path)}</y>"
-        )
+        self.log.debug(f"COS is flat — skipping mkdir for <y>{self._remote_path_to_key(path)}</y>")
 
     @override
     async def rmtree(self, path: str) -> None:
@@ -308,16 +306,15 @@ class CosStorage(AbstractStorage):
 
         yield key, dirs, files
         for dir in dirs:
-            async for sub_path, sub_dirs, sub_files in self._walk(dir.path):
-                yield sub_path, sub_dirs, sub_files
+            async for sp, sd, sf in self._walk(dir.path):
+                yield sp, sd, sf
 
     async def _copy_multipart(self, src_key: str, dst_key: str, src_size: int) -> None:
         """Server-side copy via multipart upload for objects above the threshold."""
         client = self._ensure_client()
         num_parts = (src_size + UPLOAD_CHUNK_SIZE - 1) // UPLOAD_CHUNK_SIZE
         self.log.debug(
-            f"Multipart copy: <y>{src_key}</y> → <y>{dst_key}</y> "
-            f"(<g>{src_size}</g> bytes in <g>{num_parts}</g> parts)"
+            f"Multipart copy: <y>{src_key}</y> → <y>{dst_key}</y> (<g>{src_size}</g> bytes in <g>{num_parts}</g> parts)"
         )
 
         upload_id = await client.create_multipart_upload(dst_key)

@@ -19,9 +19,9 @@ BLOCK_SIZE = 256 * 1024 * 1024  # 256 MB
 CHUNKS_INDEX_FILE = "__chunks_index_id__"
 
 
-def hash_to_path(hash_str: str) -> str:
+def hash_to_path(hash_str: str, suffix: str | None = None) -> str:
     """Convert a hash string to a path with subdirectories."""
-    return f"{hash_str[:2]}/{hash_str[2:4]}/{hash_str[4:]}"
+    return f"{hash_str[:2]}/{hash_str[2:4]}/{hash_str[4:]}{f".{suffix}" if suffix else ""}"
 
 
 @contextlib.asynccontextmanager
@@ -140,7 +140,7 @@ class IndexStorage(AbstractStorage):
         async with _storage_file_lock(
             self.log,
             storage=self._ensure_chunks(),
-            lock_path=f"{hash_to_path(chunk_hash)}.lock",
+            lock_path=hash_to_path(chunk_hash, "lock"),
         ):
             yield
 
@@ -170,7 +170,7 @@ class IndexStorage(AbstractStorage):
 
     async def _chunk_incref(self, chunk_hash: str, remote_path: str) -> None:
         chunks = self._ensure_chunks()
-        ref_path = f"{hash_to_path(chunk_hash)}.ref"
+        ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
 
         if await chunks.exists(ref_path):
@@ -183,8 +183,7 @@ class IndexStorage(AbstractStorage):
 
     async def _chunk_decref(self, chunk_hash: str, remote_path: str) -> None:
         chunks = self._ensure_chunks()
-        ref_path = f"{hash_to_path(chunk_hash)}.ref"
-        bin_path = f"{hash_to_path(chunk_hash)}.bin"
+        ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
 
         if not await chunks.exists(ref_path):
@@ -202,7 +201,7 @@ class IndexStorage(AbstractStorage):
             self.log.debug(f"Chunk {_colored_hash} -ref → <g>{len(refs)}</g> (<i>{escape_tag(remote_path)}</i>)")
         else:
             await chunks.delete(ref_path)
-            await chunks.delete(bin_path)
+            await chunks.delete(hash_to_path(chunk_hash, "bin"))
             self.log.debug(f"Chunk {_colored_hash} ref=0, deleted data (<i>{escape_tag(remote_path)}</i>)")
 
     @override
@@ -243,7 +242,7 @@ class IndexStorage(AbstractStorage):
                     await chunks.delete(temp_path)
                 raise
 
-            bin_path = f"{hash_to_path(chunk_hash)}.bin"
+            bin_path = hash_to_path(chunk_hash, "bin")
             await chunks.move(temp_path, bin_path)
             await self._chunk_incref(chunk_hash, remote_path)
             chunk_decref.push_async_callback(self._chunk_decref, chunk_hash, remote_path)
@@ -352,7 +351,7 @@ class IndexStorage(AbstractStorage):
             if meta is None:
                 raise FileNotFoundError(f"File not found: {remote_path}")
             for chunk_hash in meta.chunks:
-                bin_path = f"{hash_to_path(chunk_hash)}.bin"
+                bin_path = hash_to_path(chunk_hash, "bin")
                 async with self._lock_chunk(chunk_hash):
                     if not await chunks.exists(bin_path):
                         raise FileNotFoundError(f"Chunk not found: {chunk_hash}")
@@ -466,9 +465,10 @@ class IndexStorage(AbstractStorage):
                 ),
                 chunks=src_meta.chunks,
             )
+            new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
             async with self._lock_chunks(src_meta.chunks):
                 await index.mkdir(Path(dst).parent.as_posix(), parents=True, exist_ok=True)
-                await index.upload_bytes(new_dst_meta.model_dump_json().encode(), dst, overwrite=True)
+                await index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in src_meta.chunks:
                         tg.start_soon(self._chunk_incref, chunk_hash, dst)
@@ -547,10 +547,16 @@ class IndexStorage(AbstractStorage):
         index = self._ensure_index()
         if not await index.is_dir(path):
             raise NotADirectoryError(f"Not a directory: {path}")
-        async for sub_dir, dirs, files in index.walk(path):
-            file_infos: list[FileInfo] = []
-            for file_entry in files:
-                meta = await self._get_file_meta(file_entry.path)
-                if meta is not None:
-                    file_infos.append(meta.info)
-            yield sub_dir, dirs, file_infos
+
+        async def _fetch_meta(path: str) -> None:
+            meta = await self._get_file_meta(path)
+            if meta is not None:
+                files.append(meta.info)
+
+        async for sp, sd, sf in index.walk(path):
+            files: list[FileInfo] = []
+            async with anyio.create_task_group() as tg:
+                for entry in sf:
+                    tg.start_soon(_fetch_meta, entry.path)
+            files.sort(key=lambda x: x.name)
+            yield sp, sd, files

@@ -159,14 +159,10 @@ class MemoryStorage(AbstractStorage):
             # Only allow deletion of empty directories.
             for key in self._files:
                 if key.startswith(prefix):
-                    raise OSError(
-                        f"Directory not empty: {path}"
-                    )
+                    raise OSError(f"Directory not empty: {path}")
             for key in self._dirs:
                 if key != _target and key.startswith(prefix):
-                    raise OSError(
-                        f"Directory not empty: {path}"
-                    )
+                    raise OSError(f"Directory not empty: {path}")
         else:
             raise FileNotFoundError(f"Path not found: {path}")
 

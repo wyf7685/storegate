@@ -149,7 +149,6 @@ class AbstractStorage(ABC):
         local_path: str | Path,
     ) -> None:
         """Download to a local file."""
-
         async with ayafileio.open(local_path, "wb") as file:
             async for chunk in self.download_stream(remote_path):
                 await file.write(chunk)

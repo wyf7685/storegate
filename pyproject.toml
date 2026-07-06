@@ -12,3 +12,8 @@ dependencies = [
     "loguru>=0.7.3",
     "pydantic>=2.13.4",
 ]
+
+[dependency-groups]
+dev = [
+    "ty>=0.0.56",
+]
