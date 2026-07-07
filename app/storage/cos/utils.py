@@ -1,5 +1,7 @@
 import contextlib
+import json
 from collections.abc import AsyncGenerator, AsyncIterable
+from datetime import datetime
 from typing import Self
 
 import anyio
@@ -7,6 +9,7 @@ import anyio.lowlevel
 import httpx
 
 from app.log import escape_tag, logger
+from app.storage.abstract import FileInfo
 
 from .cos_client import AsyncCosClient, MultipartUploadPart
 
@@ -17,6 +20,36 @@ DEFAULT_TTL_SECS = 3600  # 1 hour
 
 def get_object_key(key: str) -> str:
     return key
+
+
+def serialize_file_info(info: FileInfo) -> bytes:
+    """将 ``FileInfo`` 序列化为 JSON bytes，用作目录标记对象的值。"""
+    data: dict[str, object] = {
+        "path": info.path,
+        "name": info.name,
+        "is_dir": True,
+        "size": info.size,
+    }
+    if info.modified is not None:
+        data["modified"] = info.modified.isoformat()
+    if info.created is not None:
+        data["created"] = info.created.isoformat()
+    return json.dumps(data, separators=(",", ":")).encode("utf-8")
+
+
+def deserialize_file_info(path: str, data: bytes) -> FileInfo:
+    """从 JSON bytes 反序列化 ``FileInfo``（仅用于目录标记对象）。"""
+    obj = json.loads(data.decode("utf-8"))
+    modified = datetime.fromisoformat(obj["modified"]) if "modified" in obj else None
+    created = datetime.fromisoformat(obj["created"]) if "created" in obj else None
+    return FileInfo(
+        path=obj.get("path", path),
+        name=obj.get("name", ""),
+        is_dir=True,
+        size=obj.get("size"),
+        modified=modified,
+        created=created,
+    )
 
 
 class MultipartUploadTask:

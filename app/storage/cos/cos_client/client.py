@@ -1,6 +1,8 @@
+import base64
+import hashlib
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Literal, Self
 from urllib.parse import quote, urlencode
@@ -308,7 +310,11 @@ class AsyncCosClient:
         etag = response.headers.get("ETag")
         if etag is None or etag == "":
             raise CosResponseParseError("Missing ETag in head_object response")
-        return HeadObjectResponse(content_length=content_length, etag=etag)
+        last_modified_str = response.headers.get("Last-Modified")
+        if last_modified_str is None or last_modified_str == "":
+            raise CosResponseParseError("Missing Last-Modified in head_object response")
+        last_modified = datetime.strptime(last_modified_str, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=UTC)
+        return HeadObjectResponse(content_length=content_length, etag=etag, last_modified=last_modified)
 
     async def get_object(self, key: str, range: tuple[int, int] | None = None) -> bytes:  # noqa: A002
         headers: dict[str, str] = {}
@@ -356,11 +362,15 @@ class AsyncCosClient:
         for key in keys:
             ET.SubElement(ET.SubElement(root, "Object"), "Key").text = key
         content = ET.tostring(root, encoding="utf-8")
+        content_md5 = base64.b64encode(hashlib.md5(content).digest()).decode()  # noqa: S324
         response = await self._request(
             method="POST",
             key="",
             params={"delete": ""},
-            headers={"Content-Type": "application/xml"},
+            headers={
+                "Content-Type": "application/xml",
+                "Content-MD5": content_md5,
+            },
             content=content,
         )
 

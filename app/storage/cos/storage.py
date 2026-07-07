@@ -1,6 +1,7 @@
 import contextlib
 import itertools
 from collections.abc import AsyncIterable, AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import final, override
 
@@ -10,8 +11,8 @@ import anyio.lowlevel
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
 from app.utils import coalesce_chunks
 
-from .cos_client import AsyncCosClient, CosConfig, ListObjectsDir, MultipartUploadPart
-from .utils import UPLOAD_CHUNK_SIZE, MultipartUploadTask
+from .cos_client import AsyncCosClient, CosConfig, CosHttpStatusError, ListObjectsDir, MultipartUploadPart
+from .utils import UPLOAD_CHUNK_SIZE, MultipartUploadTask, deserialize_file_info, serialize_file_info
 
 # Files larger than this are copied via multipart upload to stay within
 # the PUT Object - Copy 5 GiB limit and to allow parallel part copies.
@@ -85,6 +86,17 @@ class CosStorage(AbstractStorage):
             path = path.relative_to("/")
         return str(path) if path != PurePosixPath(".") else ""
 
+    def _dir_key(self, path: str) -> str | None:
+        """返回目录标记对象的 COS 键。
+
+        目录标记对象使用尾随 ``/`` 的键存储。
+        根目录（``""``）没有标记对象，返回 ``None``。
+        """
+        key = self._remote_path_to_key(path)
+        if key == "":
+            return None
+        return key + "/"
+
     @override
     async def upload_stream(
         self,
@@ -146,17 +158,31 @@ class CosStorage(AbstractStorage):
 
     @override
     async def delete(self, path: str) -> None:
-        if await self.is_dir(path):
-            # COS is flat, so we can't delete a "directory" if it has any objects under it.
-            raise OSError(f"Directory not empty: {path}")
-
-        if not await self.is_file(path):
-            return
-
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
-        self.log.info(f"Delete: <y>{key}</y>")
-        await client.delete_object(key=key)
+
+        # 1. 文件：直接删除
+        if await client.head_object(key=key) is not None:
+            self.log.info(f"Delete: <y>{key}</y>")
+            await client.delete_object(key=key)
+            return
+
+        # 2. 目录：检查为空后删除标记对象
+        if await self.is_dir(path):
+            try:
+                await anext(self.iterdir(path))
+            except StopAsyncIteration:
+                pass  # 空目录
+            else:
+                raise OSError(f"Directory not empty: {path}")
+
+            dir_key = self._dir_key(path)
+            assert dir_key is not None  # is_dir=True 且不是根目录
+            self.log.info(f"Delete dir: <y>{dir_key}</y>")
+            await client.delete_object(key=dir_key)
+            return
+
+        # 3. 不存在：静默成功（保持现有约定）
 
     @override
     async def move(
@@ -199,7 +225,49 @@ class CosStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
-        self.log.debug(f"COS is flat — skipping mkdir for <y>{self._remote_path_to_key(path)}</y>")
+        key = self._remote_path_to_key(path)
+
+        # 根目录始终存在
+        if key == "":
+            if exist_ok:
+                return
+            raise FileExistsError("Root directory already exists")
+
+        client = self._ensure_client()
+        dir_key = self._dir_key(path)
+        assert dir_key is not None  # key != "" 保证了这一点
+
+        # 冲突检查：同名文件
+        if await client.head_object(key=key) is not None:
+            raise FileExistsError(f"Path is a file: {path}")
+
+        # 重复检查：标记对象已存在
+        if await client.head_object(key=dir_key) is not None:
+            if exist_ok:
+                return
+            raise FileExistsError(f"Directory already exists: {path}")
+
+        # 父目录处理
+        parent = PurePosixPath(path).parent
+        parent_path = parent.as_posix()
+        parent_is_root = parent_path in (".", "/", "")
+        if parents and not parent_is_root:
+            await self.mkdir(parent_path, parents=True, exist_ok=True)
+        elif not parent_is_root and not await self.is_dir(parent_path):
+            raise FileNotFoundError(f"Parent directory not found: {parent_path}")
+
+        # 创建标记对象
+        now = datetime.now(UTC)
+        info = FileInfo(
+            path=path,
+            name=PurePosixPath(path).name,
+            is_dir=True,
+            size=None,
+            modified=now,
+            created=now,
+        )
+        await client.put_object(key=dir_key, data=serialize_file_info(info))
+        self.log.info(f"MkDir: <y>{key}</y>")
 
     @override
     async def rmtree(self, path: str) -> None:
@@ -207,22 +275,57 @@ class CosStorage(AbstractStorage):
         key = self._remote_path_to_key(path)
         self.log.info(f"RmTree: <y>{key}</y>")
 
-        deleted = 0
-        async for _, _, files in self.walk(path):
-            for batch in itertools.batched(files, 100):
-                await client.delete_objects(self._remote_path_to_key(file.path) for file in batch)
-                deleted += len(batch)
+        if not await self.is_dir(path):
+            raise NotADirectoryError(f"Not a directory: {path}")
 
-        # Also delete the object at the path itself (COS "directory marker" object).
-        if await self.is_file(path):
-            await client.delete_object(key)
-            deleted += 1
+        # 先收集再删除：避免删除操作干扰 walk 的 list_objects 分页迭代
+        file_keys: list[str] = []
+        dir_paths: list[str] = []
+        async for _sp, _sd, sf in self.walk(path):
+            file_keys.extend(self._remote_path_to_key(f.path) for f in sf)
+            dir_paths.extend(d.path for d in _sd)
 
-        self.log.info(f"RmTree complete: <y>{key}</y> (<g>{deleted}</g> objects deleted)")
+        # 批量删除文件
+        deleted_files = 0
+        for batch in itertools.batched(file_keys, 100):
+            if batch:
+                await client.delete_objects(batch)
+                deleted_files += len(batch)
+
+        # 自底向上删除目录标记对象
+        deleted_dirs = 0
+        for dir_path in reversed(dir_paths):
+            dir_key = self._dir_key(dir_path)
+            if dir_key is not None and await client.head_object(key=dir_key) is not None:
+                await client.delete_object(key=dir_key)
+                deleted_dirs += 1
+
+        # 删除根路径自身的标记对象
+        root_dir_key = self._dir_key(path)
+        if root_dir_key is not None and await client.head_object(key=root_dir_key) is not None:
+            await client.delete_object(key=root_dir_key)
+            deleted_dirs += 1
+
+        self.log.info(f"RmTree complete: <y>{key}</y> (<g>{deleted_files}</g> files, <g>{deleted_dirs}</g> dirs)")
 
     @override
     async def exists(self, path: str) -> bool:
-        return await self.is_file(path) or await self.is_dir(path)
+        key = self._remote_path_to_key(path)
+        if key == "":
+            return True  # 根目录始终存在
+
+        client = self._ensure_client()
+
+        # 文件
+        if await client.head_object(key=key) is not None:
+            return True
+
+        # 目录标记
+        dir_key = self._dir_key(path)
+        if dir_key is not None and await client.head_object(key=dir_key) is not None:  # noqa: SIM103
+            return True
+
+        return False
 
     @override
     async def is_file(self, path: str) -> bool:
@@ -233,28 +336,43 @@ class CosStorage(AbstractStorage):
     @override
     async def is_dir(self, path: str) -> bool:
         key = self._remote_path_to_key(path)
-        # Root of a bucket is always a valid "directory".
         if key == "":
-            return True
-        client = self._ensure_client()
-        prefix = key + "/"
-        async for _ in client.list_objects(prefix=prefix, delimiter="/", max_keys=1):
-            return True
-        return False
+            return True  # 根目录始终为目录
+
+        dir_key = self._dir_key(path)
+        if dir_key is None:
+            return False
+        return await self._ensure_client().head_object(key=dir_key) is not None
 
     @override
     async def stat(self, path: str) -> FileInfo:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
+
+        # 根目录：不需要 COS 请求
+        if key == "":
+            return FileInfo(path=path, name="", is_dir=True, size=None)
+
+        # 1. 尝试作为常规文件
         head = await client.head_object(key=key)
-        if head is None:
-            raise FileNotFoundError(f"Object not found: {path}")
-        return FileInfo(
-            path=path,
-            name=PurePosixPath(path).name,
-            size=head.content_length,
-            is_dir=False,
-        )
+        if head is not None:
+            return FileInfo(
+                path=path,
+                name=PurePosixPath(path).name,
+                size=head.content_length,
+                is_dir=False,
+                modified=head.last_modified,
+            )
+
+        # 2. 尝试作为目录（读取标记对象）
+        dir_key = self._dir_key(path)
+        if dir_key is not None:
+            head = await client.head_object(key=dir_key)
+            if head is not None:
+                body = await client.get_object(key=dir_key)
+                return deserialize_file_info(path, body)
+
+        raise FileNotFoundError(f"Object not found: {path}")
 
     @override
     def iterdir(self, path: str) -> AsyncIterator[FileInfo]:
@@ -271,22 +389,25 @@ class CosStorage(AbstractStorage):
         prefix = (key + "/") if key else None
         async for obj in client.list_objects(prefix=prefix, delimiter="/"):
             if isinstance(obj, ListObjectsDir):
-                yield FileInfo(
-                    path=obj.prefix.rstrip("/"),
-                    name=PurePosixPath(obj.prefix.rstrip("/")).name,
-                    size=0,
-                    is_dir=True,
-                )
+                dir_path = obj.prefix.rstrip("/")
+                # 读取标记对象获取完整 FileInfo
+                try:
+                    body = await client.get_object(key=dir_path + "/")
+                except CosHttpStatusError:
+                    # 无标记对象 → 不是合法目录，跳过
+                    continue
+                yield deserialize_file_info(dir_path, body)
                 continue
 
-            # Extract the immediate child name from the full COS key.
+            # 提取直接子级名称
             if key:  # noqa: SIM108
                 rest = obj.key[len(key) + 1 :]  # "test/foo/bar.txt" → "foo/bar.txt"
             else:
                 rest = obj.key  # "foo/bar.txt" → "foo/bar.txt"
 
-            if "/" in rest:
-                continue  # not an immediate child
+            # 跳过：非直接子级 (rest 含 "/") 或目录自身的标记对象 (rest 为空)
+            if not rest or "/" in rest:
+                continue
 
             yield FileInfo(
                 path=obj.key,

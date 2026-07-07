@@ -35,6 +35,7 @@ class CompleteMultipartUploadPayload(TypedDict):
 class HeadObjectResponse:
     content_length: int
     etag: str
+    last_modified: datetime
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
