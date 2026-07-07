@@ -84,7 +84,7 @@ class DataConnection:
             raise RuntimeError("Data connection not established")
         return await self._stream.receive(max_bytes)
 
-    def receive_chunks(self, chunk_size: int = 65536) -> _DataStreamReader:
+    def receive_chunks(self, chunk_size: int = 65536) -> AsyncIterator[bytes]:
         """Return an async iterable that yields chunks from the data connection."""
         if self._stream is None:
             raise RuntimeError("Data connection not established")
