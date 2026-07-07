@@ -3,7 +3,7 @@ import shutil
 from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Self, final, override
+from typing import final, override
 
 import anyio
 import anyio.lowlevel
@@ -27,15 +27,6 @@ class LocalStorage(AbstractStorage):
     def __init__(self, root: str | Path) -> None:
         super().__init__()
         self._root: Path = Path(root).absolute()
-
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def from_directory(cls, directory: str | Path) -> Self:
-        """Create a ``LocalStorage`` rooted at *directory*."""
-        return cls(root=directory)
 
     # ------------------------------------------------------------------
     # Identity

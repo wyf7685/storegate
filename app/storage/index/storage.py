@@ -30,30 +30,29 @@ class FileMeta(BaseModel):
 
 @final
 class IndexStorage(AbstractStorage):
-    _index: AbstractStorage | None = None
-    _chunks: AbstractStorage | None = None
-    _block_size: int = BLOCK_SIZE
-    _max_concurrent_uploads: int = MAX_CONCURRENT_UPLOADS
-    _skip_locking: bool = False
+    _index: AbstractStorage | None
+    _chunks: AbstractStorage | None
+    _block_size: int
+    _max_concurrent_uploads: int
+    _skip_locking: bool
 
-    @classmethod
-    def from_storage(
-        cls,
+    def __init__(
+        self,
         index: AbstractStorage,
         chunks: AbstractStorage,
         block_size: int = BLOCK_SIZE,
         max_concurrent_uploads: int = MAX_CONCURRENT_UPLOADS,
         skip_locking: bool = False,
-    ) -> IndexStorage:
+    ):
         if index is chunks:
             raise ValueError("Index storage and chunks storage cannot be the same.")
-        self = cls()
+
+        super().__init__()
         self._index = index
         self._chunks = chunks
         self._block_size = block_size
         self._max_concurrent_uploads = max_concurrent_uploads
         self._skip_locking = skip_locking
-        return self
 
     def _ensure_index(self) -> AbstractStorage:
         if self._index is None:
@@ -165,25 +164,24 @@ class IndexStorage(AbstractStorage):
     @contextlib.asynccontextmanager
     async def _lock_indexes(self, *index_paths: str) -> AsyncGenerator[None]:
         index = self._ensure_index()
-        paths = sorted(set(index_paths))
         try:
-            for index_path in paths:
+            for index_path in sorted(set(index_paths)):
                 await self._acquire_storage_file_lock(index, f"{index_path}.lock")
             yield
         finally:
-            await self._release_storage_file_lock(index, *(f"{index_path}.lock" for index_path in paths))
+            await self._release_storage_file_lock(index, *(f"{index_path}.lock" for index_path in index_paths))
 
     @contextlib.asynccontextmanager
     async def _lock_chunks(self, chunk_hashes: Iterable[str]) -> AsyncGenerator[None]:
         chunks = self._ensure_chunks()
-        hashes = sorted(set(chunk_hashes))
-
         try:
-            for chunk_hash in hashes:
+            for chunk_hash in sorted(set(chunk_hashes)):
                 await self._acquire_storage_file_lock(chunks, hash_to_path(chunk_hash, "lock"))
             yield
         finally:
-            await self._release_storage_file_lock(chunks, *(hash_to_path(chunk_hash, "lock") for chunk_hash in hashes))
+            await self._release_storage_file_lock(
+                chunks, *(hash_to_path(chunk_hash, "lock") for chunk_hash in chunk_hashes)
+            )
 
     async def _get_file_meta(self, path: str) -> FileMeta | None:
         index = self._ensure_index()
@@ -421,15 +419,22 @@ class IndexStorage(AbstractStorage):
             meta = await self._get_file_meta(remote_path)
             if meta is None:
                 raise FileNotFoundError(f"File not found: {remote_path}")
+            total_size = 0
+            file_start = anyio.current_time()
             for idx, chunk_hash in enumerate(meta.chunks):
+                self.log.debug(f"Downloading Chunk #{idx + 1} <c>{chunk_hash[:8]}</c> for {_colored_path}")
                 bin_path = hash_to_path(chunk_hash, "bin")
                 async with self._lock_chunk(chunk_hash):
                     if not await chunks.exists(bin_path):
                         raise FileNotFoundError(f"Chunk not found: {chunk_hash}")
                     hasher = hashlib.sha256()
+                    chunk_size = 0
+                    chunk_start = anyio.current_time()
                     async for chunk in chunks.download_stream(bin_path):
                         hasher.update(chunk)
+                        chunk_size += len(chunk)
                         yield chunk
+                    chunk_elapsed = anyio.current_time() - chunk_start
                     actual_hash = hasher.hexdigest()
                     if actual_hash != chunk_hash:
                         self.log.error(
@@ -440,6 +445,16 @@ class IndexStorage(AbstractStorage):
                             f"Chunk hash mismatch for {chunk_hash} (got {actual_hash}) "
                             f"for Chunk #{idx + 1} of {remote_path}"
                         )
+                    self.log.debug(
+                        f"Downloaded Chunk #{idx + 1} <c>{chunk_hash[:8]}</c> for {_colored_path} "
+                        f"(<g>{chunk_size:,}</g> bytes, <g>{chunk_elapsed:.2f}</g> s)"
+                    )
+                    total_size += chunk_size
+            file_elapsed = anyio.current_time() - file_start
+            self.log.info(
+                f"Download complete: {_colored_path} (<g>{total_size:,}</g> bytes in <g>{len(meta.chunks)}</g> chunks, "
+                f"<g>{file_elapsed:.2f}</g> s)"
+            )
 
     @override
     async def delete(self, path: str) -> None:

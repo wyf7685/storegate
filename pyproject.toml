@@ -11,6 +11,8 @@ dependencies = [
     "httpx[http2]>=0.28.1",
     "loguru>=0.7.3",
     "pydantic>=2.13.4",
+    "uvloop>=0.22.1 ; sys_platform != 'win32'",
+    "winloop>=0.6.3 ; sys_platform == 'win32'",
 ]
 
 [dependency-groups]

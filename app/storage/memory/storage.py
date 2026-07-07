@@ -2,7 +2,7 @@ import itertools
 from collections.abc import AsyncIterable, AsyncIterator
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Self, final, override
+from typing import final, override
 
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
 
@@ -20,24 +20,15 @@ class MemoryStorage(AbstractStorage):
             await storage.upload_bytes(b"hello", "foo.txt")
     """
 
-    def __init__(self, root: str) -> None:
+    def __init__(self, root: str | None = None) -> None:
         super().__init__()
-        _root = PurePosixPath("/", root)
+        _root = PurePosixPath("/", root) if root is not None else PurePosixPath("/")
         # Normalise away double-leading-slash when root == "/".
         self._root: PurePosixPath = PurePosixPath(str(_root).replace("//", "/"))
         self._files: dict[str, bytes] = {}  # path → content
         self._dirs: set[str] = set()  # directory paths
         self._now: float = datetime.now(tz=UTC).timestamp()
         self._id: int = next(_sid)
-
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def from_directory(cls, directory: str) -> Self:
-        """Create a ``MemoryStorage`` rooted at *directory*."""
-        return cls(root=directory)
 
     # ------------------------------------------------------------------
     # Identity

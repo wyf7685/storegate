@@ -25,19 +25,9 @@ class CosStorage(AbstractStorage):
     _client: AsyncCosClient | None = None
     _config: CosConfig
 
-    def __init__(self, config: CosConfig) -> None:
+    def __init__(self, config: str | Path | CosConfig) -> None:
         super().__init__()
-        self._config = config
-
-    @classmethod
-    def from_config(cls, config: CosConfig) -> CosStorage:
-        """Create a ``CosStorage`` from a ``CosConfig``."""
-        return cls(config)
-
-    @classmethod
-    def from_file(cls, path: str | Path) -> CosStorage:
-        """Create a ``CosStorage`` from a JSON config file."""
-        return cls.from_config(CosConfig.from_file(path))
+        self._config = config if isinstance(config, CosConfig) else CosConfig.from_file(config)
 
     @override
     @property
