@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import anyio
 from anyio.abc import SocketStream
+from anyio.streams.memory import MemoryObjectReceiveStream
 
 from app.storage import FileInfo
 from app.utils import logger_wrapper
@@ -44,6 +45,31 @@ _REQUIRES_AUTH: frozenset[str] = frozenset(
         "ABOR",
     }
 )
+
+# Commands that require a task group with concurrent monitoring (any storage I/O)
+_NEEDS_TASK_GROUP: frozenset[str] = frozenset(
+    {
+        "CWD",
+        "XCWD",
+        "CDUP",
+        "XCDUP",
+        "SIZE",
+        "MDTM",
+        "MKD",
+        "XMKD",
+        "DELE",
+        "RMD",
+        "XRMD",
+        "RNTO",
+        "LIST",
+        "NLST",
+        "RETR",
+        "STOR",
+    }
+)
+
+# Commands safe to handle immediately during a background operation
+_DURING_OP_IMMEDIATE: frozenset[str] = frozenset({"ABOR", "QUIT", "NOOP", "STAT", "PWD", "SYST", "FEAT", "OPTS"})
 
 
 class FTPHandler:
@@ -93,6 +119,11 @@ class FTPHandler:
     _host: str
     _buffer: bytearray
     _abort_event: anyio.Event
+    _send_lock: anyio.Lock
+    _op_complete: anyio.Event
+    _op_result: str | None
+    _quit_requested: bool
+    _queued_commands: list[tuple[str, str]]
 
     def __init__(
         self,
@@ -107,36 +138,60 @@ class FTPHandler:
         self._host = host
         self._buffer = bytearray()
         self._abort_event = anyio.Event()
+        self._send_lock = anyio.Lock()
+        self._op_complete = anyio.Event()
+        self._op_result: str | None = None
+        self._quit_requested = False
+        self._queued_commands: list[tuple[str, str]] = []
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        """Run the main command loop. Blocks until QUIT or disconnect."""
-        await self._send(R.READY("cos-ftp ready"))
-        try:
-            while True:
-                line = await self._read_line()
-                if not line:
-                    continue
-                cmd, arg = self._parse(line)
-                logger.debug(f"Received command: <c>{cmd}</> {arg}")
-                response = await self._dispatch(cmd, arg)
-                await self._send(response)
-                if cmd == "QUIT":
-                    break
-        except EOFError, anyio.EndOfStream:
-            logger.info("Client closed connection")
-        except anyio.ClosedResourceError:
-            logger.info("Control connection closed")
+        """Run the main command loop using a producer-consumer pattern.
+
+        The main loop (producer) reads lines from the control stream and
+        pushes parsed commands into a capacity-1 memory stream.  A background
+        dispatcher task consumes the stream and either handles fast commands
+        inline or spawns a monitored task group for slow (storage-I/O) ones.
+        """
+        cmd_send, cmd_receive = anyio.create_memory_object_stream[tuple[str, str]](1)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(self._dispatch_loop, cmd_receive, tg.cancel_scope)
+
+            await self._send(R.READY("cos-ftp ready"))
+            try:
+                async with cmd_send:
+                    while True:
+                        try:
+                            line = await self._read_line()
+                        except EOFError, anyio.EndOfStream:
+                            logger.info("Client closed connection")
+                            break
+                        except anyio.ClosedResourceError:
+                            logger.info("Control connection closed")
+                            break
+                        if not line:
+                            continue
+                        cmd, arg = self._parse(line)
+                        logger.debug(f"Received command: <c>{cmd}</> {arg}")
+                        await cmd_send.send((cmd, arg))
+            except anyio.get_cancelled_exc_class():
+                pass  # dispatcher cancelled the root scope on QUIT
 
     # ------------------------------------------------------------------
     # I/O helpers
     # ------------------------------------------------------------------
 
     async def _send(self, text: str) -> None:
-        """Send a response line over the control connection."""
+        """Send a response line over the control connection (lock-protected)."""
+        async with self._send_lock:
+            await self._do_send(text)
+
+    async def _do_send(self, text: str) -> None:
+        """Raw write to the control stream. Caller must hold ``_send_lock``."""
         await self._stream.send(text.encode("utf-8") + b"\r\n")
 
     async def _read_line(self) -> str:
@@ -182,6 +237,155 @@ class FTPHandler:
         except Exception:
             logger.exception(f"Unhandled error processing <c>{cmd}</> {arg}")
             return R.LOCAL_ERROR(f"Internal error processing <c>{cmd}</>")
+
+    # ------------------------------------------------------------------
+    # Dispatch loop & concurrent operation helpers
+    # ------------------------------------------------------------------
+
+    async def _dispatch_loop(
+        self,
+        cmd_receive: MemoryObjectReceiveStream[tuple[str, str]],
+        root_scope: anyio.CancelScope,
+    ) -> None:
+        """Consume commands from the queue and dispatch them.
+
+        Fast (in-memory) commands are handled inline.  Slow (storage-I/O)
+        commands are delegated to ``_execute_with_monitor`` which spawns a
+        task group so the control channel stays responsive.
+        """
+        try:
+            async with cmd_receive:
+                async for cmd, arg in cmd_receive:
+                    logger.debug(f"Dispatch: <c>{cmd}</> {arg}")
+
+                    if cmd in _NEEDS_TASK_GROUP:
+                        response = await self._execute_with_monitor(cmd, arg, cmd_receive.clone())
+                    elif cmd == "STAT" and arg:
+                        # STAT with path → storage.stat → needs task group
+                        response = await self._execute_with_monitor(cmd, arg, cmd_receive.clone())
+                    else:
+                        response = await self._dispatch(cmd, arg)
+
+                    async with self._send_lock:
+                        await self._do_send(response)
+
+                    if cmd == "QUIT" or self._quit_requested:
+                        if self._quit_requested:
+                            async with self._send_lock:
+                                await self._do_send(R.CLOSING("Goodbye"))
+                        root_scope.cancel()
+                        break
+        except anyio.get_cancelled_exc_class():
+            pass  # expected during shutdown
+
+    async def _execute_with_monitor(
+        self,
+        cmd: str,
+        arg: str,
+        cmd_receive: MemoryObjectReceiveStream[tuple[str, str]],
+    ) -> str:
+        """Execute a potentially slow command with concurrent queue monitoring.
+
+        Spawns a task group containing:
+
+        * **Operation task** — runs the actual command via ``_dispatch``.
+        * **Monitor** — races between receiving the next queued command and
+          the operation completing.  ABOR / QUIT / NOOP / STAT are handled
+          immediately; all other commands are queued for after the operation.
+        """
+        # ---- Pre-validation (before spawning) ----
+        if cmd in _REQUIRES_AUTH and not self._session.authenticated:
+            cmd_receive.close()
+            return R.NOT_LOGGED_IN("Please login with USER and PASS")
+
+        # ---- Setup operation state ----
+        self._abort_event = anyio.Event()
+        self._op_complete = anyio.Event()
+        self._op_result = None
+        self._quit_requested = False
+        self._queued_commands = []
+
+        # ---- Execute with concurrent monitoring ----
+        async with anyio.create_task_group() as tg, cmd_receive:
+            tg.start_soon(self._run_op_task, cmd, arg)
+
+            # Monitor: race between receiving a command and operation completion
+            try:
+                while not self._op_complete.is_set():
+                    # Race: next command  vs  operation complete
+                    t_cmd: str | None = None
+                    t_arg: str | None = None
+
+                    async with anyio.create_task_group() as race_tg:
+
+                        async def _recv() -> None:
+                            nonlocal t_cmd, t_arg
+                            t_cmd, t_arg = await cmd_receive.receive()
+                            race_tg.cancel_scope.cancel()
+
+                        async def _wait_complete() -> None:
+                            await self._op_complete.wait()
+                            race_tg.cancel_scope.cancel()
+
+                        race_tg.start_soon(_recv)
+                        race_tg.start_soon(_wait_complete)
+
+                    if t_cmd is None or t_arg is None:
+                        # _op_complete fired first → operation finished
+                        break
+
+                    logger.debug(f"Monitor received: <c>{t_cmd}</> {t_arg}")
+
+                    if t_cmd == "ABOR":
+                        self._abort_event.set()
+                        await self._op_complete.wait()
+                        break
+                    if t_cmd == "QUIT":
+                        self._abort_event.set()
+                        self._quit_requested = True
+                        await self._op_complete.wait()
+                        break
+                    if t_cmd in _DURING_OP_IMMEDIATE:
+                        resp = await self._dispatch(t_cmd, t_arg)
+                        async with self._send_lock:
+                            await self._do_send(resp)
+                    else:
+                        self._queued_commands.append((t_cmd, t_arg))
+            except* anyio.ClosedResourceError, anyio.EndOfStream:
+                # cmd_receive closed (client disconnected)
+                self._abort_event.set()
+
+        # ---- Collect result ----
+        result = self._op_result or (
+            R.TRANSFER_ABORTED("Operation aborted") if self._abort_event.is_set() else R.SUCCESS("Operation complete")
+        )
+
+        # ---- Process queued commands in order ----
+        for q_cmd, q_arg in self._queued_commands:
+            if self._quit_requested:
+                break
+            try:
+                resp = await self._dispatch(q_cmd, q_arg)
+            except Exception:
+                resp = R.LOCAL_ERROR(f"Error processing queued {q_cmd}")
+            async with self._send_lock:
+                await self._do_send(resp)
+
+        return result
+
+    async def _run_op_task(self, cmd: str, arg: str) -> None:
+        """Background task: execute the command and capture the result."""
+        cancelled_cls = anyio.get_cancelled_exc_class()
+        try:
+            result = await self._dispatch(cmd, arg)
+        except cancelled_cls:
+            result = R.TRANSFER_ABORTED("Operation aborted")
+        except Exception:
+            logger.exception(f"Error in background operation <c>{cmd}</>")
+            result = R.LOCAL_ERROR(f"Internal error processing <c>{cmd}</>")
+        finally:
+            self._op_result = result
+            self._op_complete.set()
 
     # ------------------------------------------------------------------
     # Path resolution
@@ -332,6 +536,9 @@ class FTPHandler:
         try:
             await self._send(R.DATA_OPEN("Opening data connection for directory listing"))
             async with self._make_data_connection() as dc:
+                if self._abort_event.is_set():
+                    await dc.close()
+                    return R.TRANSFER_ABORTED("Transfer aborted")
                 await dc.send_all(text)
         except TimeoutError, OSError:
             return R.NO_DATA_CONN("Failed to establish data connection")
@@ -357,7 +564,7 @@ class FTPHandler:
         return await self._transfer_download(target)
 
     async def _transfer_download(self, target: str) -> str:
-        self._abort_event = anyio.Event()
+        # NOTE: _abort_event is set up by _execute_with_monitor
         try:
             await self._send(R.DATA_OPEN("Opening data connection for download"))
             async with self._make_data_connection() as dc:
@@ -380,21 +587,25 @@ class FTPHandler:
         return await self._transfer_upload(target)
 
     async def _transfer_upload(self, target: str) -> str:
-        self._abort_event = anyio.Event()
+        # NOTE: _abort_event is set up by _execute_with_monitor
 
         async def wait_for_abort():
             await self._abort_event.wait()
             logger.info("Upload aborted by client")
             tg.cancel_scope.cancel()
 
+        cancelled_cls = anyio.get_cancelled_exc_class()
+        response: str
         try:
             await self._send(R.DATA_OPEN("Opening data connection for upload"))
             async with self._make_data_connection() as dc, anyio.create_task_group() as tg:
                 tg.start_soon(wait_for_abort)
                 await self._storage.upload_stream(dc.receive_chunks(), target, overwrite=True)
-                tg.cancel_scope.cancel()
+                tg.cancel_scope.cancel()  # normal completion — cancel the abort watcher
         except* TimeoutError, OSError:
             response = R.NO_DATA_CONN("Failed to establish data connection")
+        except* cancelled_cls:
+            response = R.TRANSFER_ABORTED("Transfer aborted")
         else:
             response = R.TRANSFER_OK("Transfer complete")
         finally:
