@@ -1,9 +1,8 @@
 import contextlib
 import hashlib
-import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import final, override
 
 import anyio
@@ -16,6 +15,7 @@ from app.utils import LoggerWrapper
 from ..abstract import AbstractStorage, BytesLike, FileInfo
 
 BLOCK_SIZE = 64 * 1024 * 1024  # 64 MB
+MAX_CONCURRENT_UPLOADS = 2
 CHUNKS_INDEX_FILE = "__chunks_index_id__"
 
 
@@ -58,6 +58,7 @@ class IndexStorage(AbstractStorage):
     _index: AbstractStorage | None = None
     _chunks: AbstractStorage | None = None
     _block_size: int = BLOCK_SIZE
+    _max_concurrent_uploads: int = MAX_CONCURRENT_UPLOADS
 
     @classmethod
     def from_storage(
@@ -65,6 +66,7 @@ class IndexStorage(AbstractStorage):
         index: AbstractStorage,
         chunks: AbstractStorage,
         block_size: int = BLOCK_SIZE,
+        max_concurrent_uploads: int = MAX_CONCURRENT_UPLOADS,
     ) -> IndexStorage:
         if index is chunks:
             raise ValueError("Index storage and chunks storage cannot be the same.")
@@ -72,6 +74,7 @@ class IndexStorage(AbstractStorage):
         self._index = index
         self._chunks = chunks
         self._block_size = block_size
+        self._max_concurrent_uploads = max_concurrent_uploads
         return self
 
     def _ensure_index(self) -> AbstractStorage:
@@ -205,6 +208,26 @@ class IndexStorage(AbstractStorage):
             await chunks.delete(hash_to_path(chunk_hash, "bin"))
             self.log.debug(f"Chunk {_colored_hash} ref=0, deleted data (<i>{escape_tag(remote_path)}</i>)")
 
+    async def _save_chunk_worker(
+        self,
+        recv: MemoryObjectReceiveStream[tuple[str, bytes, str]],
+        incref_done: set[str],
+    ) -> None:
+        """Worker：从 channel 拉取 block，保存或复用已有分块。"""
+        chunks = self._ensure_chunks()
+        async for chunk_hash, data, remote_path in recv:
+            bin_path = hash_to_path(chunk_hash, "bin")
+
+            async with self._lock_chunk(chunk_hash):
+                if not await chunks.exists(bin_path):
+                    await chunks.upload_bytes(data, bin_path)
+                    self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> uploaded (<g>{len(data)}</g> bytes)")
+                else:
+                    self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> already exists, skipping upload")
+                await self._chunk_incref(chunk_hash, remote_path)
+
+            incref_done.add(chunk_hash)
+
     @override
     async def upload_stream(
         self,
@@ -219,104 +242,87 @@ class IndexStorage(AbstractStorage):
         _colored_path = f"<y>{escape_tag(remote_path)}</y>"
         self.log.info(f"Upload starting: {_colored_path}")
 
-        async def stream_chunk(
-            chunk_id: int,
-            stream: MemoryObjectReceiveStream[str | BytesLike],
-        ) -> None:
-            send, recv = anyio.create_memory_object_stream[BytesLike](4)
-            temp_path = f"{uuid.uuid4().hex}.tmp"
-
-            try:
-                async with anyio.create_task_group() as tg, stream, send:
-                    tg.start_soon(chunks.upload_stream, recv, temp_path)
-                    async for item in stream:
-                        if isinstance(item, str):
-                            chunk_hash = item
-                            break
-                        await send.send(item)
-                    else:
-                        tg.cancel_scope.cancel()
-                        self.log.debug(f"Chunk #{chunk_id} stream closed without hash for {_colored_path}")
-                        return
-            except Exception:
-                if await chunks.exists(temp_path):
-                    await chunks.delete(temp_path)
-                raise
-
-            bin_path = hash_to_path(chunk_hash, "bin")
-            await chunks.move(temp_path, bin_path)
-            chunk_decref.push_async_callback(self._chunk_decref, chunk_hash, remote_path)
-            await self._chunk_incref(chunk_hash, remote_path)
-            self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> saved for {_colored_path}")
-
         index = self._ensure_index()
-        chunks = self._ensure_chunks()
+        self._ensure_chunks()
         chunk_hashes: list[str] = []
         total_size = 0
-        current_chunk_size = 0
-        current_chunk_hash = hashlib.sha256()
-        chunk_index = 0
+        incref_done: set[str] = set()
+        max_workers = self._max_concurrent_uploads
 
         try:
             async with self._lock_index(remote_path):
-                c_send, c_recv = anyio.create_memory_object_stream[str | BytesLike](4)
-                async with (
-                    contextlib.AsyncExitStack() as chunk_lock,
-                    contextlib.AsyncExitStack() as chunk_decref,
-                ):
-                    async with anyio.create_task_group() as tg:
-                        tg.start_soon(stream_chunk, chunk_index + 1, c_recv)
-                        async for chunk in stream:
-                            total_size += len(chunk)
-                            current_chunk_size += len(chunk)
-                            if current_chunk_size < self._block_size:
-                                current_chunk_hash.update(chunk)
-                                await c_send.send(chunk)
-                                continue
-                            chunk = memoryview(chunk)
-                            remaining = self._block_size - (current_chunk_size - len(chunk))
-                            current_chunk_hash.update(chunk[:remaining])
-                            await c_send.send(chunk[:remaining])
-                            chunk_hash = current_chunk_hash.hexdigest()
-                            chunk_hashes.append(chunk_hash)
-                            chunk_index += 1
-                            await chunk_lock.enter_async_context(self._lock_chunk(chunk_hash))
-                            await c_send.send(chunk_hash)
-                            c_send.close()
-                            self.log.debug(
-                                f"Chunk #{chunk_index} <c>{chunk_hash[:8]}</c> "
-                                f"complete for {_colored_path}"
-                                f" (<g>{self._block_size}</g> bytes)"
-                            )
-                            current_chunk_size = len(chunk) - remaining
-                            current_chunk_hash = hashlib.sha256()
-                            current_chunk_hash.update(chunk[remaining:])
-                            c_send, c_recv = anyio.create_memory_object_stream[str | BytesLike](4)
-                            tg.start_soon(stream_chunk, chunk_index + 1, c_recv)
-                            await c_send.send(chunk[remaining:])
+                send, recv = anyio.create_memory_object_stream[
+                    tuple[str, bytes, str]
+                ](max_workers * 2)
 
-                        if current_chunk_size > 0:
-                            chunk_hash = current_chunk_hash.hexdigest()
-                            chunk_hashes.append(chunk_hash)
-                            chunk_index += 1
-                            await chunk_lock.enter_async_context(self._lock_chunk(chunk_hash))
-                            await c_send.send(chunk_hash)
-                            c_send.close()
-                            self.log.debug(
-                                f"Chunk #{chunk_index} <c>{chunk_hash[:8]}</c> "
-                                f"complete for {_colored_path}"
-                                f" (<g>{current_chunk_size}</g> bytes)"
-                            )
-                        else:
-                            c_send.close()
+                async with anyio.create_task_group() as tg, send:
+                    for worker_idx in range(max_workers):
+                        self.log.debug(f"Starting chunk upload worker #{worker_idx + 1}")
+                        tg.start_soon(self._save_chunk_worker, recv.clone(), incref_done)
+                    recv.close()
 
-                    chunk_decref.pop_all()
+                    buffer = bytearray()
+                    hasher = hashlib.sha256()
+
+                    async for chunk in stream:
+                        total_size += len(chunk)
+
+                        # 若未达阈值：缓冲并继续
+                        if len(buffer) + len(chunk) < self._block_size:
+                            buffer.extend(chunk)
+                            hasher.update(chunk)
+                            continue
+
+                        # 当前 chunk 跨越 block_size 边界，需要拆分
+                        chunk_mv = memoryview(chunk)
+                        offset = 0
+                        while offset < len(chunk_mv):
+                            remaining = self._block_size - len(buffer)
+                            take = min(remaining, len(chunk_mv) - offset)
+
+                            hasher.update(chunk_mv[offset : offset + take])
+                            buffer.extend(chunk_mv[offset : offset + take])
+                            offset += take
+
+                            # buffer 恰好填满一个 block
+                            if len(buffer) == self._block_size:
+                                chunk_hash = hasher.hexdigest()
+                                chunk_hashes.append(chunk_hash)
+
+                                self.log.debug(
+                                    f"Chunk #{len(chunk_hashes)} <c>{chunk_hash[:8]}</c> "
+                                    f"complete for {_colored_path}"
+                                    f" (<g>{self._block_size}</g> bytes)"
+                                )
+                                # channel 满时阻塞 → 反压输入流
+                                await send.send(
+                                    (chunk_hash, bytes(buffer), remote_path),
+                                )
+
+                                buffer.clear()
+                                hasher = hashlib.sha256()
+
+                    # 最后一块
+                    if buffer:
+                        chunk_hash = hasher.hexdigest()
+                        chunk_hashes.append(chunk_hash)
+
+                        self.log.debug(
+                            f"Chunk #{len(chunk_hashes)} <c>{chunk_hash[:8]}</c> "
+                            f"complete for {_colored_path}"
+                            f" (<g>{len(buffer)}</g> bytes)"
+                        )
+                        await send.send(
+                            (chunk_hash, bytes(buffer), remote_path),
+                        )
+
+                # send 关闭 → worker 退出 → tg 退出 → 所有上传完成
 
                 now = datetime.now(UTC)
                 meta = FileMeta(
                     info=FileInfo(
                         path=remote_path,
-                        name=Path(remote_path).name,
+                        name=PurePosixPath(remote_path).name,
                         is_dir=False,
                         size=total_size,
                         modified=now,
@@ -324,18 +330,30 @@ class IndexStorage(AbstractStorage):
                     ),
                     chunks=chunk_hashes,
                 )
-                await index.mkdir(Path(remote_path).parent.as_posix(), parents=True, exist_ok=True)
-                await index.upload_bytes(meta.model_dump_json().encode(), remote_path, overwrite=True)
+                await index.mkdir(
+                    PurePosixPath(remote_path).parent.as_posix(),
+                    parents=True,
+                    exist_ok=True,
+                )
+                await index.upload_bytes(
+                    meta.model_dump_json().encode(),
+                    remote_path,
+                    overwrite=True,
+                )
 
             self.log.info(
-                f"Upload complete: {_colored_path} (<g>{total_size}</g> bytes in <g>{chunk_index}</g> chunks)"
+                f"Upload complete: {_colored_path} "
+                f"(<g>{total_size}</g> bytes in <g>{len(chunk_hashes)}</g> chunks)"
             )
         except Exception:
             self.log.error(  # noqa: TRY400
                 f"Upload failed: {_colored_path} "
                 f"(<g>{total_size}</g> bytes streamed, "
-                f"<g>{chunk_index}</g> chunks written)"
+                f"<g>{len(chunk_hashes)}</g> chunks processed)"
             )
+            # 回滚已 incref 的分块
+            for h in incref_done:
+                await self._chunk_decref(h, remote_path)
             raise
 
     @override
