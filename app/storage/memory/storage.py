@@ -279,7 +279,7 @@ class MemoryStorage(AbstractStorage):
                 path=path,
                 name=name,
                 is_dir=True,
-                size=None,
+                size=0,
                 modified=datetime.fromtimestamp(self._now, tz=UTC),
                 created=datetime.fromtimestamp(self._now, tz=UTC),
             )
@@ -315,7 +315,7 @@ class MemoryStorage(AbstractStorage):
                 path=f"{path}/{rest}" if path else rest,
                 name=rest,
                 is_dir=True,
-                size=None,
+                size=0,
                 modified=datetime.fromtimestamp(self._now, tz=UTC),
                 created=datetime.fromtimestamp(self._now, tz=UTC),
             )
@@ -369,7 +369,7 @@ class MemoryStorage(AbstractStorage):
                     path=f"{path}/{rest}" if path else rest,
                     name=rest,
                     is_dir=True,
-                    size=None,
+                    size=0,
                     modified=datetime.fromtimestamp(self._now, tz=UTC),
                     created=datetime.fromtimestamp(self._now, tz=UTC),
                 )

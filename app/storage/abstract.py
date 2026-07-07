@@ -19,7 +19,7 @@ class FileInfo:
     path: str
     name: str
     is_dir: bool
-    size: int | None
+    size: int = 0
     modified: datetime | None = None
     created: datetime | None = None
 
@@ -161,6 +161,11 @@ class AbstractStorage(ABC):
     async def delete(self, path: str) -> None:
         """Delete a file or an empty directory."""
         raise NotImplementedError
+
+    async def delete_many(self, *paths: str) -> None:
+        """Delete multiple files or empty directories."""
+        for path in paths:
+            await self.delete(path)
 
     @abstractmethod
     async def move(

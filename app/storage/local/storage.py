@@ -208,7 +208,7 @@ class LocalStorage(AbstractStorage):
             path=path,
             name=target.name,
             is_dir=is_dir,
-            size=None if is_dir else stat_result.st_size,
+            size=0 if is_dir else stat_result.st_size,
             modified=datetime.fromtimestamp(stat_result.st_mtime).astimezone(),
             created=datetime.fromtimestamp(stat_result.st_ctime).astimezone(),
         )
@@ -232,7 +232,7 @@ class LocalStorage(AbstractStorage):
                 path=str(entry.relative_to(self._root)).replace("\\", "/"),
                 name=entry.name,
                 is_dir=entry_is_dir,
-                size=None if entry_is_dir else stat_result.st_size,
+                size=0 if entry_is_dir else stat_result.st_size,
                 modified=datetime.fromtimestamp(stat_result.st_mtime).astimezone(),
                 created=datetime.fromtimestamp(stat_result.st_ctime).astimezone(),
             )
@@ -255,7 +255,7 @@ class LocalStorage(AbstractStorage):
                 path=str(entry.relative_to(self._root)).replace("\\", "/"),
                 name=entry.name,
                 is_dir=entry_is_dir,
-                size=None if entry_is_dir else stat_result.st_size,
+                size=0 if entry_is_dir else stat_result.st_size,
                 modified=datetime.fromtimestamp(stat_result.st_mtime).astimezone(),
                 created=datetime.fromtimestamp(stat_result.st_ctime).astimezone(),
             )

@@ -10,7 +10,6 @@ from anyio.streams.memory import MemoryObjectReceiveStream
 from pydantic import BaseModel
 
 from app.log import escape_tag
-from app.utils import LoggerWrapper
 
 from ..abstract import AbstractStorage, BytesLike, FileInfo
 
@@ -24,30 +23,6 @@ def hash_to_path(hash_str: str, suffix: str | None = None) -> str:
     return f"{hash_str[:2]}/{hash_str[2:6]}/{hash_str[6:]}{f".{suffix}" if suffix else ""}"
 
 
-@contextlib.asynccontextmanager
-async def _storage_file_lock(log: LoggerWrapper, storage: AbstractStorage, lock_path: str) -> AsyncGenerator[None]:
-    _colored_path = f"<y>{escape_tag(lock_path)}</y>"
-
-    while True:
-        if await storage.exists(lock_path):
-            log.trace(f"Lock {_colored_path} is held, waiting …")
-            await anyio.sleep(0.1)
-            continue
-        try:
-            await storage.upload_bytes(b"", lock_path, overwrite=False)
-            break
-        except FileExistsError:
-            log.trace(f"Lock {_colored_path} race detected, retrying …")
-            await anyio.sleep(0.1)
-
-    log.trace(f"Lock {_colored_path} acquired")
-    try:
-        yield
-    finally:
-        await storage.delete(lock_path)
-        log.trace(f"Lock {_colored_path} released")
-
-
 class FileMeta(BaseModel):
     info: FileInfo
     chunks: list[str]
@@ -59,6 +34,7 @@ class IndexStorage(AbstractStorage):
     _chunks: AbstractStorage | None = None
     _block_size: int = BLOCK_SIZE
     _max_concurrent_uploads: int = MAX_CONCURRENT_UPLOADS
+    _skip_locking: bool = False
 
     @classmethod
     def from_storage(
@@ -67,6 +43,7 @@ class IndexStorage(AbstractStorage):
         chunks: AbstractStorage,
         block_size: int = BLOCK_SIZE,
         max_concurrent_uploads: int = MAX_CONCURRENT_UPLOADS,
+        skip_locking: bool = False,
     ) -> IndexStorage:
         if index is chunks:
             raise ValueError("Index storage and chunks storage cannot be the same.")
@@ -75,6 +52,7 @@ class IndexStorage(AbstractStorage):
         self._chunks = chunks
         self._block_size = block_size
         self._max_concurrent_uploads = max_concurrent_uploads
+        self._skip_locking = skip_locking
         return self
 
     def _ensure_index(self) -> AbstractStorage:
@@ -130,47 +108,91 @@ class IndexStorage(AbstractStorage):
     async def ping(self) -> bool:
         return await self._ensure_index().ping() and await self._ensure_chunks().ping()
 
+    async def _acquire_storage_file_lock(self, storage: AbstractStorage, lock_path: str) -> None:
+        _colored_path = f"<y>{escape_tag(lock_path)}</y>"
+        if self._skip_locking:
+            self.log.trace(f"Lock {_colored_path} disabled, skipping ...")
+            return
+
+        while True:
+            if await storage.exists(lock_path):
+                self.log.trace(f"Lock {_colored_path} is held, waiting ...")
+                await anyio.sleep(0.1)
+                continue
+            try:
+                await storage.upload_bytes(b"", lock_path, overwrite=False)
+                break
+            except FileExistsError:
+                self.log.trace(f"Lock {_colored_path} race detected, retrying ...")
+                await anyio.sleep(0.1)
+
+        self.log.trace(f"Lock {_colored_path} acquired")
+
+    async def _release_storage_file_lock(self, storage: AbstractStorage, *lock_paths: str) -> None:
+        if self._skip_locking or not lock_paths:
+            return
+
+        if len(lock_paths) == 1:
+            with contextlib.suppress(FileNotFoundError):
+                await storage.delete(lock_paths[0])
+            self.log.trace(f"Lock <y>{escape_tag(lock_paths[0])}</y> released")
+        else:
+            await storage.delete_many(*lock_paths)
+            self.log.trace(f"Locks <y>{", ".join(escape_tag(p) for p in lock_paths)}</y> released")
+
     @contextlib.asynccontextmanager
     async def _lock_index(self, index_path: str) -> AsyncGenerator[None]:
-        async with _storage_file_lock(
-            self.log,
-            storage=self._ensure_index(),
-            lock_path=f"{index_path}.lock",
-        ):
+        index = self._ensure_index()
+        lock_path = f"{index_path}.lock"
+
+        try:
+            await self._acquire_storage_file_lock(index, lock_path)
             yield
+        finally:
+            await self._release_storage_file_lock(index, lock_path)
 
     @contextlib.asynccontextmanager
     async def _lock_chunk(self, chunk_hash: str) -> AsyncGenerator[None]:
-        async with _storage_file_lock(
-            self.log,
-            storage=self._ensure_chunks(),
-            lock_path=hash_to_path(chunk_hash, "lock"),
-        ):
+        chunks = self._ensure_chunks()
+        lock_path = hash_to_path(chunk_hash, "lock")
+
+        try:
+            await self._acquire_storage_file_lock(chunks, lock_path)
             yield
+        finally:
+            await self._release_storage_file_lock(chunks, lock_path)
 
     @contextlib.asynccontextmanager
     async def _lock_indexes(self, *index_paths: str) -> AsyncGenerator[None]:
-        async with contextlib.AsyncExitStack() as stack:
-            for index_path in sorted(set(index_paths)):
-                await stack.enter_async_context(self._lock_index(index_path))
+        index = self._ensure_index()
+        paths = sorted(set(index_paths))
+        try:
+            for index_path in paths:
+                await self._acquire_storage_file_lock(index, f"{index_path}.lock")
             yield
+        finally:
+            await self._release_storage_file_lock(index, *(f"{index_path}.lock" for index_path in paths))
 
     @contextlib.asynccontextmanager
     async def _lock_chunks(self, chunk_hashes: Iterable[str]) -> AsyncGenerator[None]:
-        async with contextlib.AsyncExitStack() as stack:
-            for chunk_hash in sorted(set(chunk_hashes)):
-                await stack.enter_async_context(self._lock_chunk(chunk_hash))
-            yield
+        chunks = self._ensure_chunks()
+        hashes = sorted(set(chunk_hashes))
 
-    async def _get_file_meta(self, path: str, lock: bool = True) -> FileMeta | None:
+        try:
+            for chunk_hash in hashes:
+                await self._acquire_storage_file_lock(chunks, hash_to_path(chunk_hash, "lock"))
+            yield
+        finally:
+            await self._release_storage_file_lock(chunks, *(hash_to_path(chunk_hash, "lock") for chunk_hash in hashes))
+
+    async def _get_file_meta(self, path: str) -> FileMeta | None:
         index = self._ensure_index()
-        async with self._lock_index(path) if lock else contextlib.nullcontext():
-            if not await index.exists(path):
-                return None
-            meta_bytes = await index.download_bytes(path)
-            if not meta_bytes:
-                return None
-            return FileMeta.model_validate_json(meta_bytes.decode())
+        if not await index.exists(path):
+            return None
+        meta_bytes = await index.download_bytes(path)
+        if not meta_bytes:
+            return None
+        return FileMeta.model_validate_json(meta_bytes.decode())
 
     async def _chunk_incref(self, chunk_hash: str, remote_path: str) -> None:
         chunks = self._ensure_chunks()
@@ -208,6 +230,34 @@ class IndexStorage(AbstractStorage):
             await chunks.delete(hash_to_path(chunk_hash, "bin"))
             self.log.debug(f"Chunk {_colored_hash} ref=0, deleted data (<i>{escape_tag(remote_path)}</i>)")
 
+    async def _chunk_transref(self, chunk_hash: str, src_path: str, dst_path: str, missing_ok: bool = False) -> None:
+        chunks = self._ensure_chunks()
+        ref_path = hash_to_path(chunk_hash, "ref")
+        _colored_hash = f"<c>{chunk_hash[:8]}</c>"
+
+        if not await chunks.exists(ref_path):
+            if not missing_ok:
+                raise FileNotFoundError(f"Chunk {chunk_hash} ref file missing for transref")
+            refs = set[str]()
+        else:
+            refs = set((await chunks.download_bytes(ref_path)).decode().splitlines())
+
+        if src_path not in refs:
+            if missing_ok:
+                self.log.warning(
+                    f"Chunk {_colored_hash} ref entry not found for transref: <i>{escape_tag(src_path)}</i>"
+                )
+            else:
+                raise FileNotFoundError(f"Chunk {chunk_hash} ref entry not found for transref: {src_path}")
+
+        refs.remove(src_path)
+        refs.add(dst_path)
+        await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
+        self.log.debug(
+            f"Chunk {_colored_hash} transref: <i>{escape_tag(src_path)}</i> → <i>{escape_tag(dst_path)}</i> "
+            f"(<g>{len(refs)}</g> refs)"
+        )
+
     async def _save_chunk_worker(
         self,
         recv: MemoryObjectReceiveStream[tuple[str, bytes, str]],
@@ -220,8 +270,12 @@ class IndexStorage(AbstractStorage):
 
             async with self._lock_chunk(chunk_hash):
                 if not await chunks.exists(bin_path):
+                    start = anyio.current_time()
                     await chunks.upload_bytes(data, bin_path)
-                    self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> uploaded (<g>{len(data)}</g> bytes)")
+                    elapsed = anyio.current_time() - start
+                    self.log.debug(
+                        f"Chunk <c>{chunk_hash[:8]}</c> uploaded (<g>{len(data):,}</g> bytes, <g>{elapsed:.2f}</g> s)"
+                    )
                 else:
                     self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> already exists, skipping upload")
                 await self._chunk_incref(chunk_hash, remote_path)
@@ -251,9 +305,7 @@ class IndexStorage(AbstractStorage):
 
         try:
             async with self._lock_index(remote_path):
-                send, recv = anyio.create_memory_object_stream[
-                    tuple[str, bytes, str]
-                ](max_workers * 2)
+                send, recv = anyio.create_memory_object_stream[tuple[str, bytes, str]](max_workers * 2)
 
                 async with anyio.create_task_group() as tg, send:
                     for worker_idx in range(max_workers):
@@ -291,8 +343,8 @@ class IndexStorage(AbstractStorage):
 
                                 self.log.debug(
                                     f"Chunk #{len(chunk_hashes)} <c>{chunk_hash[:8]}</c> "
-                                    f"complete for {_colored_path}"
-                                    f" (<g>{self._block_size}</g> bytes)"
+                                    f"received for {_colored_path}"
+                                    f" (<g>{self._block_size:,}</g> bytes)"
                                 )
                                 # channel 满时阻塞 → 反压输入流
                                 await send.send(
@@ -309,14 +361,15 @@ class IndexStorage(AbstractStorage):
 
                         self.log.debug(
                             f"Chunk #{len(chunk_hashes)} <c>{chunk_hash[:8]}</c> "
-                            f"complete for {_colored_path}"
-                            f" (<g>{len(buffer)}</g> bytes)"
+                            f"received for {_colored_path}"
+                            f" (<g>{len(buffer):,}</g> bytes)"
                         )
                         await send.send(
                             (chunk_hash, bytes(buffer), remote_path),
                         )
 
                 # send 关闭 → worker 退出 → tg 退出 → 所有上传完成
+                self.log.debug(f"All chunk upload workers completed for {_colored_path}")
 
                 now = datetime.now(UTC)
                 meta = FileMeta(
@@ -342,13 +395,12 @@ class IndexStorage(AbstractStorage):
                 )
 
             self.log.info(
-                f"Upload complete: {_colored_path} "
-                f"(<g>{total_size}</g> bytes in <g>{len(chunk_hashes)}</g> chunks)"
+                f"Upload complete: {_colored_path} (<g>{total_size:,}</g> bytes in <g>{len(chunk_hashes)}</g> chunks)"
             )
         except Exception:
             self.log.error(  # noqa: TRY400
                 f"Upload failed: {_colored_path} "
-                f"(<g>{total_size}</g> bytes streamed, "
+                f"(<g>{total_size:,}</g> bytes streamed, "
                 f"<g>{len(chunk_hashes)}</g> chunks processed)"
             )
             # 回滚已 incref 的分块
@@ -366,7 +418,7 @@ class IndexStorage(AbstractStorage):
 
         chunks = self._ensure_chunks()
         async with self._lock_index(remote_path):
-            meta = await self._get_file_meta(remote_path, lock=False)
+            meta = await self._get_file_meta(remote_path)
             if meta is None:
                 raise FileNotFoundError(f"File not found: {remote_path}")
             for idx, chunk_hash in enumerate(meta.chunks):
@@ -403,7 +455,7 @@ class IndexStorage(AbstractStorage):
             return
 
         async with self._lock_index(path):
-            meta = await self._get_file_meta(path, lock=False)
+            meta = await self._get_file_meta(path)
             if meta is None:
                 return
             async with self._lock_chunks(meta.chunks):
@@ -411,7 +463,7 @@ class IndexStorage(AbstractStorage):
                     for chunk_hash in meta.chunks:
                         tg.start_soon(self._chunk_decref, chunk_hash, path)
                 await index.delete(path)
-        self.log.info(f"Deleted: {_colored_path} (<g>{meta.info.size}</g> bytes, <g>{len(meta.chunks)}</g> chunks)")
+        self.log.info(f"Deleted: {_colored_path} (<g>{meta.info.size:,}</g> bytes, <g>{len(meta.chunks)}</g> chunks)")
 
     @override
     async def move(
@@ -428,10 +480,10 @@ class IndexStorage(AbstractStorage):
 
         index = self._ensure_index()
         async with self._lock_indexes(src, dst):
-            src_meta = await self._get_file_meta(src, lock=False)
+            src_meta = await self._get_file_meta(src)
             if src_meta is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
-            dst_meta = await self._get_file_meta(dst, lock=False)
+            dst_meta = await self._get_file_meta(dst)
             if dst_meta is not None:
                 raise FileExistsError(f"Destination file already exists: {dst}")
 
@@ -452,15 +504,12 @@ class IndexStorage(AbstractStorage):
                 await index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in src_meta.chunks:
-                        tg.start_soon(self._chunk_incref, chunk_hash, dst)
-                async with anyio.create_task_group() as tg:
-                    for chunk_hash in src_meta.chunks:
-                        tg.start_soon(self._chunk_decref, chunk_hash, src)
+                        tg.start_soon(self._chunk_transref, chunk_hash, src, dst)
             await index.delete(src)
 
         self.log.info(
             f"Moved: {_colored_src} → {_colored_dst} "
-            f"(<g>{src_meta.info.size}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
+            f"(<g>{src_meta.info.size:,}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
         )
 
     @override
@@ -478,10 +527,10 @@ class IndexStorage(AbstractStorage):
 
         index = self._ensure_index()
         async with self._lock_indexes(src, dst):
-            src_meta = await self._get_file_meta(src, lock=False)
+            src_meta = await self._get_file_meta(src)
             if src_meta is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
-            dst_meta = await self._get_file_meta(dst, lock=False)
+            dst_meta = await self._get_file_meta(dst)
             if dst_meta is not None:
                 raise FileExistsError(f"Destination file already exists: {dst}")
 
@@ -506,7 +555,7 @@ class IndexStorage(AbstractStorage):
 
         self.log.info(
             f"Copied: {_colored_src} → {_colored_dst} "
-            f"(<g>{src_meta.info.size}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
+            f"(<g>{src_meta.info.size:,}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
         )
 
     @override
