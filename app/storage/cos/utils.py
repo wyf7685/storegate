@@ -8,8 +8,9 @@ import anyio
 import anyio.lowlevel
 import httpx
 
-from app.log import escape_tag, logger
+from app.log import escape_tag
 from app.storage.abstract import FileInfo
+from app.utils import logger_wrapper
 
 from .cos_client import AsyncCosClient, MultipartUploadPart
 
@@ -65,6 +66,7 @@ class MultipartUploadTask:
         self.parts = []
         self._next_part_number = 1
         self._parts_lock = anyio.Lock()
+        self.log = logger_wrapper(f"cos.multipart <i><c>{escape_tag(self.key)}</></>")
 
     @property
     def colored_key(self) -> str:
@@ -75,9 +77,7 @@ class MultipartUploadTask:
     async def create(cls, client: AsyncCosClient, key: str) -> AsyncGenerator[Self]:
         self = cls(client, key)
         self.upload_id = await client.create_multipart_upload(self.key)
-        logger.opt(colors=True).info(
-            f"Created multipart upload for key={self.colored_key} with upload_id=<y>{self.upload_id}</>"
-        )
+        self.log.info(f"Created multipart upload with upload_id=<y>{self.upload_id}</>")
 
         try:
             yield self
@@ -86,7 +86,7 @@ class MultipartUploadTask:
             try:
                 await self.abort()
             except Exception as abort_exc:
-                logger.opt(exception=abort_exc).warning(f"Failed to abort multipart upload for key={self.key}")
+                self.log.warning(f"Failed to abort multipart upload for {self.key}", exception=abort_exc)
             raise
 
     def next_part_number(self) -> int:
@@ -95,7 +95,7 @@ class MultipartUploadTask:
         return value
 
     async def put_chunk(self, part_number: int, chunk: bytes) -> None:
-        logger.opt(colors=True).debug(f"Uploading part <y>{part_number}</> for key={self.colored_key}")
+        self.log.debug(f"Uploading #<y>{part_number}</>")
 
         last_exc = None
         max_attempts = 3
@@ -109,16 +109,14 @@ class MultipartUploadTask:
                 )
             except httpx.RequestError as exc:
                 last_exc = exc
-                logger.opt(colors=True).warning(
-                    f"Attempt <g>{attempt + 1}</> to upload part <y>{part_number}</> "
-                    f"for key={self.colored_key} failed: "
-                    f"<r>{escape_tag(repr(exc))}</>"
+                self.log.warning(
+                    f"Attempt <g>{attempt + 1}</> to upload #<y>{part_number}</> failed: <r>{escape_tag(repr(exc))}</>"
                 )
             else:
                 break
         else:
             raise RuntimeError(
-                f"Failed to upload part {part_number} for key={self.key} after {max_attempts} attempts: {last_exc!r}"
+                f"Failed to upload part {part_number} for {self.key} after {max_attempts} attempts: {last_exc!r}"
             ) from last_exc
 
         part: MultipartUploadPart = {
@@ -132,16 +130,14 @@ class MultipartUploadTask:
         assert all(part["ETag"] for part in self.parts)
         self.parts.sort(key=lambda part: part["PartNumber"])
         await self.client.complete_multipart_upload(key=self.key, upload_id=self.upload_id, parts=self.parts)
-        logger.opt(colors=True).info(
-            f"Completed multipart upload for key={self.colored_key} "
+        self.log.info(
+            f"Completed multipart upload "
             f"with upload_id=<y>{self.upload_id}</> and <g>{len(self.parts)}</> parts"
         )
 
     async def abort(self) -> None:
         await self.client.abort_multipart_upload(key=self.key, upload_id=self.upload_id)
-        logger.opt(colors=True).warning(
-            f"Aborted multipart upload for key={self.colored_key} with upload_id=<y>{self.upload_id}</>"
-        )
+        self.log.warning(f"Aborted multipart upload with upload_id=<y>{self.upload_id}</>")
 
     async def upload_from(
         self,

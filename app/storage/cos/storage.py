@@ -8,6 +8,7 @@ from typing import final, override
 import anyio
 import anyio.lowlevel
 
+from app.log import escape_tag
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
 from app.utils import coalesce_chunks
 
@@ -110,22 +111,23 @@ class CosStorage(AbstractStorage):
 
         client = self._ensure_client()
         key = self._remote_path_to_key(remote_path)
-        self.log.info(f"Upload: <y>{key}</y>")
+        self.log.info(f"Upload: <y>{escape_tag(key)}</y>")
+        await self.mkdir(PurePosixPath(remote_path).parent.as_posix(), parents=True, exist_ok=True)
 
         chunk_iter = aiter(coalesce_chunks(stream))
         first_chunk = await anext(chunk_iter, None)
         if first_chunk is None:
-            self.log.debug(f"Upload: <y>{key}</y> — empty object")
+            self.log.debug(f"Upload: <y>{escape_tag(key)}</y> — empty object")
             await client.put_object(key=key, data=b"")
             return
 
         second_chunk = await anext(chunk_iter, None)
         if second_chunk is None:
-            self.log.debug(f"Upload: <y>{key}</y> — single chunk (<g>{len(first_chunk)}</g> bytes)")
+            self.log.debug(f"Upload: <y>{escape_tag(key)}</y> — single chunk (<g>{len(first_chunk)}</g> bytes)")
             await client.put_object(key=key, data=first_chunk)
             return
 
-        self.log.debug(f"Upload: <y>{key}</y> — multipart upload")
+        self.log.debug(f"Upload: <y>{escape_tag(key)}</y> — multipart upload")
         async with (
             MultipartUploadTask.create(client, key) as task,
             anyio.create_task_group() as tg,
@@ -148,7 +150,7 @@ class CosStorage(AbstractStorage):
         total_size = head.content_length
         num_chunks = (total_size + UPLOAD_CHUNK_SIZE - 1) // UPLOAD_CHUNK_SIZE
 
-        self.log.debug(f"Download: <y>{key}</y> (<g>{total_size}</g> bytes in <g>{num_chunks}</g> chunks)")
+        self.log.debug(f"Download: <y>{escape_tag(key)}</y> (<g>{total_size}</g> bytes in <g>{num_chunks}</g> chunks)")
 
         for i in range(num_chunks):
             start = i * UPLOAD_CHUNK_SIZE
@@ -163,7 +165,7 @@ class CosStorage(AbstractStorage):
 
         # 1. 文件：直接删除
         if await client.head_object(key=key) is not None:
-            self.log.info(f"Delete: <y>{key}</y>")
+            self.log.info(f"Delete: <y>{escape_tag(key)}</y>")
             await client.delete_object(key=key)
             return
 
@@ -178,11 +180,44 @@ class CosStorage(AbstractStorage):
 
             dir_key = self._dir_key(path)
             assert dir_key is not None  # is_dir=True 且不是根目录
-            self.log.info(f"Delete dir: <y>{dir_key}</y>")
+            self.log.info(f"Delete dir: <y>{escape_tag(dir_key)}</y>")
             await client.delete_object(key=dir_key)
             return
 
         # 3. 不存在：静默成功（保持现有约定）
+
+    @override
+    async def delete_many(self, *paths: str) -> None:
+        client = self._ensure_client()
+        objects_to_delete: list[str] = []
+
+        for path in paths:
+            key = self._remote_path_to_key(path)
+
+            # 1. 文件：直接删除
+            if await client.head_object(key=key) is not None:
+                objects_to_delete.append(key)
+                continue
+
+            # 2. 目录：检查为空后删除标记对象
+            if await self.is_dir(path):
+                try:
+                    await anext(self.iterdir(path))
+                except StopAsyncIteration:
+                    pass  # 空目录
+                else:
+                    raise OSError(f"Directory not empty: {path}")
+
+                dir_key = self._dir_key(path)
+                assert dir_key is not None  # is_dir=True 且不是根目录
+                objects_to_delete.append(dir_key)
+                continue
+
+            # 3. 不存在：静默成功（保持现有约定）
+
+        if objects_to_delete:
+            self.log.info(f"Delete many: <y>{escape_tag(repr(objects_to_delete))}</y>")
+            await client.delete_objects(objects_to_delete)
 
     @override
     async def move(
@@ -192,7 +227,7 @@ class CosStorage(AbstractStorage):
     ) -> None:
         src_key = self._remote_path_to_key(src)
         dst_key = self._remote_path_to_key(dst)
-        self.log.info(f"Move: <y>{src_key}</y> → <y>{dst_key}</y>")
+        self.log.info(f"Move: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y>")
         await self.copy(src, dst)
         await self.delete(src)
 
@@ -211,10 +246,10 @@ class CosStorage(AbstractStorage):
             raise FileNotFoundError(f"Source not found: {src}")
 
         if head.content_length <= COPY_MULTIPART_THRESHOLD:
-            self.log.debug(f"Copy: <y>{src_key}</y> → <y>{dst_key}</y> (PUT Object - Copy)")
+            self.log.debug(f"Copy: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y> (PUT Object - Copy)")
             await client.put_object_copy(src_key, dst_key)
         else:
-            self.log.debug(f"Copy: <y>{src_key}</y> → <y>{dst_key}</y> (multipart copy)")
+            self.log.debug(f"Copy: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y> (multipart copy)")
             await self._copy_multipart(src_key, dst_key, head.content_length)
 
     @override
@@ -262,18 +297,18 @@ class CosStorage(AbstractStorage):
             path=path,
             name=PurePosixPath(path).name,
             is_dir=True,
-            size=None,
+            size=0,
             modified=now,
             created=now,
         )
         await client.put_object(key=dir_key, data=serialize_file_info(info))
-        self.log.info(f"MkDir: <y>{key}</y>")
+        self.log.info(f"MkDir: <y>{escape_tag(key)}</y>")
 
     @override
     async def rmtree(self, path: str) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
-        self.log.info(f"RmTree: <y>{key}</y>")
+        self.log.info(f"RmTree: <y>{escape_tag(key)}</y>")
 
         if not await self.is_dir(path):
             raise NotADirectoryError(f"Not a directory: {path}")
@@ -306,7 +341,9 @@ class CosStorage(AbstractStorage):
             await client.delete_object(key=root_dir_key)
             deleted_dirs += 1
 
-        self.log.info(f"RmTree complete: <y>{key}</y> (<g>{deleted_files}</g> files, <g>{deleted_dirs}</g> dirs)")
+        self.log.info(
+            f"RmTree complete: <y>{escape_tag(key)}</y> (<g>{deleted_files}</g> files, <g>{deleted_dirs}</g> dirs)"
+        )
 
     @override
     async def exists(self, path: str) -> bool:
@@ -351,7 +388,7 @@ class CosStorage(AbstractStorage):
 
         # 根目录：不需要 COS 请求
         if key == "":
-            return FileInfo(path=path, name="", is_dir=True, size=None)
+            return FileInfo(path=path, name="", is_dir=True, size=0)
 
         # 1. 尝试作为常规文件
         head = await client.head_object(key=key)
@@ -433,7 +470,8 @@ class CosStorage(AbstractStorage):
         client = self._ensure_client()
         num_parts = (src_size + UPLOAD_CHUNK_SIZE - 1) // UPLOAD_CHUNK_SIZE
         self.log.debug(
-            f"Multipart copy: <y>{src_key}</y> → <y>{dst_key}</y> (<g>{src_size}</g> bytes in <g>{num_parts}</g> parts)"
+            f"Multipart copy: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y> "
+            f"(<g>{src_size}</g> bytes in <g>{num_parts}</g> parts)"
         )
 
         upload_id = await client.create_multipart_upload(dst_key)
@@ -458,7 +496,7 @@ class CosStorage(AbstractStorage):
                 await anyio.lowlevel.checkpoint()
 
             await client.complete_multipart_upload(dst_key, upload_id, parts)
-            self.log.debug(f"Multipart copy complete: <y>{dst_key}</y>")
+            self.log.debug(f"Multipart copy complete: <y>{escape_tag(dst_key)}</y>")
         except Exception:
             with contextlib.suppress(Exception):
                 await client.abort_multipart_upload(dst_key, upload_id)
