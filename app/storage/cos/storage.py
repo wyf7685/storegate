@@ -13,8 +13,10 @@ from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
 from app.utils import coalesce_chunks
 
 from .cos_client import AsyncCosClient, CosConfig, CosHttpStatusError, ListObjectsDir, MultipartUploadPart
-from .utils import UPLOAD_CHUNK_SIZE, MultipartUploadTask, deserialize_file_info, serialize_file_info
+from .utils import MultipartUploadTask, deserialize_file_info, serialize_file_info
 
+UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 # Files larger than this are copied via multipart upload to stay within
 # the PUT Object - Copy 5 GiB limit and to allow parallel part copies.
 COPY_MULTIPART_THRESHOLD = 4 * 1024 * 1024  # 4 MiB
@@ -53,18 +55,15 @@ class CosStorage(AbstractStorage):
     async def ping(self) -> bool:
         if self._client is None:
             return False
-        agen = self._client.list_objects(max_keys=1)
         try:
             # Use list_objects instead of head_bucket to work with minimal
             # IAM policies (head_bucket requires GetBucket permission).
-            with contextlib.suppress(StopAsyncIteration):  # bucket exists but is empty — still healthy
-                await anext(agen)
+            async with contextlib.aclosing(self._client.list_objects(max_keys=1)) as agen:
+                await anext(agen, None)
         except Exception:
             return False
         else:
             return True
-        finally:
-            await agen.aclose()
 
     def _ensure_client(self) -> AsyncCosClient:
         if self._client is None:
@@ -104,7 +103,7 @@ class CosStorage(AbstractStorage):
         self.log.info(f"Upload: <y>{escape_tag(key)}</y>")
         await self.mkdir(PurePosixPath(remote_path).parent.as_posix(), parents=True, exist_ok=True)
 
-        chunk_iter = aiter(coalesce_chunks(stream))
+        chunk_iter = aiter(coalesce_chunks(stream, UPLOAD_CHUNK_SIZE))
         first_chunk = await anext(chunk_iter, None)
         if first_chunk is None:
             self.log.debug(f"Upload: <y>{escape_tag(key)}</y> — empty object")
@@ -138,13 +137,13 @@ class CosStorage(AbstractStorage):
         if head is None:
             raise FileNotFoundError(f"Object not found: {remote_path}")
         total_size = head.content_length
-        num_chunks = (total_size + UPLOAD_CHUNK_SIZE - 1) // UPLOAD_CHUNK_SIZE
+        num_chunks = (total_size + DOWNLOAD_CHUNK_SIZE - 1) // DOWNLOAD_CHUNK_SIZE
 
         self.log.debug(f"Download: <y>{escape_tag(key)}</y> (<g>{total_size}</g> bytes in <g>{num_chunks}</g> chunks)")
 
         for i in range(num_chunks):
-            start = i * UPLOAD_CHUNK_SIZE
-            end = min(start + UPLOAD_CHUNK_SIZE - 1, total_size - 1)
+            start = i * DOWNLOAD_CHUNK_SIZE
+            end = min(start + DOWNLOAD_CHUNK_SIZE - 1, total_size - 1)
             chunk = await client.get_object(key=key, range=(start, end))
             yield chunk
 
@@ -161,11 +160,7 @@ class CosStorage(AbstractStorage):
 
         # 2. 目录：检查为空后删除标记对象
         if await self.is_dir(path):
-            try:
-                await anext(self.iterdir(path))
-            except StopAsyncIteration:
-                pass  # 空目录
-            else:
+            if not await self._is_dir_empty(path):
                 raise OSError(f"Directory not empty: {path}")
 
             dir_key = self._dir_key(path)
@@ -191,11 +186,7 @@ class CosStorage(AbstractStorage):
 
             # 2. 目录：检查为空后删除标记对象
             if await self.is_dir(path):
-                try:
-                    await anext(self.iterdir(path))
-                except StopAsyncIteration:
-                    pass  # 空目录
-                else:
+                if not await self._is_dir_empty(path):
                     raise OSError(f"Directory not empty: {path}")
 
                 dir_key = self._dir_key(path)
@@ -491,3 +482,11 @@ class CosStorage(AbstractStorage):
             with contextlib.suppress(Exception):
                 await client.abort_multipart_upload(dst_key, upload_id)
             raise
+
+    @override
+    async def _is_dir_empty(self, path: str) -> bool:
+        key = self._remote_path_to_key(path)
+        prefix = (key + "/") if key else None
+        async for _ in self._ensure_client().list_objects(prefix=prefix, delimiter="/", max_keys=1):
+            return False
+        return True

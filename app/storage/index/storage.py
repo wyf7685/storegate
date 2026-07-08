@@ -1,5 +1,6 @@
 import contextlib
 import hashlib
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -192,15 +193,22 @@ class IndexStorage(AbstractStorage):
             return None
         return FileMeta.model_validate_json(meta_bytes.decode())
 
+    async def _chunk_load_refs(self, chunk_hash: str) -> set[str] | None:
+        chunks = self._ensure_chunks()
+        ref_path = hash_to_path(chunk_hash, "ref")
+        if not await chunks.exists(ref_path):
+            return None
+
+        refs_bytes = await chunks.download_bytes(ref_path)
+        return set(refs_bytes.decode().splitlines())
+
     async def _chunk_incref(self, chunk_hash: str, remote_path: str) -> None:
         chunks = self._ensure_chunks()
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
 
-        if await chunks.exists(ref_path):
-            refs: set[str] = set((await chunks.download_bytes(ref_path)).decode().splitlines())
-        else:
-            refs = set()
+        refs: set[str] = await self._chunk_load_refs(chunk_hash) or set()
+
         refs.add(remote_path)
         await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
         self.log.debug(f"Chunk {_colored_hash} +ref → <g>{len(refs)}</g> (<i>{escape_tag(remote_path)}</i>)")
@@ -210,15 +218,16 @@ class IndexStorage(AbstractStorage):
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
 
-        if not await chunks.exists(ref_path):
+        refs = await self._chunk_load_refs(chunk_hash)
+        if refs is None:
             self.log.warning(f"Chunk {_colored_hash} ref file missing, skip decref (<i>{escape_tag(remote_path)}</i>)")
             return
-        refs = set((await chunks.download_bytes(ref_path)).decode().splitlines())
         if remote_path not in refs:
             self.log.warning(
                 f"Chunk {_colored_hash} ref entry not found for <i>{escape_tag(remote_path)}</i>, skip decref"
             )
             return
+
         refs.remove(remote_path)
         if refs:
             await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
@@ -233,12 +242,11 @@ class IndexStorage(AbstractStorage):
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
 
-        if not await chunks.exists(ref_path):
+        refs: set[str] | None = await self._chunk_load_refs(chunk_hash)
+        if refs is None:
             if not missing_ok:
                 raise FileNotFoundError(f"Chunk {chunk_hash} ref file missing for transref")
-            refs = set[str]()
-        else:
-            refs = set((await chunks.download_bytes(ref_path)).decode().splitlines())
+            refs = set()
 
         if src_path not in refs:
             if missing_ok:
@@ -256,6 +264,36 @@ class IndexStorage(AbstractStorage):
             f"(<g>{len(refs)}</g> refs)"
         )
 
+    @contextlib.asynccontextmanager
+    async def _chunk_temp_ref(self, chunk_hash: str) -> AsyncGenerator[None]:
+        chunks = self._ensure_chunks()
+        ref_path = hash_to_path(chunk_hash, "ref")
+        _colored_hash = f"<c>{chunk_hash[:8]}</c>"
+        temp_ref = f"$tempref-{uuid.uuid4().hex[:8]}"
+
+        async with self._lock_chunk(chunk_hash):
+            refs = await self._chunk_load_refs(chunk_hash) or set()
+            refs.add(temp_ref)
+            await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
+        self.log.debug(f"Chunk {_colored_hash} +tempref → <g>{len(refs)}</g> (<i>{escape_tag(temp_ref)}</i>)")
+
+        try:
+            yield
+        finally:
+            async with self._lock_chunk(chunk_hash):
+                refs = await self._chunk_load_refs(chunk_hash) or set()
+                if temp_ref in refs:
+                    refs.remove(temp_ref)
+                    if refs:
+                        await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
+                        self.log.debug(
+                            f"Chunk {_colored_hash} -tempref → <g>{len(refs)}</g> (<i>{escape_tag(temp_ref)}</i>)"
+                        )
+                    else:
+                        await chunks.delete(ref_path)
+                        await chunks.delete(hash_to_path(chunk_hash, "bin"))
+                        self.log.debug(f"Chunk {_colored_hash} tempref=0, deleted data (<i>{escape_tag(temp_ref)}</i>)")
+
     async def _save_chunk_worker(
         self,
         recv: MemoryObjectReceiveStream[tuple[str, bytes, str]],
@@ -272,7 +310,7 @@ class IndexStorage(AbstractStorage):
                     await chunks.upload_bytes(data, bin_path)
                     elapsed = anyio.current_time() - start
                     self.log.debug(
-                        f"Chunk <c>{chunk_hash[:8]}</c> uploaded (<g>{len(data):,}</g> bytes, <g>{elapsed:.2f}</g> s)"
+                        f"Chunk <c>{chunk_hash[:8]}</c> uploaded (<g>{len(data)}</g> bytes, <g>{elapsed:.2f}</g> s)"
                     )
                 else:
                     self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> already exists, skipping upload")
@@ -342,7 +380,7 @@ class IndexStorage(AbstractStorage):
                                 self.log.debug(
                                     f"Chunk #{len(chunk_hashes)} <c>{chunk_hash[:8]}</c> "
                                     f"received for {_colored_path}"
-                                    f" (<g>{self._block_size:,}</g> bytes)"
+                                    f" (<g>{self._block_size}</g> bytes)"
                                 )
                                 # channel 满时阻塞 → 反压输入流
                                 await send.send(
@@ -360,7 +398,7 @@ class IndexStorage(AbstractStorage):
                         self.log.debug(
                             f"Chunk #{len(chunk_hashes)} <c>{chunk_hash[:8]}</c> "
                             f"received for {_colored_path}"
-                            f" (<g>{len(buffer):,}</g> bytes)"
+                            f" (<g>{len(buffer)}</g> bytes)"
                         )
                         await send.send(
                             (chunk_hash, bytes(buffer), remote_path),
@@ -393,17 +431,20 @@ class IndexStorage(AbstractStorage):
                 )
 
             self.log.info(
-                f"Upload complete: {_colored_path} (<g>{total_size:,}</g> bytes in <g>{len(chunk_hashes)}</g> chunks)"
+                f"Upload complete: {_colored_path} (<g>{total_size}</g> bytes in <g>{len(chunk_hashes)}</g> chunks)"
             )
         except Exception:
             self.log.error(  # noqa: TRY400
                 f"Upload failed: {_colored_path} "
-                f"(<g>{total_size:,}</g> bytes streamed, "
+                f"(<g>{total_size}</g> bytes streamed, "
                 f"<g>{len(chunk_hashes)}</g> chunks processed)"
             )
+
             # 回滚已 incref 的分块
-            for h in incref_done:
-                await self._chunk_decref(h, remote_path)
+            with anyio.CancelScope(shield=True):
+                async with self._lock_chunks(incref_done), anyio.create_task_group() as tg:
+                    for h in incref_done:
+                        tg.start_soon(self._chunk_decref, h, remote_path)
             raise
 
     @override
@@ -424,9 +465,9 @@ class IndexStorage(AbstractStorage):
             for idx, chunk_hash in enumerate(meta.chunks):
                 self.log.debug(f"Downloading Chunk #{idx + 1} <c>{chunk_hash[:8]}</c> for {_colored_path}")
                 bin_path = hash_to_path(chunk_hash, "bin")
-                async with self._lock_chunk(chunk_hash):
+                async with self._chunk_temp_ref(chunk_hash):
                     if not await chunks.exists(bin_path):
-                        raise FileNotFoundError(f"Chunk not found: {chunk_hash}")
+                        raise FileNotFoundError(f"Chunk #{idx + 1} {chunk_hash} not found for file {remote_path}")
                     hasher = hashlib.sha256()
                     chunk_size = 0
                     chunk_start = anyio.current_time()
@@ -447,12 +488,12 @@ class IndexStorage(AbstractStorage):
                         )
                     self.log.debug(
                         f"Downloaded Chunk #{idx + 1} <c>{chunk_hash[:8]}</c> for {_colored_path} "
-                        f"(<g>{chunk_size:,}</g> bytes, <g>{chunk_elapsed:.2f}</g> s)"
+                        f"(<g>{chunk_size}</g> bytes, <g>{chunk_elapsed:.2f}</g> s)"
                     )
                     total_size += chunk_size
             file_elapsed = anyio.current_time() - file_start
             self.log.info(
-                f"Download complete: {_colored_path} (<g>{total_size:,}</g> bytes in <g>{len(meta.chunks)}</g> chunks, "
+                f"Download complete: {_colored_path} (<g>{total_size}</g> bytes in <g>{len(meta.chunks)}</g> chunks, "
                 f"<g>{file_elapsed:.2f}</g> s)"
             )
 
@@ -461,11 +502,8 @@ class IndexStorage(AbstractStorage):
         _colored_path = f"<y>{escape_tag(path)}</y>"
         index = self._ensure_index()
         if await index.is_dir(path):
-            try:
-                await anext(index.iterdir(path))
+            if not await self._is_dir_empty(path):
                 raise OSError(f"Directory not empty: {path}")
-            except StopAsyncIteration:
-                pass
             await index.delete(path)
             return
 
@@ -478,7 +516,7 @@ class IndexStorage(AbstractStorage):
                     for chunk_hash in meta.chunks:
                         tg.start_soon(self._chunk_decref, chunk_hash, path)
                 await index.delete(path)
-        self.log.info(f"Deleted: {_colored_path} (<g>{meta.info.size:,}</g> bytes, <g>{len(meta.chunks)}</g> chunks)")
+        self.log.info(f"Deleted: {_colored_path} (<g>{meta.info.size}</g> bytes, <g>{len(meta.chunks)}</g> chunks)")
 
     @override
     async def move(
@@ -524,7 +562,7 @@ class IndexStorage(AbstractStorage):
 
         self.log.info(
             f"Moved: {_colored_src} → {_colored_dst} "
-            f"(<g>{src_meta.info.size:,}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
+            f"(<g>{src_meta.info.size}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
         )
 
     @override
@@ -570,7 +608,7 @@ class IndexStorage(AbstractStorage):
 
         self.log.info(
             f"Copied: {_colored_src} → {_colored_dst} "
-            f"(<g>{src_meta.info.size:,}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
+            f"(<g>{src_meta.info.size}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
         )
 
     @override

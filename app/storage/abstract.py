@@ -252,3 +252,9 @@ class AbstractStorage(ABC):
         """Recursively walk a directory tree."""
         raise NotImplementedError
         yield
+
+    async def _is_dir_empty(self, path: str) -> bool:
+        """Check if a directory is empty."""
+        async for _ in self.iterdir(path):
+            return False
+        return True

@@ -14,10 +14,6 @@ from app.utils import logger_wrapper
 
 from .cos_client import AsyncCosClient, MultipartUploadPart
 
-UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
-DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
-DEFAULT_TTL_SECS = 3600  # 1 hour
-
 
 def get_object_key(key: str) -> str:
     return key
