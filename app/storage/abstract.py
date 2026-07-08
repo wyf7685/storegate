@@ -158,9 +158,41 @@ class AbstractStorage(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def delete(self, path: str) -> None:
-        """Delete a file or an empty directory."""
+    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
+        """Delete a file.
+
+        Args:
+            path: Path to the file.
+            missing_ok: If ``True``, silently succeed when the file does not exist.
+
+        Raises:
+            IsADirectoryError: If *path* is a directory.
+            FileNotFoundError: If *path* does not exist and *missing_ok* is ``False``.
+        """
         raise NotImplementedError
+
+    @abstractmethod
+    async def rmdir(self, path: str) -> None:
+        """Delete an empty directory.
+
+        Raises:
+            NotADirectoryError: If *path* is a file.
+            OSError: If the directory is not empty.
+            FileNotFoundError: If *path* does not exist (implementations may
+                silently succeed instead).
+        """
+        raise NotImplementedError
+
+    async def delete(self, path: str) -> None:
+        """Delete a file or an empty directory.
+
+        Convenience method that calls :meth:`rmdir` if *path* is a directory,
+        otherwise :meth:`unlink`.
+        """
+        if await self.is_dir(path):
+            await self.rmdir(path)
+        else:
+            await self.unlink(path)
 
     async def delete_many(self, *paths: str) -> None:
         """Delete multiple files or empty directories."""

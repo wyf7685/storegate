@@ -47,7 +47,8 @@ class FTPServer:
     async def _handle_client(self, stream: SocketStream) -> None:
         """Handle a single client connection."""
         peer = stream.extra_attributes.get(anyio.abc.SocketAttribute.remote_address, lambda: ("unknown", 0))()
-        logger.info(f"New connection from <g><b>{peer[0]}</>:{peer[1]}</>")
+        colored_peer = f"<g><b>{peer[0]}</>:{peer[1]}</>"
+        logger.info(f"New connection from {colored_peer}")
 
         session = FTPSession()
         handler = FTPHandler(storage=self._storage, session=session, stream=stream, host=self._host)
@@ -61,4 +62,4 @@ class FTPServer:
             # Clean up any lingering PASV listener
             if session.pasv_listener is not None:
                 await session.pasv_listener.aclose()
-            logger.info(f"Connection closed: <g><b>{peer[0]}</>:{peer[1]}</>")
+            logger.info(f"Connection closed: {colored_peer}")

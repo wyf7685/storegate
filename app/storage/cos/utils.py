@@ -127,8 +127,7 @@ class MultipartUploadTask:
         self.parts.sort(key=lambda part: part["PartNumber"])
         await self.client.complete_multipart_upload(key=self.key, upload_id=self.upload_id, parts=self.parts)
         self.log.info(
-            f"Completed multipart upload "
-            f"with upload_id=<y>{self.upload_id}</> and <g>{len(self.parts)}</> parts"
+            f"Completed multipart upload with upload_id=<y>{self.upload_id}</> and <g>{len(self.parts)}</> parts"
         )
 
     async def abort(self) -> None:

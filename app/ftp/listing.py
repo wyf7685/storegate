@@ -28,11 +28,6 @@ def format_list(items: list[FileInfo]) -> str:
     return "\r\n".join(format_list_line(item) for item in items) + "\r\n"
 
 
-def format_nlst_line(info: FileInfo) -> str:
-    """Format a single FileInfo entry as a plain filename (NLST)."""
-    return info.name
-
-
 def format_nlst(items: list[FileInfo]) -> str:
     """Format a list of FileInfo entries as plain filenames (NLST)."""
     if not items:

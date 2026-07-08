@@ -626,7 +626,14 @@ class FTPHandler:
         if not arg:
             return R.SYNTAX_ERROR("DELE requires a filename")
         target = self._resolve_path(arg)
-        await self._storage.delete(target)
+        try:
+            await self._storage.unlink(target)
+        except IsADirectoryError:
+            return R.NOT_AVAILABLE(f"{arg}: is a directory")
+        except FileNotFoundError:
+            return R.NOT_AVAILABLE(f"File not found: {arg}")
+        except OSError:
+            return R.NOT_AVAILABLE(f"Failed to delete {arg}")
         return R.ACTION_OK(f"Deleted {arg}")
 
     async def _handle_rmd(self, arg: str) -> str:
@@ -634,10 +641,14 @@ class FTPHandler:
             return R.SYNTAX_ERROR("RMD requires a directory name")
         target = self._resolve_path(arg)
         try:
-            await self._storage.delete(target)
-            return R.ACTION_OK(f"Removed directory {arg}")
+            await self._storage.rmdir(target)
+        except NotADirectoryError:
+            return R.NOT_AVAILABLE(f"{arg}: not a directory")
+        except FileNotFoundError:
+            return R.NOT_AVAILABLE(f"Directory not found: {arg}")
         except OSError as e:
             return R.NOT_AVAILABLE(f"Failed to remove directory {arg}: {e}")
+        return R.ACTION_OK(f"Removed directory {arg}")
 
     async def _handle_mkd(self, arg: str) -> str:
         if not arg:

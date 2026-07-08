@@ -124,13 +124,14 @@ class LocalStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def delete(self, path: str) -> None:
+    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
         target = self._resolve(path)
-        p = anyio.Path(target)
-        if await p.is_dir():
-            await p.rmdir()
-        else:
-            await p.unlink(missing_ok=False)
+        await anyio.Path(target).unlink(missing_ok=missing_ok)
+
+    @override
+    async def rmdir(self, path: str) -> None:
+        target = self._resolve(path)
+        await anyio.Path(target).rmdir()
 
     @override
     async def move(self, src: str, dst: str) -> None:

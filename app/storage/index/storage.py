@@ -133,8 +133,7 @@ class IndexStorage(AbstractStorage):
             return
 
         if len(lock_paths) == 1:
-            with contextlib.suppress(FileNotFoundError):
-                await storage.delete(lock_paths[0])
+            await storage.unlink(lock_paths[0], missing_ok=True)
             self.log.trace(f"Lock <y>{escape_tag(lock_paths[0])}</y> released")
         else:
             await storage.delete_many(*lock_paths)
@@ -233,8 +232,8 @@ class IndexStorage(AbstractStorage):
             await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
             self.log.debug(f"Chunk {_colored_hash} -ref → <g>{len(refs)}</g> (<i>{escape_tag(remote_path)}</i>)")
         else:
-            await chunks.delete(ref_path)
-            await chunks.delete(hash_to_path(chunk_hash, "bin"))
+            await chunks.unlink(ref_path, missing_ok=True)
+            await chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
             self.log.debug(f"Chunk {_colored_hash} ref=0, deleted data (<i>{escape_tag(remote_path)}</i>)")
 
     async def _chunk_transref(self, chunk_hash: str, src_path: str, dst_path: str, missing_ok: bool = False) -> None:
@@ -290,8 +289,8 @@ class IndexStorage(AbstractStorage):
                             f"Chunk {_colored_hash} -tempref → <g>{len(refs)}</g> (<i>{escape_tag(temp_ref)}</i>)"
                         )
                     else:
-                        await chunks.delete(ref_path)
-                        await chunks.delete(hash_to_path(chunk_hash, "bin"))
+                        await chunks.unlink(ref_path, missing_ok=True)
+                        await chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
                         self.log.debug(f"Chunk {_colored_hash} tempref=0, deleted data (<i>{escape_tag(temp_ref)}</i>)")
 
     async def _save_chunk_worker(
@@ -498,25 +497,38 @@ class IndexStorage(AbstractStorage):
             )
 
     @override
-    async def delete(self, path: str) -> None:
+    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
         _colored_path = f"<y>{escape_tag(path)}</y>"
         index = self._ensure_index()
+
         if await index.is_dir(path):
-            if not await self._is_dir_empty(path):
-                raise OSError(f"Directory not empty: {path}")
-            await index.delete(path)
-            return
+            raise IsADirectoryError(f"Is a directory: {path}")
 
         async with self._lock_index(path):
             meta = await self._get_file_meta(path)
             if meta is None:
-                return
+                if missing_ok:
+                    return
+                raise FileNotFoundError(f"File not found: {path}")
             async with self._lock_chunks(meta.chunks):
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in meta.chunks:
                         tg.start_soon(self._chunk_decref, chunk_hash, path)
-                await index.delete(path)
+                await index.unlink(path)
         self.log.info(f"Deleted: {_colored_path} (<g>{meta.info.size}</g> bytes, <g>{len(meta.chunks)}</g> chunks)")
+
+    @override
+    async def rmdir(self, path: str) -> None:
+        index = self._ensure_index()
+
+        if await index.is_file(path):
+            raise NotADirectoryError(f"Not a directory: {path}")
+        if not await index.is_dir(path):
+            raise FileNotFoundError(f"Directory not found: {path}")
+        if not await self._is_dir_empty(path):
+            raise OSError(f"Directory not empty: {path}")
+
+        await index.rmdir(path)
 
     @override
     async def move(
@@ -558,7 +570,7 @@ class IndexStorage(AbstractStorage):
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in src_meta.chunks:
                         tg.start_soon(self._chunk_transref, chunk_hash, src, dst)
-            await index.delete(src)
+            await index.unlink(src)
 
         self.log.info(
             f"Moved: {_colored_src} → {_colored_dst} "
@@ -634,8 +646,8 @@ class IndexStorage(AbstractStorage):
                 if info.is_dir:
                     tg.start_soon(self.rmtree, info.path)
                 else:
-                    tg.start_soon(self.delete, info.path)
-        await index.delete(path)
+                    tg.start_soon(self.unlink, info.path)
+        await index.rmdir(path)
         self.log.info(f"RmTree complete: {_colored_path} (<g>{count}</g> entries removed)")
 
     @override

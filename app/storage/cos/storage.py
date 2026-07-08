@@ -148,7 +148,54 @@ class CosStorage(AbstractStorage):
             yield chunk
 
     @override
+    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
+        client = self._ensure_client()
+        key = self._remote_path_to_key(path)
+
+        # 1. 文件：直接删除
+        if await client.head_object(key=key) is not None:
+            self.log.info(f"Delete file: <y>{escape_tag(key)}</y>")
+            await client.delete_object(key=key)
+            return
+
+        # 2. 目录：报错
+        if await self.is_dir(path):
+            raise IsADirectoryError(f"Is a directory: {path}")
+
+        # 3. 不存在
+        if not missing_ok:
+            raise FileNotFoundError(f"File not found: {path}")
+
+    @override
+    async def rmdir(self, path: str) -> None:
+        client = self._ensure_client()
+        key = self._remote_path_to_key(path)
+
+        # 1. 文件：报错
+        if await client.head_object(key=key) is not None:
+            raise NotADirectoryError(f"Not a directory: {path}")
+
+        # 2. 目录：检查为空后删除标记对象
+        if await self.is_dir(path):
+            if not await self._is_dir_empty(path):
+                raise OSError(f"Directory not empty: {path}")
+
+            dir_key = self._dir_key(path)
+            assert dir_key is not None  # is_dir=True 且不是根目录
+            self.log.info(f"Delete dir: <y>{escape_tag(dir_key)}</y>")
+            await client.delete_object(key=dir_key)
+            return
+
+        # 3. 不存在：静默成功
+
+    @override
     async def delete(self, path: str) -> None:
+        """Delete a file or an empty directory.
+
+        Uses inline branching to minimize COS API calls, rather than the
+        base class convenience method which would require an extra
+        ``head_object`` via :meth:`is_dir`.
+        """
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
 
@@ -169,7 +216,7 @@ class CosStorage(AbstractStorage):
             await client.delete_object(key=dir_key)
             return
 
-        # 3. 不存在：静默成功（保持现有约定）
+        # 3. 不存在：静默成功
 
     @override
     async def delete_many(self, *paths: str) -> None:
@@ -194,7 +241,7 @@ class CosStorage(AbstractStorage):
                 objects_to_delete.append(dir_key)
                 continue
 
-            # 3. 不存在：静默成功（保持现有约定）
+            # 3. 不存在：静默成功
 
         if objects_to_delete:
             self.log.info(f"Delete many: <y>{escape_tag(repr(objects_to_delete))}</y>")
@@ -210,7 +257,7 @@ class CosStorage(AbstractStorage):
         dst_key = self._remote_path_to_key(dst)
         self.log.info(f"Move: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y>")
         await self.copy(src, dst)
-        await self.delete(src)
+        await self.unlink(src)
 
     @override
     async def copy(

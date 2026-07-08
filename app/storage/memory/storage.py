@@ -137,25 +137,40 @@ class MemoryStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def delete(self, path: str) -> None:
+    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
         target = self._resolve(path)
 
         if target in self._files:
             del self._files[target]
-        elif target in self._dirs or target == "" or self._is_dir(target):
-            _target = target or ""
-            if _target in self._dirs:
-                self._dirs.discard(_target)
-            prefix = _target + "/" if _target else ""
-            # Only allow deletion of empty directories.
-            for key in self._files:
-                if key.startswith(prefix):
-                    raise OSError(f"Directory not empty: {path}")
-            for key in self._dirs:
-                if key != _target and key.startswith(prefix):
-                    raise OSError(f"Directory not empty: {path}")
-        else:
-            raise FileNotFoundError(f"Path not found: {path}")
+            return
+
+        if target in self._dirs or target == "" or self._is_dir(target):
+            raise IsADirectoryError(f"Is a directory: {path}")
+
+        if missing_ok:
+            return
+
+        raise FileNotFoundError(f"File not found: {path}")
+
+    @override
+    async def rmdir(self, path: str) -> None:
+        target = self._resolve(path)
+
+        if target in self._files:
+            raise NotADirectoryError(f"Not a directory: {path}")
+        if target not in self._dirs and target != "" and not self._is_dir(target):
+            raise FileNotFoundError(f"Directory not found: {path}")
+
+        if target in self._dirs:
+            self._dirs.discard(target)
+        prefix = target + "/" if target else ""
+        # Only allow deletion of empty directories.
+        for key in self._files:
+            if key.startswith(prefix):
+                raise OSError(f"Directory not empty: {path}")
+        for key in self._dirs:
+            if key != target and key.startswith(prefix):
+                raise OSError(f"Directory not empty: {path}")
 
     @override
     async def move(self, src: str, dst: str) -> None:
