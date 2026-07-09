@@ -12,7 +12,14 @@ from app.log import escape_tag
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
 from app.utils import coalesce_chunks
 
-from .cos_client import AsyncCosClient, CosConfig, CosHttpStatusError, ListObjectsDir, MultipartUploadPart
+from .cos_client import (
+    AsyncCosClient,
+    CosConfig,
+    CosHttpStatusError,
+    ListObjectsDir,
+    ListObjectsItem,
+    MultipartUploadPart,
+)
 from .utils import MultipartUploadTask, deserialize_file_info, serialize_file_info
 
 UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
@@ -474,11 +481,9 @@ class CosStorage(AbstractStorage):
                 continue
 
             # 提取直接子级名称
-            if key:  # noqa: SIM108
-                rest = obj.key[len(key) + 1 :]  # "test/foo/bar.txt" → "foo/bar.txt"
-            else:
-                rest = obj.key  # "foo/bar.txt" → "foo/bar.txt"
-
+            #   "test/foo/bar.txt" → "foo/bar.txt"
+            #   "foo/bar.txt" → "foo/bar.txt"
+            rest = obj.key[len(key) + 1 :] if key else obj.key
             # 跳过：非直接子级 (rest 含 "/") 或目录自身的标记对象 (rest 为空)
             if not rest or "/" in rest:
                 continue
@@ -501,6 +506,48 @@ class CosStorage(AbstractStorage):
         for dir in dirs:
             async for sp, sd, sf in self._walk(dir.path):
                 yield sp, sd, sf
+
+    @override
+    async def list_(self, path: str) -> list[FileInfo]:
+        client = self._ensure_client()
+        key = self._remote_path_to_key(path)
+        prefix = (key + "/") if key else None
+        infos: list[FileInfo] = []
+
+        async def _fetch_dir_info(dir_path: str) -> None:
+            try:
+                body = await client.get_object(key=dir_path + "/")
+            except CosHttpStatusError:
+                # 无标记对象 → 不是合法目录，跳过
+                return
+            infos.append(deserialize_file_info(dir_path, body))
+
+        async with anyio.create_task_group() as tg:
+            async for obj in client.list_objects(prefix=prefix, delimiter="/"):
+                if isinstance(obj, ListObjectsDir):
+                    dir_path = obj.prefix.rstrip("/")
+                    tg.start_soon(_fetch_dir_info, dir_path)
+                    continue
+
+                # 提取直接子级名称
+                #   "test/foo/bar.txt" → "foo/bar.txt"
+                #   "foo/bar.txt" → "foo/bar.txt"
+                rest = obj.key[len(key) + 1 :] if key else obj.key
+                # 跳过：非直接子级 (rest 含 "/") 或目录自身的标记对象 (rest 为空)
+                if not rest or "/" in rest:
+                    continue
+
+                infos.append(
+                    FileInfo(
+                        path=obj.key,
+                        name=rest,
+                        is_dir=False,
+                        size=obj.size,
+                        modified=obj.last_modified,
+                    )
+                )
+
+        return infos
 
     async def _copy_multipart(self, src_key: str, dst_key: str, src_size: int) -> None:
         """Server-side copy via multipart upload for objects above the threshold."""
@@ -543,6 +590,9 @@ class CosStorage(AbstractStorage):
     async def _is_dir_empty(self, path: str) -> bool:
         key = self._remote_path_to_key(path)
         prefix = (key + "/") if key else None
-        async for _ in self._ensure_client().list_objects(prefix=prefix, delimiter="/", max_keys=1):
+        async for item in self._ensure_client().list_objects(prefix=prefix, delimiter="/", max_keys=2):
+            # skip directory marker object itself
+            if isinstance(item, ListObjectsItem) and item.key.rstrip("/") == key:
+                continue
             return False
         return True
