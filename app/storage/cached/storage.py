@@ -180,9 +180,7 @@ class CachedStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
-        buffer: bytearray | None = (
-            bytearray() if self._download_cache_threshold is not None else None
-        )
+        buffer = bytearray() if self._download_cache_threshold is not None else None
         threshold = self._download_cache_threshold or 0
 
         async def _tracked_stream() -> AsyncGenerator[BytesLike]:
