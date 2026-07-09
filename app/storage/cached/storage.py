@@ -1,3 +1,4 @@
+import itertools
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from pathlib import PurePosixPath
 from typing import Literal, final, override
@@ -430,6 +431,15 @@ class CachedStorage(AbstractStorage):
         self.log.debug(f"Cache miss: <le>is_dir</>(<y>{escape_tag(np)}</y>) = <g>{result}</g>")
         return result
 
+    @staticmethod
+    def _info_to_cache_entries(np: str, info: FileInfo) -> list[tuple[str, str, object]]:
+        return [
+            ("stat", np, info),
+            ("exists", np, True),
+            ("is_file", np, not info.is_dir),
+            ("is_dir", np, info.is_dir),
+        ]
+
     @override
     async def stat(self, path: str) -> FileInfo:
         np = self._normalize(path)
@@ -439,12 +449,7 @@ class CachedStorage(AbstractStorage):
             return cached
         result = await self._storage.stat(path)  # may raise FileNotFoundError
         # stat is the most complete metadata source
-        await self._cache.mset(
-            ("stat", np, result),
-            ("exists", np, True),
-            ("is_file", np, not result.is_dir),
-            ("is_dir", np, result.is_dir),
-        )
+        await self._cache.mset(*self._info_to_cache_entries(np, result))
         self.log.debug(f"Cache miss: <le>stat</>(<y>{escape_tag(np)}</y>)")
         return result
 
@@ -458,14 +463,17 @@ class CachedStorage(AbstractStorage):
         cached: list[FileInfo] | None = await self._cache.get("iterdir", np)
         if cached is not None:
             self.log.trace(f"Cache hit: <le>iterdir</>(<y>{escape_tag(np)}</y>) → <g>{len(cached)}</g> entries")
-            for entry in cached:
-                yield entry
+            for info in cached:
+                yield info
             return
         entries: list[FileInfo] = []
-        async for entry in self._storage.iterdir(path):
-            entries.append(entry)
-            yield entry
-        await self._cache.set("iterdir", np, entries.copy())
+        cache_entries: list[tuple[str, str, object]] = []
+        async for info in self._storage.iterdir(path):
+            entries.append(info)
+            cache_entries.extend(self._info_to_cache_entries(self._normalize(info.path), info))
+            yield info
+        cache_entries.append(("iterdir", np, entries.copy()))
+        await self._cache.mset(*cache_entries)
         self.log.debug(f"Cache miss: <le>iterdir</>(<y>{escape_tag(np)}</y>) → <g>{len(entries)}</g> entries")
 
     @override
@@ -478,3 +486,13 @@ class CachedStorage(AbstractStorage):
         for d in dirs:
             async for result in self.walk(d.path):
                 yield result
+
+    @override
+    async def list_(self, path: str) -> list[FileInfo]:
+        infos: list[FileInfo] = await self._storage.list_(path)
+        await self._cache.mset(
+            *itertools.chain.from_iterable(
+                self._info_to_cache_entries(self._normalize(entry.path), entry) for entry in infos
+            )
+        )
+        return infos
