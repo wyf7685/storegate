@@ -4,13 +4,11 @@ from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 from typing import Any, Protocol, final, override
 
 import anyio
-from wsgidav import dav_error
 from wsgidav.dav_provider import DAVNonCollection
 
-from app.log import escape_tag, logger
 from app.storage import AbstractStorage, FileInfo
 
-from .utils import NativeHandlerResult, run_async
+from .utils import NativeHandlerResult, call_with_catch, current_event_loop_token, run_async
 
 
 class DAVReader(Protocol):
@@ -77,11 +75,11 @@ class ResourceWriter:
         self._send, self._recv = anyio.create_memory_object_stream[bytes](max_buffer_size=2)
         self._closed = False
         self._upload_fn = upload_fn
+        self._token = current_event_loop_token.get()
         self._scope = None
         self._scope_lock = threading.Lock()
         self._worker_thread: threading.Thread = threading.Thread(
-            target=run_async,
-            args=(self._arun,),
+            target=self._run,
             name="ResourceWriterWorker",
             daemon=True,
         )
@@ -99,6 +97,10 @@ class ResourceWriter:
         with self._scope_lock:
             self._scope = None
         self._worker_thread.join()
+
+    def _run(self) -> None:
+        with current_event_loop_token.set(self._token):
+            run_async(self._arun)
 
     async def _arun(self) -> None:
         try:
@@ -199,31 +201,17 @@ class StorageResource(DAVNonCollection):
         self._writer.close()
         self._writer = None
 
-    async def _call_with_catch(self, func: Callable[[], Awaitable[object]]) -> NativeHandlerResult:
-        error = None
-        try:
-            await func()
-        except IsADirectoryError:
-            error = dav_error.HTTP_FORBIDDEN
-        except FileNotFoundError:
-            error = dav_error.HTTP_NOT_FOUND
-        except Exception:
-            error = dav_error.HTTP_INTERNAL_ERROR
-            logger.opt(colors=True).exception(f"Error in DAV operation for path <y>{escape_tag(self.path)}</>")
-
-        return [(self.get_href(), dav_error.DAVError(error))] if error is not None else True
-
     @override
     def handle_delete(self) -> NativeHandlerResult:
-        return run_async(self._call_with_catch, functools.partial(self._storage.unlink, self.path, missing_ok=False))
+        return run_async(call_with_catch, self, functools.partial(self._storage.unlink, self.path, missing_ok=False))
 
     @override
     def handle_copy(self, dest_path: str, *, depth_infinity: bool) -> NativeHandlerResult:
-        return run_async(self._call_with_catch, functools.partial(self._storage.copy, self.path, dest_path))
+        return run_async(call_with_catch, self, functools.partial(self._storage.copy, self.path, dest_path))
 
     @override
     def handle_move(self, dest_path: str) -> NativeHandlerResult:
-        return run_async(self._call_with_catch, functools.partial(self._storage.move, self.path, dest_path))
+        return run_async(call_with_catch, self, functools.partial(self._storage.move, self.path, dest_path))
 
     @override
     def support_recursive_move(self, dest_path: str) -> bool:

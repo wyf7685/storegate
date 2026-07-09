@@ -1,3 +1,4 @@
+import functools
 from pathlib import PurePosixPath
 from typing import final, override
 
@@ -6,7 +7,7 @@ from wsgidav.dav_provider import DAVCollection as BaseDAVCollection
 from app.storage import AbstractStorage
 
 from .resource import StorageResource
-from .utils import run_async
+from .utils import NativeHandlerResult, call_with_catch, run_async
 
 
 @final
@@ -62,8 +63,8 @@ class StorageCollection(BaseDAVCollection):
         return True
 
     @override
-    def handle_delete(self) -> None:
-        run_async(self._storage.rmtree, self.path)
+    def handle_delete(self) -> NativeHandlerResult:
+        return run_async(call_with_catch, self, functools.partial(self._storage.rmtree, self.path))
 
     @override
     def copy_move_single(self, dest_path: str, *, is_move: bool) -> None:
