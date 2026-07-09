@@ -11,22 +11,49 @@ from ..abstract import AbstractStorage, BytesLike, FileInfo
 
 @final
 class CachedStorage(AbstractStorage):
-    """Cache metadata queries of an :class:`AbstractStorage`.
+    """Cache metadata and download queries of an :class:`AbstractStorage`.
 
     Wraps an existing storage backend and caches the results of
-    ``exists``, ``is_file``, ``is_dir``, ``stat`` and ``iterdir``
-    using :class:`~expiringdictx.ExpiringDict` instances.
+    ``exists``, ``is_file``, ``is_dir``, ``stat``, ``iterdir`` and
+    ``download_stream`` using :class:`~expiringdictx.ExpiringDict` instances.
+
+    **Cross-caching** — each read operation that returns a positive result
+    also backfills related caches so that subsequent queries for the same
+    path can be served without hitting the underlying storage:
+
+    - ``is_file`` → ``True``: also writes ``exists=True`` and ``is_dir=False``.
+    - ``is_dir`` → ``True``: also writes ``exists=True`` and ``is_file=False``.
+    - ``exists`` → ``False``: also writes ``is_file=False`` and ``is_dir=False``.
+    - ``stat`` success: also writes ``exists=True``, ``is_file`` and ``is_dir``.
+    - ``download_stream`` success: also writes ``exists=True``, ``is_file=True``
+      and ``is_dir=False``.
+
+    **Write-backfill** — after a successful write operation, semantically
+    certain values are written into the cache immediately, avoiding a
+    subsequent round-trip to the underlying storage:
+
+    - ``upload_stream``: ``exists=True, is_file=True, is_dir=False`` plus the
+      uploaded bytes cached for ``download_stream`` when ≤ threshold.
+    - ``unlink`` / ``rmdir`` / ``delete``: ``exists=False, is_file=False,
+      is_dir=False``.
+    - ``move``: source → ``exists=False, is_file=False, is_dir=False``;
+      destination → ``exists=True``, with ``is_file`` / ``is_dir`` inferred
+      from the source's cached type when available.
+    - ``copy``: destination → ``exists=True`` + type inferred from source cache.
+    - ``mkdir``: ``exists=True, is_file=False, is_dir=True``.
+    - ``rmtree``: all caches cleared (too broad to backfill precisely).
 
     Parameters
     ----------
     storage:
         The underlying storage to wrap.
     ttl:
-        TTL (seconds) for cached entries.  Default 5 s.
+        TTL (seconds) for cached entries.  Default 30 s.
     capacity:
-        Maximum number of entries per cache.  Default 500.
+        Maximum number of entries per cache.  Default 1000.
     download_cache_threshold:
-        Minimum file size (bytes) to cache for ``download_stream``. None to disable caching.  Default 16 KB.
+        Maximum file size (bytes) to cache for ``download_stream``.
+        ``None`` to disable caching.  Default 16 KB.
     """
 
     def __init__(
@@ -134,8 +161,7 @@ class CachedStorage(AbstractStorage):
             removed = True
         if self._cache_stat.pop(np, None) is not None:
             removed = True
-        parent = self._parent(np)
-        if self._cache_iterdir.pop(parent, None) is not None:
+        if self._cache_iterdir.pop(self._parent(np), None) is not None:
             removed = True
         if self._cache_download.pop(np, None) is not None:
             removed = True
