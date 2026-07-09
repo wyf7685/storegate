@@ -185,9 +185,10 @@ class IndexStorage(AbstractStorage):
 
     async def _get_file_meta(self, path: str) -> FileMeta | None:
         index = self._ensure_index()
-        if not await index.exists(path):
+        try:
+            meta_bytes = await index.download_bytes(path)
+        except FileNotFoundError:
             return None
-        meta_bytes = await index.download_bytes(path)
         if not meta_bytes:
             return None
         return FileMeta.model_validate_json(meta_bytes.decode())
@@ -665,10 +666,12 @@ class IndexStorage(AbstractStorage):
     @override
     async def stat(self, path: str) -> FileInfo:
         index = self._ensure_index()
-        if await self.is_dir(path):
-            return await index.stat(path)
-        if not await index.is_file(path):
-            raise FileNotFoundError(f"File not found: {path}")
+        try:
+            stat = await index.stat(path)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"File not found: {path}") from e
+        if stat.is_dir:
+            return stat
         meta_bytes = await index.download_bytes(path)
         meta = FileMeta.model_validate_json(meta_bytes.decode())
         return meta.info

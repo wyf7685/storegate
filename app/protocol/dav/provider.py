@@ -18,11 +18,11 @@ class StorageProvider(BaseDAVProvider):
 
     @override
     def get_resource_inst(self, path: str, environ: dict[str, object]) -> StorageResource | StorageCollection | None:
-        if run_async(self._storage.is_dir, path):
-            return StorageCollection(path, environ, self._storage)
-        if run_async(self._storage.is_file, path):
-            return StorageResource(path, environ, self._storage)
-        return None
+        try:
+            info = run_async(self._storage.stat, path)
+        except FileNotFoundError:
+            return None
+        return (StorageCollection if info.is_dir else StorageResource)(path, environ, self._storage)
 
     @override
     def exists(self, path: str, environ: dict[str, object]) -> bool:

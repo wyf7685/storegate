@@ -4,13 +4,13 @@ from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 from typing import Any, Protocol, final, override
 
 import anyio
-from anyio._core._eventloop import claim_worker_thread
 from wsgidav import dav_error
 from wsgidav.dav_provider import DAVNonCollection
 
+from app.log import escape_tag, logger
 from app.storage import AbstractStorage, FileInfo
 
-from .utils import NativeHandlerResult, current_event_loop_token, run_async
+from .utils import NativeHandlerResult, run_async
 
 
 class DAVReader(Protocol):
@@ -29,18 +29,21 @@ class ResourceReader:
         self._buffer = bytearray()
         self._closed = False
 
-    def read(self, size: int) -> bytes:
-        if self._closed:
-            raise ValueError("I/O operation on closed file.")
+    async def _read_impl(self, size: int) -> bytes:
         while len(self._buffer) < size:
             try:
-                chunk = run_async(lambda: anext(self._agen))
+                chunk = await anext(self._agen)
             except StopAsyncIteration:
                 break
             self._buffer.extend(chunk)
         result = self._buffer[:size]
         del self._buffer[:size]
         return bytes(result)
+
+    def read(self, size: int) -> bytes:
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        return run_async(self._read_impl, size)
 
     def close(self) -> None:
         self._closed = True
@@ -56,12 +59,13 @@ class ResourceWriter:
         self._closed = False
         self._upload_fn = upload_fn
         self._scope = None
-
-        token = current_event_loop_token.get()
-        if token is None:
-            raise RuntimeError("ResourceWriter must be created in an async context.")
-        self._token = token
-        self._worker_thread: threading.Thread = threading.Thread(target=self._run, daemon=True)
+        self._scope_lock = threading.Lock()
+        self._worker_thread: threading.Thread = threading.Thread(
+            target=run_async,
+            args=(self._arun,),
+            name="ResourceWriterWorker",
+            daemon=True,
+        )
 
     def write(self, data: bytes) -> None:
         if self._closed:
@@ -73,27 +77,28 @@ class ResourceWriter:
             return
         self._send.close()
         self._closed = True
-        self._scope = None
+        with self._scope_lock:
+            self._scope = None
         self._worker_thread.join()
-
-    def _run(self) -> None:
-        with claim_worker_thread(self._token.backend_class, self._token.native_token):
-            run_async(self._arun)
 
     async def _arun(self) -> None:
         try:
-            with anyio.CancelScope() as self._scope, self._recv:
+            with anyio.CancelScope() as scope, self._recv:
+                with self._scope_lock:
+                    self._scope = scope
                 await self._upload_fn(self._recv)
         finally:
-            self._scope = None
+            with self._scope_lock:
+                self._scope = None
 
     def start(self) -> None:
         self._worker_thread.start()
 
     def abort(self) -> None:
-        if self._scope is not None:
-            self._scope.cancel()
-            self._scope = None
+        with self._scope_lock:
+            if self._scope is not None:
+                self._scope.cancel()
+                self._scope = None
 
 
 @final
@@ -121,7 +126,10 @@ class StorageResource(DAVNonCollection):
 
     @override
     def get_etag(self) -> str | None:
-        return None
+        info = self._get_file_info()
+        if info.modified is None:
+            return None
+        return f"{info.size}-{int(info.modified.timestamp())}"
 
     @override
     def get_last_modified(self) -> float | None:
@@ -138,7 +146,7 @@ class StorageResource(DAVNonCollection):
 
     @override
     def support_etag(self) -> bool:
-        return False
+        return True
 
     @override
     def support_modified(self) -> bool:
@@ -173,6 +181,8 @@ class StorageResource(DAVNonCollection):
             raise RuntimeError("No write operation in progress.")
         if with_errors:
             self._writer.abort()
+        self._writer.close()
+        self._writer = None
 
     async def _call_with_catch(self, func: Callable[[], Awaitable[object]]) -> NativeHandlerResult:
         error = None
@@ -184,6 +194,7 @@ class StorageResource(DAVNonCollection):
             error = dav_error.HTTP_NOT_FOUND
         except Exception:
             error = dav_error.HTTP_INTERNAL_ERROR
+            logger.opt(colors=True).exception(f"Error in DAV operation for path <y>{escape_tag(self.path)}</>")
 
         return [(self.get_href(), dav_error.DAVError(error))] if error is not None else True
 

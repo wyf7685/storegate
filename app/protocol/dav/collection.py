@@ -32,16 +32,26 @@ class StorageCollection(BaseDAVCollection):
     @override
     def get_member(self, name: str) -> StorageResource | StorageCollection | None:
         path = (self._pure_path / name).as_posix()
-        if run_async(self._storage.is_dir, path):
-            return StorageCollection(path, self.environ, self._storage)
-        if run_async(self._storage.is_file, path):
-            return StorageResource(path, self.environ, self._storage)
-        return None
+        try:
+            info = run_async(self._storage.stat, path)
+        except FileNotFoundError:
+            return None
+        return (StorageCollection if info.is_dir else StorageResource)(path, self.environ, self._storage)
 
     @override
     def get_member_names(self) -> list[str]:
         infos = run_async(self._storage.list_, self.path)
         return [info.name for info in infos]
+
+    @override
+    def get_member_list(self) -> list[StorageResource | StorageCollection]:
+        infos = run_async(self._storage.list_, self.path)
+        return [
+            (StorageCollection if info.is_dir else StorageResource)(
+                self._pure_path.joinpath(info.name).as_posix(), self.environ, self._storage
+            )
+            for info in infos
+        ]
 
     @override
     def support_etag(self) -> bool:
@@ -52,7 +62,7 @@ class StorageCollection(BaseDAVCollection):
         return True
 
     @override
-    def delete(self) -> None:
+    def handle_delete(self) -> None:
         run_async(self._storage.rmtree, self.path)
 
     @override
