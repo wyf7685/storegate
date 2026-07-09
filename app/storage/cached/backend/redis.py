@@ -1,12 +1,14 @@
 import json
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, final, override
-
-import redis.asyncio as aioredis
+from typing import TYPE_CHECKING, Any, final, override
 
 from app.storage.abstract import FileInfo
-from app.storage.cached.backend.base import CacheBackend
+
+from .base import CacheBackend
+
+if TYPE_CHECKING:
+    import redis.asyncio as aioredis
 
 
 def _bool_to_bytes(v: bool) -> bytes:
@@ -123,6 +125,8 @@ class RedisCacheBackend(CacheBackend):
     async def connect(self) -> None:
         if self._redis is not None:
             return  # idempotent
+
+        import redis.asyncio as aioredis
 
         client: aioredis.Redis = await aioredis.from_url(self._url, **self._kw)
         await client.ping()
