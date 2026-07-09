@@ -761,3 +761,25 @@ class IndexStorage(AbstractStorage):
                     tg.start_soon(_fetch_meta, entry.path)
             files.sort(key=lambda x: x.name)
             yield sp, sd, files
+
+    @override
+    async def list_(self, path: str) -> list[FileInfo]:
+        index = self._ensure_index()
+        if not await index.is_dir(path):
+            raise NotADirectoryError(f"Not a directory: {path}")
+
+        async def _fetch_meta(path: str) -> None:
+            meta = await self._get_file_meta(path)
+            if meta is not None:
+                files.append(meta.info)
+
+        files: list[FileInfo] = []
+        async with anyio.create_task_group() as tg:
+            async for entry in index.iterdir(path):
+                if entry.is_dir:
+                    files.append(entry)
+                else:
+                    tg.start_soon(_fetch_meta, entry.path)
+
+        files.sort(key=lambda x: x.name)
+        return files
