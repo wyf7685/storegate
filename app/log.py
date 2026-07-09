@@ -47,17 +47,14 @@ LOGGING_CONFIG = {
     "loggers": {
         "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
         "uvicorn.error": {"handlers": ["default"], "level": "INFO", "propagate": False},
-        "uvicorn.access": {
-            "handlers": ["default"],
-            "level": "INFO",
-            "propagate": False,
-        },
-        "httpx": {"handlers": ["default"], "level": "INFO", "propagate": False},
+        "uvicorn.access": {"handlers": ["default"], "level": "INFO", "propagate": False},
+        "httpx": {"handlers": ["default"], "level": "WARNING", "propagate": False},
+        "wsgidav": {"handlers": ["default"], "level": "INFO", "propagate": False},
     },
 }
 
 
-log_format = "<g>{time:HH:mm:ss}</g> [<lvl>{level}</lvl>] <c><u>{name}</u></c> | {message}"
+log_format = "<g>{time:HH:mm:ss}</g> [<lvl>{level:>7}</lvl>] <c><u>{name}</u></c> | {message}"
 logger.remove()
 
 
@@ -84,7 +81,7 @@ def configure_logging() -> None:
     logging.config.dictConfig(LOGGING_CONFIG)
 
 
-_HIDDEN_NAMES = ("uvicorn", "starlette", "httpx")
+_HIDDEN_NAMES = ("uvicorn", "starlette", "httpx", "wsgidav")
 
 
 def _hidden_upstream(record: loguru.Record) -> None:

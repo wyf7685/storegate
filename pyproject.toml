@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "a2wsgi>=1.10.10",
     "aiosqlite>=0.22.1",
     "anyio>=4.14.1",
     "ayafileio>=1.4.7",
@@ -12,8 +13,10 @@ dependencies = [
     "httpx[http2]>=0.28.1",
     "loguru>=0.7.3",
     "pydantic>=2.13.4",
+    "uvicorn>=0.50.2",
     "uvloop>=0.22.1 ; sys_platform != 'win32'",
     "winloop>=0.6.3 ; sys_platform == 'win32'",
+    "wsgidav>=4.3.5",
 ]
 
 [dependency-groups]
