@@ -245,23 +245,32 @@ class CachedStorage(AbstractStorage):
     async def download_stream(
         self,
         remote_path: str,
+        *,
+        offset: int = 0,
     ) -> AsyncIterator[bytes]:
         np = self._normalize(remote_path)
+
+        # 缓存中存储的是一定是完整文件内容 → 切片后即可服务 Range 请求
         if self._download_cache_threshold is not None and (cached := await self._cache.get("download", np)) is not None:
-            self.log.trace(f"Cache hit: <le>download_stream</>(<y>{escape_tag(np)}</y>) → <g>{len(cached)} bytes</g>")
-            yield cached
+            length = len(cached)
+            self.log.trace(f"Cache hit: <le>download_stream</>(<y>{escape_tag(np)}</y>) → <g>{length} bytes</g>")
+            if offset:
+                yield cached[offset:]
+            else:
+                yield cached
             return
 
-        buffer = bytearray() if self._download_cache_threshold is not None else None
+        # offset > 0 时不写入缓存（下载的是片段）
+        buffer = bytearray() if (offset == 0 and self._download_cache_threshold is not None) else None
         threshold = self._download_cache_threshold or 0
-        async for chunk in self._storage.download_stream(remote_path):
+        async for chunk in self._storage.download_stream(remote_path, offset=offset):
             if buffer is not None:
                 buffer.extend(chunk)
                 if len(buffer) > threshold:
                     buffer = None
             yield chunk
 
-        # Download completed → file definitely exists
+        # Backfill metadata（无论 offset 都写）
         await self._cache.mset(
             ("exists", np, True),
             ("is_file", np, True),

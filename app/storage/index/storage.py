@@ -451,30 +451,75 @@ class IndexStorage(AbstractStorage):
     async def download_stream(
         self,
         remote_path: str,
+        *,
+        offset: int = 0,
     ) -> AsyncIterator[bytes]:
         _colored_path = f"<y>{escape_tag(remote_path)}</y>"
-        self.log.debug(f"Download starting: {_colored_path}")
+        self.log.debug(f"Download starting: {_colored_path}{f" (offset=<g>{offset}</g>)" if offset else ""}")
 
-        chunks = self._ensure_chunks()
+        chunks_backend = self._ensure_chunks()
         async with self._lock_index(remote_path):
             meta = await self._get_file_meta(remote_path)
             if meta is None:
                 raise FileNotFoundError(f"File not found: {remote_path}")
-            total_size = 0
+
+            # --- locate the chunk where offset falls ---
+            chunk_offset = 0  # byte position at start of current chunk
+            target_idx = 0
+            within_offset = offset  # will be refined once target chunk is found
+
+            if offset > 0:
+                target_idx = -1
+                for idx, chunk_hash in enumerate(meta.chunks):
+                    bin_path = hash_to_path(chunk_hash, "bin")
+                    if not await chunks_backend.exists(bin_path):
+                        raise FileNotFoundError(f"Chunk #{idx + 1} {chunk_hash} not found for file {remote_path}")
+                    chunk_size = (await chunks_backend.stat(bin_path)).size
+                    if chunk_offset + chunk_size > offset:
+                        target_idx = idx
+                        within_offset = offset - chunk_offset
+                        break
+                    chunk_offset += chunk_size
+
+                if target_idx == -1:
+                    # offset is beyond the file end — nothing to yield
+                    self.log.debug(f"Offset <g>{offset}</g> beyond file end for {_colored_path}")
+                    return
+
+            # --- download from the target chunk onward ---
+            total_size = chunk_offset  # bytes actually yielded (starts from chunk_offset for counters)
             file_start = anyio.current_time()
-            for idx, chunk_hash in enumerate(meta.chunks):
-                self.log.debug(f"Downloading Chunk #{idx + 1} <c>{chunk_hash[:8]}</c> for {_colored_path}")
+
+            for idx in range(target_idx, len(meta.chunks)):
+                chunk_hash = meta.chunks[idx]
+                is_target_chunk = bool(idx == target_idx and offset > 0)
+
+                self.log.debug(
+                    f"Downloading Chunk #{idx + 1} <c>{chunk_hash[:8]}</c> for {_colored_path}"
+                    f"{" (target, skip <g>" + str(within_offset) + "</g>)" if is_target_chunk else ""}"
+                )
                 bin_path = hash_to_path(chunk_hash, "bin")
                 async with self._chunk_temp_ref(chunk_hash):
-                    if not await chunks.exists(bin_path):
+                    if not await chunks_backend.exists(bin_path):
                         raise FileNotFoundError(f"Chunk #{idx + 1} {chunk_hash} not found for file {remote_path}")
                     hasher = hashlib.sha256()
                     chunk_size = 0
+                    local_skip = within_offset if is_target_chunk else 0
                     chunk_start = anyio.current_time()
-                    async for chunk in chunks.download_stream(bin_path):
+
+                    async for chunk in chunks_backend.download_stream(bin_path):
                         hasher.update(chunk)
                         chunk_size += len(chunk)
+
+                        if local_skip > 0:
+                            if local_skip >= len(chunk):
+                                local_skip -= len(chunk)
+                                continue
+                            chunk = chunk[local_skip:]
+                            local_skip = 0
+
                         yield chunk
+
                     chunk_elapsed = anyio.current_time() - chunk_start
                     actual_hash = hasher.hexdigest()
                     if actual_hash != chunk_hash:
@@ -491,11 +536,20 @@ class IndexStorage(AbstractStorage):
                         f"(<g>{chunk_size}</g> bytes, <g>{chunk_elapsed:.2f}</g> s)"
                     )
                     total_size += chunk_size
+
             file_elapsed = anyio.current_time() - file_start
-            self.log.info(
-                f"Download complete: {_colored_path} (<g>{total_size}</g> bytes in <g>{len(meta.chunks)}</g> chunks, "
-                f"<g>{file_elapsed:.2f}</g> s)"
-            )
+            if offset:
+                self.log.info(
+                    f"Download complete (offset <g>{offset}</g>): {_colored_path} "
+                    f"(<g>{total_size - chunk_offset}</g> bytes in <g>{len(meta.chunks) - target_idx}</g> chunks, "
+                    f"<g>{file_elapsed:.2f}</g> s)"
+                )
+            else:
+                self.log.info(
+                    f"Download complete: {_colored_path} "
+                    f"(<g>{total_size}</g> bytes in <g>{len(meta.chunks)}</g> chunks, "
+                    f"<g>{file_elapsed:.2f}</g> s)"
+                )
 
     @override
     async def unlink(self, path: str, *, missing_ok: bool = False) -> None:

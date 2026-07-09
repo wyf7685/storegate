@@ -128,8 +128,15 @@ class AbstractStorage(ABC):
     async def download_stream(
         self,
         remote_path: str,
+        *,
+        offset: int = 0,
     ) -> AsyncIterator[bytes]:
-        """Download as an async byte stream."""
+        """Download as an async byte stream.
+
+        Args:
+            remote_path: Path to the file.
+            offset: Byte offset to start reading from.  Default 0 (start of file).
+        """
         raise NotImplementedError
         yield
 

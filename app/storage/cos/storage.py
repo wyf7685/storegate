@@ -130,6 +130,8 @@ class CosStorage(AbstractStorage):
     async def download_stream(
         self,
         remote_path: str,
+        *,
+        offset: int = 0,
     ) -> AsyncIterator[bytes]:
         client = self._ensure_client()
         key = self._remote_path_to_key(remote_path)
@@ -137,12 +139,19 @@ class CosStorage(AbstractStorage):
         if head is None:
             raise FileNotFoundError(f"Object not found: {remote_path}")
         total_size = head.content_length
-        num_chunks = (total_size + DOWNLOAD_CHUNK_SIZE - 1) // DOWNLOAD_CHUNK_SIZE
 
-        self.log.debug(f"Download: <y>{escape_tag(key)}</y> (<g>{total_size}</g> bytes in <g>{num_chunks}</g> chunks)")
+        if offset >= total_size:
+            return
+
+        num_chunks = (total_size - offset + DOWNLOAD_CHUNK_SIZE - 1) // DOWNLOAD_CHUNK_SIZE
+
+        self.log.debug(
+            f"Download: <y>{escape_tag(key)}</y> (<g>{total_size}</g> bytes, "
+            f"offset=<g>{offset}</g>, <g>{num_chunks}</g> chunks)"
+        )
 
         for i in range(num_chunks):
-            start = i * DOWNLOAD_CHUNK_SIZE
+            start = offset + i * DOWNLOAD_CHUNK_SIZE
             end = min(start + DOWNLOAD_CHUNK_SIZE - 1, total_size - 1)
             chunk = await client.get_object(key=key, range=(start, end))
             yield chunk

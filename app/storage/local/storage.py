@@ -109,6 +109,8 @@ class LocalStorage(AbstractStorage):
     async def download_stream(
         self,
         remote_path: str,
+        *,
+        offset: int = 0,
     ) -> AsyncIterator[bytes]:
         target = self._resolve(remote_path)
 
@@ -116,6 +118,8 @@ class LocalStorage(AbstractStorage):
             raise FileNotFoundError(f"File not found: {remote_path}")
 
         async with ayafileio.open(target, "rb") as f:
+            if offset:
+                await f.seek(offset)
             async for chunk in f.chunk(1024 * 1024):
                 yield bytes(chunk)
 

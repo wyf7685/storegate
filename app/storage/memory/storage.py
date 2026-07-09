@@ -122,6 +122,8 @@ class MemoryStorage(AbstractStorage):
     async def download_stream(
         self,
         remote_path: str,
+        *,
+        offset: int = 0,
     ) -> AsyncIterator[bytes]:
         target = self._resolve(remote_path)
 
@@ -130,7 +132,13 @@ class MemoryStorage(AbstractStorage):
         except KeyError:
             raise FileNotFoundError(f"File not found: {remote_path}") from None
 
-        yield data
+        if offset >= len(data):
+            return
+
+        remaining = data[offset:]
+        step = 1024 * 1024
+        for i in range(0, len(remaining), step):
+            yield remaining[i : i + step]
 
     # ------------------------------------------------------------------
     # File operations

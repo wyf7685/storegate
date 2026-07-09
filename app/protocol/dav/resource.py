@@ -15,6 +15,7 @@ from .utils import NativeHandlerResult, run_async
 
 class DAVReader(Protocol):
     def read(self, size: int) -> bytes: ...
+    def seek(self, offset: int) -> None: ...
     def close(self) -> None: ...
 
 
@@ -24,12 +25,27 @@ class DAVWriter(Protocol):
 
 
 class ResourceReader:
-    def __init__(self, agen: AsyncGenerator[bytes]) -> None:
-        self._agen = agen
+    def __init__(self, storage: AbstractStorage, path: str) -> None:
+        self._storage = storage
+        self._path = path
+        self._offset = 0
         self._buffer = bytearray()
         self._closed = False
+        self._agen: AsyncGenerator[bytes] | None = None
+
+    def seek(self, offset: int) -> None:
+        if self._agen is not None:
+            raise ValueError("Cannot seek after reading has started")
+        self._offset = offset
+
+    async def _download_stream(self) -> AsyncGenerator[bytes]:
+        async for chunk in self._storage.download_stream(self._path, offset=self._offset):
+            yield chunk
 
     async def _read_impl(self, size: int) -> bytes:
+        if self._agen is None:
+            self._agen = self._download_stream()
+
         while len(self._buffer) < size:
             try:
                 chunk = await anext(self._agen)
@@ -46,8 +62,11 @@ class ResourceReader:
         return run_async(self._read_impl, size)
 
     def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
-        run_async(self._agen.aclose)
+        if self._agen is not None:
+            run_async(self._agen.aclose)
 
 
 class ResourceWriter:
@@ -138,7 +157,7 @@ class StorageResource(DAVNonCollection):
 
     @override
     def support_ranges(self) -> bool:
-        return False
+        return True
 
     @override
     def support_content_length(self) -> bool:
@@ -154,11 +173,7 @@ class StorageResource(DAVNonCollection):
 
     @override
     def get_content(self) -> DAVReader:
-        async def download() -> AsyncGenerator[bytes]:
-            async for chunk in self._storage.download_stream(self.path):
-                yield chunk
-
-        return ResourceReader(download())
+        return ResourceReader(self._storage, self.path)
 
     @override
     def begin_write(self, *, content_type: object = None) -> DAVWriter:
