@@ -202,7 +202,16 @@ class AbstractStorage(ABC):
             await self.unlink(path)
 
     async def delete_many(self, *paths: str) -> None:
-        """Delete multiple files or empty directories."""
+        """Delete multiple files or empty directories.
+
+        **Fail-fast semantics**: raises on the first error encountered.
+        No guarantee is made about which prior *paths* were processed
+        (and thus deleted) before the error occurred.  Nonexistent paths
+        are silently skipped.
+
+        Implementations MAY batch operations for efficiency but MUST
+        maintain fail-fast semantics.
+        """
         for path in paths:
             await self.delete(path)
 
