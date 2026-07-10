@@ -67,12 +67,28 @@ class StorageCollection(BaseDAVCollection):
         return run_async(call_with_catch, self, functools.partial(self._storage.rmtree, self.path))
 
     @override
+    def handle_copy(self, dest_path: str, *, depth_infinity: bool) -> NativeHandlerResult:
+        return run_async(
+            call_with_catch,
+            self,
+            functools.partial(self._storage.copytree, self.path, dest_path, overwrite=True),
+        )
+
+    @override
+    def handle_move(self, dest_path: str) -> NativeHandlerResult:
+        return run_async(
+            call_with_catch,
+            self,
+            functools.partial(self._storage.movetree, self.path, dest_path, overwrite=True),
+        )
+
+    @override
     def copy_move_single(self, dest_path: str, *, is_move: bool) -> None:
         run_async(self._storage.mkdir, dest_path, parents=True, exist_ok=True)
 
     @override
     def support_recursive_move(self, dest_path: str) -> bool:
-        return False
+        return True
 
     # @override
     # def move_recursive(self, dest_path: str): ...

@@ -26,6 +26,10 @@ async def call_with_catch(resource: BaseDAVResource, func: Callable[[], Awaitabl
     error = None
     try:
         await func()
+    except NotADirectoryError:
+        error = dav_error.HTTP_METHOD_NOT_ALLOWED
+    except FileExistsError:
+        error = dav_error.HTTP_PRECONDITION_FAILED
     except IsADirectoryError:
         error = dav_error.HTTP_FORBIDDEN
     except FileNotFoundError:

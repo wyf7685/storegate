@@ -214,5 +214,12 @@ class StorageResource(DAVNonCollection):
         return run_async(call_with_catch, self, functools.partial(self._storage.move, self.path, dest_path))
 
     @override
+    def copy_move_single(self, dest_path: str, *, is_move: bool) -> None:
+        if is_move:
+            run_async(self._storage.move, self.path, dest_path)
+        else:
+            run_async(self._storage.copy, self.path, dest_path)
+
+    @override
     def support_recursive_move(self, dest_path: str) -> bool:
         return False
