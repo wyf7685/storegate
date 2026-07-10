@@ -171,14 +171,15 @@ class IndexStorage(AbstractStorage):
 
     @contextlib.asynccontextmanager
     async def _lock_chunks(self, chunk_hashes: Iterable[str]) -> AsyncGenerator[None]:
+        unique_hashes = sorted(set(chunk_hashes))
         try:
-            for chunk_hash in sorted(set(chunk_hashes)):
+            for chunk_hash in unique_hashes:
                 await self._acquire_storage_file_lock(self._chunks, hash_to_path(chunk_hash, "lock"))
             yield
         finally:
             with anyio.CancelScope(shield=True):
                 await self._release_storage_file_lock(
-                    self._chunks, *(hash_to_path(chunk_hash, "lock") for chunk_hash in chunk_hashes)
+                    self._chunks, *(hash_to_path(chunk_hash, "lock") for chunk_hash in unique_hashes)
                 )
 
     async def _get_file_meta(self, path: str) -> FileMeta | None:
@@ -327,8 +328,15 @@ class IndexStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
-        if not overwrite and await self.exists(remote_path):
-            raise FileExistsError(f"File already exists: {remote_path}")
+        try:
+            info = await self.stat(remote_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if info.is_dir:
+                raise IsADirectoryError(f"Is a directory: {remote_path}")
+            if not overwrite:
+                raise FileExistsError(f"File already exists: {remote_path}")
 
         _colored_path = f"<y>{escape_tag(remote_path)}</y>"
         self.log.info(f"Upload starting: {_colored_path}")
@@ -340,6 +348,9 @@ class IndexStorage(AbstractStorage):
 
         try:
             async with self._lock_index(remote_path):
+                # 取出旧元数据，用于后续清理不再引用的旧分块
+                old_meta = await self._get_file_meta(remote_path)
+
                 send, recv = anyio.create_memory_object_stream[tuple[str, bytes, str]](max_workers * 2)
 
                 async with anyio.create_task_group() as tg, send:
@@ -428,6 +439,12 @@ class IndexStorage(AbstractStorage):
                     remote_path,
                     overwrite=True,
                 )
+
+            # 清理旧文件不再引用的分块
+            if old_meta is not None:
+                async with self._lock_chunks(old_meta.chunks), anyio.create_task_group() as tg:
+                    for h in set(old_meta.chunks) - set(chunk_hashes):
+                        tg.start_soon(self._chunk_decref, h, remote_path)
 
             self.log.info(
                 f"Upload complete: {_colored_path} (<g>{total_size}</g> bytes in <g>{len(chunk_hashes)}</g> chunks)"

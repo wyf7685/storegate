@@ -64,7 +64,7 @@ class MemoryStorage(AbstractStorage):
         if p.is_absolute():
             p = p.relative_to("/")
         resolved = str(PurePosixPath(self._root) / p)
-        return resolved if resolved != "." else ""
+        return "" if resolved in (".", "/") else resolved
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -98,13 +98,17 @@ class MemoryStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
+        try:
+            info = await self.stat(remote_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if info.is_dir:
+                raise IsADirectoryError(f"Is a directory: {remote_path}")
+            if not overwrite:
+                raise FileExistsError(f"File already exists: {remote_path}")
+
         target = self._resolve(remote_path)
-
-        if target in self._dirs:
-            raise FileExistsError(f"Path is a directory: {remote_path}")
-        if not overwrite and target in self._files:
-            raise FileExistsError(f"File already exists: {remote_path}")
-
         self._ensure_parent_dirs(target)
 
         buffer = bytearray()
@@ -234,6 +238,8 @@ class MemoryStorage(AbstractStorage):
             self._ensure_parent_dirs(target)
 
         parent = str(PurePosixPath(target).parent) if target else ""
+        if parent in (".", "/"):
+            parent = ""
         if target and parent != "" and parent not in self._dirs:
             raise FileNotFoundError(f"Parent directory not found: {path}")
 
@@ -369,7 +375,7 @@ class MemoryStorage(AbstractStorage):
         target = self._resolve(path)
         if target in self._dirs:
             return True
-        return target != "" and not self._is_file(target) and self._is_dir(target)
+        return target == "" or self._is_dir(target)
 
     @override
     async def stat(self, path: str) -> FileInfo:

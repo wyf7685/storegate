@@ -102,8 +102,15 @@ class CosStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
-        if not overwrite and await self.exists(remote_path):
-            raise FileExistsError(f"Object already exists: {remote_path}")
+        try:
+            info = await self.stat(remote_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if info.is_dir:
+                raise IsADirectoryError(f"Is a directory: {remote_path}")
+            if not overwrite:
+                raise FileExistsError(f"File already exists: {remote_path}")
 
         client = self._ensure_client()
         key = self._remote_path_to_key(remote_path)

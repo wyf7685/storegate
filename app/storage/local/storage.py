@@ -90,11 +90,17 @@ class LocalStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
+        try:
+            info = await self.stat(remote_path)
+        except FileNotFoundError:
+            pass
+        else:
+            if info.is_dir:
+                raise IsADirectoryError(f"Is a directory: {remote_path}")
+            if not overwrite:
+                raise FileExistsError(f"File already exists: {remote_path}")
+
         target = self._resolve(remote_path)
-
-        if not overwrite and await anyio.Path(target).exists():
-            raise FileExistsError(f"File already exists: {remote_path}")
-
         await anyio.Path(target.parent).mkdir(parents=True, exist_ok=True)
 
         async with ayafileio.open(target, "wb") as f:
