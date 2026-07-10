@@ -5,7 +5,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from typing import final, override
 
 import anyio
@@ -183,6 +183,7 @@ class IndexStorage(AbstractStorage):
                 )
 
     async def _get_file_meta(self, path: str) -> FileMeta | None:
+        path = self._to_abs_path(path)
         try:
             meta_bytes = await self._index.download_bytes(path)
         except FileNotFoundError:
@@ -328,6 +329,8 @@ class IndexStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
+        remote_path = self._to_abs_path(remote_path)
+
         try:
             info = await self.stat(remote_path)
         except FileNotFoundError:
@@ -568,6 +571,7 @@ class IndexStorage(AbstractStorage):
 
     @override
     async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
+        path = self._to_abs_path(path)
         _colored_path = f"<y>{escape_tag(path)}</y>"
 
         if await self._index.is_dir(path):
@@ -603,6 +607,8 @@ class IndexStorage(AbstractStorage):
         src: str,
         dst: str,
     ) -> None:
+        src = self._to_abs_path(src)
+        dst = self._to_abs_path(dst)
         if src == dst:
             return
 
@@ -621,7 +627,7 @@ class IndexStorage(AbstractStorage):
             new_dst_meta = FileMeta(
                 info=FileInfo(
                     path=dst,
-                    name=Path(dst).name,
+                    name=PurePosixPath(dst).name,
                     is_dir=False,
                     size=src_meta.info.size,
                     modified=src_meta.info.modified,
@@ -631,7 +637,7 @@ class IndexStorage(AbstractStorage):
             )
             new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
             async with self._lock_chunks(src_meta.chunks):
-                await self._index.mkdir(Path(dst).parent.as_posix(), parents=True, exist_ok=True)
+                await self._index.mkdir(PurePosixPath(dst).parent.as_posix(), parents=True, exist_ok=True)
                 await self._index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in src_meta.chunks:
@@ -649,6 +655,8 @@ class IndexStorage(AbstractStorage):
         src: str,
         dst: str,
     ) -> None:
+        src = self._to_abs_path(src)
+        dst = self._to_abs_path(dst)
         if src == dst:
             return
 
@@ -689,10 +697,11 @@ class IndexStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
-        return await self._index.mkdir(path, parents=parents, exist_ok=exist_ok)
+        return await self._index.mkdir(self._to_abs_path(path), parents=parents, exist_ok=exist_ok)
 
     @override
     async def rmtree(self, path: str) -> None:
+        path = self._to_abs_path(path)
         _colored_path = f"<y>{escape_tag(path)}</y>"
         self.log.info(f"RmTree: {_colored_path}")
 
@@ -706,6 +715,8 @@ class IndexStorage(AbstractStorage):
 
     @override
     async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        src = self._to_abs_path(src)
+        dst = self._to_abs_path(dst)
         _colored_src = f"<y>{escape_tag(src)}</y>"
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
         self.log.info(f"CopyTree: {_colored_src} → {_colored_dst}")
@@ -736,7 +747,8 @@ class IndexStorage(AbstractStorage):
             async for _, sd, sf in self._index.walk(src):
                 for info in sf:
                     tg.start_soon(_collect_chunk_updates, info)
-                dir_rels.extend(self._to_abs_path(d.path)[len(src_prefix) :] for d in sd)
+                abs_src_prefix = self._to_abs_path(src_prefix)
+                dir_rels.extend(self._to_abs_path(d.path)[len(abs_src_prefix) :] for d in sd)
 
         # 创建目标目录结构
         await self.mkdir(dst, parents=True, exist_ok=True)
@@ -778,6 +790,8 @@ class IndexStorage(AbstractStorage):
 
     @override
     async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        src = self._to_abs_path(src)
+        dst = self._to_abs_path(dst)
         _colored_src = f"<y>{escape_tag(src)}</y>"
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
         self.log.info(f"MoveTree: {_colored_src} → {_colored_dst}")
@@ -809,7 +823,8 @@ class IndexStorage(AbstractStorage):
             async for _, sd, sf in self._index.walk(src):
                 for info in sf:
                     tg.start_soon(_collect, info)
-                dir_rels.extend(self._to_abs_path(d.path)[len(src_prefix) :] for d in sd)
+                abs_src_prefix = self._to_abs_path(src_prefix)
+                dir_rels.extend(self._to_abs_path(d.path)[len(abs_src_prefix) :] for d in sd)
 
         # 创建目标目录结构
         await self.mkdir(dst, parents=True, exist_ok=True)
