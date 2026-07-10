@@ -100,3 +100,12 @@ class MemoryCacheBackend(CacheBackend):
             if self._caches[ns].pop(key, None) is not None:
                 count += 1
         return count
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+
+    @override
+    def snapshot(self) -> dict[str, dict[str, object]]:
+        """Return a complete snapshot of all namespaces."""
+        return {ns: dict(cache.items()) for ns, cache in self._caches.items()}

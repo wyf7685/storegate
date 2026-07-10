@@ -138,3 +138,16 @@ class CacheBackend(ABC):
         Returns the total number of keys that existed and were removed.
         """
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Introspection (optional — defaults return empty)
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict[str, dict[str, object]]:
+        """Return a complete snapshot of all namespaces for debugging/testing.
+
+        Returns ``{namespace: {key: value}}``.  The default implementation
+        returns an empty dict; backends that support introspection should
+        override this method.
+        """
+        return {}

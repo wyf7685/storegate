@@ -79,7 +79,7 @@ class CachedStorage(AbstractStorage):
             raise ValueError("download_cache_threshold must be None or >= 0")
 
         if cache == "memory":
-            self._cache: CacheBackend = MemoryCacheBackend(capacity=capacity)
+            self._cache = MemoryCacheBackend(capacity=capacity)
         else:
             self._cache = cache
 
@@ -203,6 +203,18 @@ class CachedStorage(AbstractStorage):
     async def _clear_all_caches(self) -> None:
         await self._cache.clear()
         self.log.debug("All caches cleared")
+
+    # ------------------------------------------------------------------
+    # Introspection (for testing)
+    # ------------------------------------------------------------------
+
+    def dump_cache(self) -> dict[str, dict[str, object]]:
+        """Return a complete snapshot of all cache namespaces.
+
+        Returns ``{namespace: {key: value}}``.  Intended for debugging
+        and tests; not part of the storage API contract.
+        """
+        return self._cache.snapshot()
 
     # ------------------------------------------------------------------
     # Upload
