@@ -25,8 +25,7 @@ uv run ty check            # 静态类型检查
 app/
 ├── const.py               # ROOT, DEFAULT_CHUNK_SIZE
 ├── log.py                 # loguru 日志配置 + logging→loguru 桥接
-├── utils.py               # LoggerWrapper, with_semaphore, copy_signature,
-│                            attach_async_context, SecretStrEncoder, abatched, coalesce_chunks
+├── utils.py               # LoggerWrapper, with_semaphore, coalesce_chunks
 ├── storage/               # 存储抽象层
 │   ├── abstract.py        # AbstractStorage ABC + FileInfo dataclass
 │   ├── factory.py         # ObjectSpec: JSON → 运行时对象反序列化（resolve_storage）
