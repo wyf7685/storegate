@@ -77,9 +77,6 @@ class MemoryStorage(AbstractStorage):
         for i in range(1, len(parts) + 1):
             self._dirs.add(str(PurePosixPath(*parts[:i])))
 
-    def _is_file(self, path: str) -> bool:
-        return path in self._files
-
     def _is_dir(self, path: str) -> bool:
         if path == "" or path in self._dirs:
             return True
@@ -248,6 +245,10 @@ class MemoryStorage(AbstractStorage):
     @override
     async def rmtree(self, path: str) -> None:
         target = self._resolve(path)
+
+        if target in self._files:
+            raise NotADirectoryError(f"Not a directory: {path}")
+
         prefix = target + "/" if target else ""
 
         for key in list(self._files):
@@ -268,7 +269,9 @@ class MemoryStorage(AbstractStorage):
             raise NotADirectoryError(f"Not a directory: {src}")
 
         # 覆盖策略
-        if not overwrite and (target_dst in self._dirs or target_dst == "" or self._is_dir(target_dst)):
+        if not overwrite and (
+            target_dst in self._dirs or target_dst == "" or self._is_dir(target_dst) or target_dst in self._files
+        ):
             raise FileExistsError(f"Destination already exists: {dst}")
 
         src_prefix = target_src + "/" if target_src else ""
@@ -320,7 +323,9 @@ class MemoryStorage(AbstractStorage):
             raise NotADirectoryError(f"Not a directory: {src}")
 
         # 覆盖策略
-        if not overwrite and (target_dst in self._dirs or target_dst == "" or self._is_dir(target_dst)):
+        if not overwrite and (
+            target_dst in self._dirs or target_dst == "" or self._is_dir(target_dst) or target_dst in self._files
+        ):
             raise FileExistsError(f"Destination already exists: {dst}")
 
         src_prefix = target_src + "/" if target_src else ""
