@@ -18,7 +18,7 @@ from ..abstract import AbstractStorage, BytesLike, FileInfo
 
 BLOCK_SIZE = 64 * 1024 * 1024  # 64 MB
 MAX_CONCURRENT_UPLOADS = 2
-CHUNKS_INDEX_FILE = "__chunks_index_id__"
+CHUNKS_INDEX_FILE = "/__chunks_index_id__"
 
 
 def hash_to_path(hash_str: str, suffix: str | None = None) -> str:
@@ -82,7 +82,7 @@ class IndexStorage(AbstractStorage):
             existing = None
 
         if existing is None:
-            await chunks.upload_bytes(index.id.encode(), CHUNKS_INDEX_FILE, overwrite=True)
+            await chunks.upload_bytes(index.id.encode(), CHUNKS_INDEX_FILE, overwrite=False)
             self.log.debug(f"Registered chunks storage <c>{chunks.id}</c> → index <c>{index.id}</c>")
         elif existing != index.id:
             self.log.error(
