@@ -73,8 +73,8 @@ class IndexStorage(AbstractStorage):
             return "/" + path
         return path
 
-    @override
     @property
+    @override
     def id(self) -> str:
         if self._index is None:
             raise RuntimeError("Index storage is not set.")

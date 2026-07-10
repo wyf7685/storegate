@@ -94,8 +94,8 @@ class CachedStorage(AbstractStorage):
     # Identity
     # ------------------------------------------------------------------
 
-    @override
     @property
+    @override
     def id(self) -> str:
         return self._storage.id
 

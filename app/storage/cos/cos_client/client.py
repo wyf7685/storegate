@@ -254,7 +254,7 @@ class AsyncCosClient:
         delimiter: str = "/",
         max_keys: int = 1000,
     ) -> AsyncGenerator[ListObjectsItem | ListObjectsDir]:
-        params = {"max-keys": max_keys}
+        params: dict[str, str | int] = {"max-keys": max_keys}
         if prefix is not None:
             if prefix and not prefix.endswith(delimiter):
                 prefix += delimiter

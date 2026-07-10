@@ -38,8 +38,8 @@ class CosStorage(AbstractStorage):
         super().__init__()
         self._config = config if isinstance(config, CosConfig) else CosConfig.from_file(config)
 
-    @override
     @property
+    @override
     def id(self) -> str:
         return f"cos:{self._config.bucket}:{self._config.region}"
 

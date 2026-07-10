@@ -140,9 +140,9 @@ class FTPHandler:
         self._abort_event = anyio.Event()
         self._send_lock = anyio.Lock()
         self._op_complete = anyio.Event()
-        self._op_result: str | None = None
+        self._op_result = None
         self._quit_requested = False
-        self._queued_commands: list[tuple[str, str]] = []
+        self._queued_commands = []
 
     # ------------------------------------------------------------------
     # Main loop
@@ -161,7 +161,7 @@ class FTPHandler:
         async with anyio.create_task_group() as tg:
             tg.start_soon(self._dispatch_loop, cmd_receive, tg.cancel_scope)
 
-            await self._send(R.READY("cos-ftp ready"))
+            await self._send(R.READY("storegate ready"))
             try:
                 async with cmd_send:
                     while True:
@@ -376,6 +376,7 @@ class FTPHandler:
     async def _run_op_task(self, cmd: str, arg: str) -> None:
         """Background task: execute the command and capture the result."""
         cancelled_cls = anyio.get_cancelled_exc_class()
+        result = None
         try:
             result = await self._dispatch(cmd, arg)
         except cancelled_cls:
@@ -738,7 +739,7 @@ class FTPHandler:
             return R.SYSTEM_STATUS(
                 f"{info.name}: size={info.size}, type={"dir" if info.is_dir else "file"}",
             )
-        return R.SYSTEM_STATUS("cos-ftp server running")
+        return R.SYSTEM_STATUS("storegate server running")
 
     # ------------------------------------------------------------------
     # Data connection factory

@@ -32,8 +32,8 @@ class LocalStorage(AbstractStorage):
     # Identity
     # ------------------------------------------------------------------
 
-    @override
     @property
+    @override
     def id(self) -> str:
         return f"local:{self._root.as_posix()}"
 

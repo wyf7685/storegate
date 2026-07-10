@@ -33,8 +33,8 @@ class MemoryStorage(AbstractStorage):
     # Identity
     # ------------------------------------------------------------------
 
-    @override
     @property
+    @override
     def id(self) -> str:
         return f"memory:{self._id}:{self._root.as_posix()}"
 

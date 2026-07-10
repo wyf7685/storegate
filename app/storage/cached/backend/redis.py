@@ -90,7 +90,7 @@ class RedisCacheBackend(CacheBackend):
     """Redis-backed cache backend using :mod:`redis.asyncio`.
 
     Each namespace is stored under the Redis key prefix
-    ``cosftp:{namespace}:{key}``.  Per-key TTL is set via
+    ``storegate:{namespace}:{key}``.  Per-key TTL is set via
     ``SET … EX``.
 
     Parameters
@@ -101,7 +101,7 @@ class RedisCacheBackend(CacheBackend):
         Extra keyword arguments forwarded to :func:`redis.asyncio.from_url`.
     """
 
-    _PREFIX = "cosftp"
+    _PREFIX = "storegate"
 
     def __init__(self, url: str = "redis://localhost:6379/0", **kw: Any) -> None:
         super().__init__()
