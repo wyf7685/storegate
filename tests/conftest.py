@@ -1,4 +1,5 @@
 """Shared fixtures for storage tests."""
+
 import shutil
 import sys
 import tempfile
