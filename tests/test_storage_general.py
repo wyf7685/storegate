@@ -365,3 +365,266 @@ class TestUploadStream:
                 await storage.upload_bytes(b"hello", path)
         finally:
             await storage.delete(path)
+
+
+class TestPing:
+    """ping() tests."""
+
+    async def test_ping(self, storage: AbstractStorage):
+        assert await storage.ping() is True
+
+
+class TestList:
+    """list_() tests."""
+
+    async def test_list_directory(self, storage: AbstractStorage):
+        base = f"test-list-dir-{uid()}"
+        try:
+            await storage.mkdir(base)
+            await storage.upload_bytes(b"hello", f"{base}/a.txt")
+            await storage.upload_bytes(b"world", f"{base}/b.txt")
+
+            result = await storage.list_(base)
+            names = {e.name for e in result}
+
+            assert len(result) == 2, f"Expected 2 entries, got {len(result)}"
+            assert "a.txt" in names
+            assert "b.txt" in names
+        finally:
+            await storage.rmtree(base)
+
+    async def test_list_empty_directory(self, storage: AbstractStorage):
+        base = f"test-list-empty-{uid()}"
+        try:
+            await storage.mkdir(base)
+            result = await storage.list_(base)
+            assert len(result) == 0
+        finally:
+            await storage.delete(base)
+
+
+class TestMove:
+    """move() tests."""
+
+    async def test_move_file(self, storage: AbstractStorage):
+        src = f"test-move-src-{uid()}"
+        dst = f"test-move-dst-{uid()}"
+        content = b"move test content"
+        try:
+            await storage.upload_bytes(content, src)
+            await storage.move(src, dst)
+
+            assert not await storage.exists(src)
+            assert await storage.is_file(dst)
+            assert await storage.download_bytes(dst) == content
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.delete(src)
+            with contextlib.suppress(Exception):
+                await storage.delete(dst)
+
+    async def test_move_nonexistent_source(self, storage: AbstractStorage):
+        with pytest.raises(FileNotFoundError):
+            await storage.move(f"nonexistent-{uid()}", f"nonexistent-dst-{uid()}")
+
+    async def test_move_to_existing_file(self, storage: AbstractStorage):
+        # Backends vary: some raise FileExistsError, some overwrite silently.
+        # Accept either behavior.
+        src = f"test-move-src2-{uid()}"
+        dst = f"test-move-dst2-{uid()}"
+        try:
+            await storage.upload_bytes(b"src content", src)
+            await storage.upload_bytes(b"dst content", dst)
+
+            # Some backends raise FileExistsError, others overwrite silently.
+            # Accept either behavior.
+            with contextlib.suppress(FileExistsError):
+                await storage.move(src, dst)
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.delete(src)
+            with contextlib.suppress(Exception):
+                await storage.delete(dst)
+
+
+class TestCopy:
+    """copy() tests."""
+
+    async def test_copy_file(self, storage: AbstractStorage):
+        src = f"test-copy-src-{uid()}"
+        dst = f"test-copy-dst-{uid()}"
+        content = b"copy test content"
+        try:
+            await storage.upload_bytes(content, src)
+            await storage.copy(src, dst)
+
+            assert await storage.is_file(src)
+            assert await storage.is_file(dst)
+            assert await storage.download_bytes(src) == content
+            assert await storage.download_bytes(dst) == content
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.delete(src)
+            with contextlib.suppress(Exception):
+                await storage.delete(dst)
+
+    async def test_copy_nonexistent_source(self, storage: AbstractStorage):
+        with pytest.raises(FileNotFoundError):
+            await storage.copy(f"nonexistent-{uid()}", f"nonexistent-dst-{uid()}")
+
+
+class TestDeleteMany:
+    """delete_many() tests."""
+
+    async def test_delete_many_files(self, storage: AbstractStorage):
+        p1 = f"test-dm-1-{uid()}"
+        p2 = f"test-dm-2-{uid()}"
+        p3 = f"test-dm-3-{uid()}"
+        try:
+            await storage.upload_bytes(b"a", p1)
+            await storage.upload_bytes(b"b", p2)
+            await storage.upload_bytes(b"c", p3)
+
+            await storage.delete_many(p1, p2, p3)
+
+            assert not await storage.exists(p1)
+            assert not await storage.exists(p2)
+            assert not await storage.exists(p3)
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.delete(p1)
+            with contextlib.suppress(Exception):
+                await storage.delete(p2)
+            with contextlib.suppress(Exception):
+                await storage.delete(p3)
+
+    async def test_delete_many_mixed(self, storage: AbstractStorage):
+        d = f"test-dm-dir-{uid()}"
+        f1 = f"test-dm-f1-{uid()}"
+        f2 = f"test-dm-f2-{uid()}"
+        try:
+            await storage.mkdir(d)
+            await storage.upload_bytes(b"x", f1)
+            await storage.upload_bytes(b"y", f2)
+
+            await storage.delete_many(d, f1, f2)
+
+            assert not await storage.exists(d)
+            assert not await storage.exists(f1)
+            assert not await storage.exists(f2)
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.delete(d)
+            with contextlib.suppress(Exception):
+                await storage.delete(f1)
+            with contextlib.suppress(Exception):
+                await storage.delete(f2)
+
+    async def test_delete_many_nonexistent(self, storage: AbstractStorage):
+        # Backends vary: some silently skip nonexistent paths, others raise
+        # FileNotFoundError. Accept either behavior.
+        with contextlib.suppress(FileNotFoundError):
+            await storage.delete_many(f"nonexistent-{uid()}")
+
+
+class TestCopytree:
+    """copytree() tests."""
+
+    async def test_copytree_basic(self, storage: AbstractStorage):
+        src = f"test-ct-src-{uid()}"
+        dst = f"test-ct-dst-{uid()}"
+        try:
+            await storage.mkdir(f"{src}/sub", parents=True)
+            await storage.upload_bytes(b"aaa", f"{src}/f1.txt")
+            await storage.upload_bytes(b"bbb", f"{src}/sub/f2.txt")
+
+            await storage.copytree(src, dst)
+
+            assert await storage.is_dir(dst)
+            assert await storage.is_file(f"{dst}/f1.txt")
+            assert await storage.download_bytes(f"{dst}/f1.txt") == b"aaa"
+            assert await storage.is_file(f"{dst}/sub/f2.txt")
+            assert await storage.download_bytes(f"{dst}/sub/f2.txt") == b"bbb"
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.rmtree(src)
+            with contextlib.suppress(Exception):
+                await storage.rmtree(dst)
+
+    async def test_copytree_nonexistent_source(self, storage: AbstractStorage):
+        with pytest.raises(NotADirectoryError):
+            await storage.copytree(f"nonexistent-{uid()}", f"nonexistent-dst-{uid()}")
+
+    async def test_copytree_overwrite_false(self, storage: AbstractStorage):
+        src = f"test-ct-ow-src-{uid()}"
+        dst = f"test-ct-ow-dst-{uid()}"
+        try:
+            await storage.mkdir(f"{src}/sub", parents=True)
+            await storage.upload_bytes(b"aaa", f"{src}/f1.txt")
+            await storage.upload_bytes(b"bbb", f"{src}/sub/f2.txt")
+
+            await storage.mkdir(dst)
+            await storage.upload_bytes(b"existing", f"{dst}/f1.txt")
+
+            with pytest.raises(FileExistsError):
+                await storage.copytree(src, dst, overwrite=False)
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.rmtree(src)
+            with contextlib.suppress(Exception):
+                await storage.rmtree(dst)
+
+
+class TestMovetree:
+    """movetree() tests."""
+
+    async def test_movetree_basic(self, storage: AbstractStorage):
+        src = f"test-mt-src-{uid()}"
+        dst = f"test-mt-dst-{uid()}"
+        try:
+            await storage.mkdir(f"{src}/sub", parents=True)
+            await storage.upload_bytes(b"aaa", f"{src}/f1.txt")
+            await storage.upload_bytes(b"bbb", f"{src}/sub/f2.txt")
+
+            await storage.movetree(src, dst)
+
+            assert not await storage.exists(src)
+            assert await storage.is_dir(dst)
+            assert await storage.is_file(f"{dst}/f1.txt")
+            assert await storage.download_bytes(f"{dst}/f1.txt") == b"aaa"
+            assert await storage.is_file(f"{dst}/sub/f2.txt")
+            assert await storage.download_bytes(f"{dst}/sub/f2.txt") == b"bbb"
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.rmtree(src)
+            with contextlib.suppress(Exception):
+                await storage.rmtree(dst)
+
+    async def test_movetree_nonexistent_source(self, storage: AbstractStorage):
+        with pytest.raises(NotADirectoryError):
+            await storage.movetree(f"nonexistent-{uid()}", f"nonexistent-dst-{uid()}")
+
+
+class TestDownloadStream:
+    """download_stream() tests."""
+
+    async def test_download_stream_offset(self, storage: AbstractStorage):
+        path = f"test-dl-offset-{uid()}"
+        original = b"x" * 100
+        try:
+            await storage.upload_bytes(original, path)
+            chunks = [chunk async for chunk in storage.download_stream(path, offset=50)]
+            result = b"".join(chunks)
+            assert result == original[50:]
+        finally:
+            await storage.delete(path)
+
+    async def test_download_stream_offset_beyond(self, storage: AbstractStorage):
+        path = f"test-dl-beyond-{uid()}"
+        try:
+            await storage.upload_bytes(b"x" * 10, path)
+            chunks = [chunk async for chunk in storage.download_stream(path, offset=100)]
+            result = b"".join(chunks)
+            assert result == b""
+        finally:
+            await storage.delete(path)
