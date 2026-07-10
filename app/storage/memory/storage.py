@@ -15,8 +15,7 @@ class MemoryStorage(AbstractStorage):
 
     Usage::
 
-        storage = MemoryStorage.from_directory("/")
-        async with storage:
+        async with MemoryStorage() as storage:
             await storage.upload_bytes(b"hello", "foo.txt")
     """
 

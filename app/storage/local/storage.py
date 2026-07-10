@@ -19,8 +19,7 @@ class LocalStorage(AbstractStorage):
 
     Usage::
 
-        storage = LocalStorage.from_directory("/data/ftp")
-        async with storage:
+        async with LocalStorage("/data/ftp") as storage:
             await storage.upload_bytes(b"hello", "foo.txt")
     """
 
