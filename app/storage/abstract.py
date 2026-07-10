@@ -248,6 +248,43 @@ class AbstractStorage(ABC):
         """Recursively remove a directory."""
         raise NotImplementedError
 
+    @abstractmethod
+    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        """Recursively copy a directory tree.
+
+        Args:
+            src: Source directory path.
+            dst: Destination directory path.
+            overwrite: If ``True``, silently overwrite existing files at
+                destination. If ``False``, raise FileExistsError when
+                destination already exists.
+
+        Raises:
+            NotADirectoryError: If *src* is not a directory.
+            FileExistsError: If *dst* exists and *overwrite* is ``False``.
+        """
+        raise NotImplementedError
+
+    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        """Recursively move a directory tree.
+
+        The default implementation copies the tree then removes the source.
+        Backends may override with a more efficient implementation when
+        available (e.g. native rename on the same filesystem).
+
+        Args:
+            src: Source directory path.
+            dst: Destination directory path.
+            overwrite: If ``True``, silently overwrite existing files at
+                destination. If ``False``, raise FileExistsError.
+
+        Raises:
+            NotADirectoryError: If *src* is not a directory.
+            FileExistsError: If *dst* exists and *overwrite* is ``False``.
+        """
+        await self.copytree(src, dst, overwrite=overwrite)
+        await self.rmtree(src)
+
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------

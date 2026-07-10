@@ -390,6 +390,59 @@ class CosStorage(AbstractStorage):
         )
 
     @override
+    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        client = self._ensure_client()
+
+        # 类型和策略校验
+        if not await self.is_dir(src):
+            raise NotADirectoryError(f"Not a directory: {src}")
+        if not overwrite and await self.is_dir(dst):
+            raise FileExistsError(f"Destination already exists: {dst}")
+
+        # walk 收集源树所有文件和目录
+        file_paths: list[str] = []
+        dir_paths: list[str] = []
+        async for _sp, _sd, sf in self.walk(src):
+            file_paths.extend(f.path for f in sf)
+            dir_paths.extend(d.path for d in _sd)
+
+        src_prefix = src.rstrip("/")
+        dst_prefix = dst.rstrip("/")
+
+        self.log.info(
+            f"CopyTree: <y>{escape_tag(src_prefix)}</y> → "
+            f"<y>{escape_tag(dst_prefix)}</y> "
+            f"(<g>{len(file_paths)}</g> files, <g>{len(dir_paths)}</g> subdirs)"
+        )
+
+        # 创建目标端所有目录标记 (按深度排序, 自上而下)
+        all_dst_dirs: set[str] = {dst}
+        for dir_path in dir_paths:
+            all_dst_dirs.add(dst_prefix + dir_path[len(src_prefix) :])
+        for src_file in file_paths:
+            rel = src_file[len(src_prefix) :]
+            all_dst_dirs.add(PurePosixPath(dst_prefix + rel).parent.as_posix())
+
+        dir_created = datetime.now(UTC)
+        for d in sorted(all_dst_dirs, key=lambda p: p.count("/")):
+            if dir_key := self._dir_key(d):
+                info = FileInfo(
+                    path=d,
+                    name=PurePosixPath(d).name,
+                    is_dir=True,
+                    size=0,
+                    modified=dir_created,
+                    created=dir_created,
+                )
+                await client.put_object(key=dir_key, data=serialize_file_info(info))
+
+        # 并发复制所有文件
+        async with anyio.create_task_group() as tg:
+            for src_file in file_paths:
+                dst_file = dst_prefix + src_file[len(src_prefix) :]
+                tg.start_soon(self.copy, src_file, dst_file)
+
+    @override
     async def exists(self, path: str) -> bool:
         key = self._remote_path_to_key(path)
         if key == "":

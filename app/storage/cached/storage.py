@@ -367,6 +367,18 @@ class CachedStorage(AbstractStorage):
         self.log.debug("RmTree — clearing all caches")
         await self._clear_all_caches()
 
+    @override
+    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        await self._storage.copytree(src, dst, overwrite=overwrite)
+        self.log.debug("CopyTree — clearing all caches")
+        await self._clear_all_caches()
+
+    @override
+    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        await self._storage.movetree(src, dst, overwrite=overwrite)
+        self.log.debug("MoveTree — clearing all caches")
+        await self._clear_all_caches()
+
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------

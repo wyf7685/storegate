@@ -1,3 +1,4 @@
+import functools
 import os
 import shutil
 from collections.abc import AsyncIterable, AsyncIterator
@@ -171,6 +172,36 @@ class LocalStorage(AbstractStorage):
     async def rmtree(self, path: str) -> None:
         target = self._resolve(path)
         await anyio.to_thread.run_sync(shutil.rmtree, str(target))
+
+    @override
+    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        source = self._resolve(src)
+        dest = self._resolve(dst)
+
+        if not await anyio.Path(source).is_dir():
+            raise NotADirectoryError(f"Not a directory: {src}")
+        if not overwrite and await anyio.Path(dest).exists():
+            raise FileExistsError(f"Destination already exists: {dst}")
+
+        await anyio.to_thread.run_sync(
+            functools.partial(shutil.copytree, str(source), str(dest), dirs_exist_ok=overwrite)
+        )
+
+    @override
+    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        source = self._resolve(src)
+        dest = self._resolve(dst)
+
+        if not await anyio.Path(source).is_dir():
+            raise NotADirectoryError(f"Not a directory: {src}")
+        if not overwrite and await anyio.Path(dest).exists():
+            raise FileExistsError(f"Destination already exists: {dst}")
+
+        try:
+            await anyio.Path(source).rename(dest)
+        except OSError:  # EXDEV cross-device
+            await self.copytree(src, dst, overwrite=overwrite)
+            await self.rmtree(src)
 
     # ------------------------------------------------------------------
     # Metadata

@@ -1,6 +1,8 @@
 import contextlib
+import dataclasses
 import hashlib
 import uuid
+from collections import defaultdict
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -64,6 +66,12 @@ class IndexStorage(AbstractStorage):
         if self._chunks is None:
             raise RuntimeError("Chunks storage is not set.")
         return self._chunks
+
+    @staticmethod
+    def _to_abs_path(path: str) -> str:
+        if not path.startswith("/"):
+            return "/" + path
+        return path
 
     @override
     @property
@@ -202,42 +210,49 @@ class IndexStorage(AbstractStorage):
         refs_bytes = await chunks.download_bytes(ref_path)
         return set(refs_bytes.decode().splitlines())
 
-    async def _chunk_incref(self, chunk_hash: str, remote_path: str) -> None:
+    async def _chunk_incref(self, chunk_hash: str, *remote_path: str) -> None:
         chunks = self._ensure_chunks()
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
+        _colored_remote_paths = ", ".join(f"<i>{escape_tag(p)}</i>" for p in remote_path)
 
         refs: set[str] = await self._chunk_load_refs(chunk_hash) or set()
 
-        refs.add(remote_path)
+        refs.update(remote_path)
         await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
-        self.log.debug(f"Chunk {_colored_hash} +ref → <g>{len(refs)}</g> (<i>{escape_tag(remote_path)}</i>)")
+        self.log.debug(f"Chunk {_colored_hash} +ref → <g>{len(refs)}</g> ({_colored_remote_paths})")
 
-    async def _chunk_decref(self, chunk_hash: str, remote_path: str) -> None:
+    async def _chunk_decref(self, chunk_hash: str, *remote_path: str) -> None:
         chunks = self._ensure_chunks()
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
+        _colored_remote_paths = ", ".join(f"<i>{escape_tag(p)}</i>" for p in remote_path)
 
         refs = await self._chunk_load_refs(chunk_hash)
         if refs is None:
-            self.log.warning(f"Chunk {_colored_hash} ref file missing, skip decref (<i>{escape_tag(remote_path)}</i>)")
-            return
-        if remote_path not in refs:
-            self.log.warning(
-                f"Chunk {_colored_hash} ref entry not found for <i>{escape_tag(remote_path)}</i>, skip decref"
-            )
+            self.log.warning(f"Chunk {_colored_hash} ref file missing, skip decref ({_colored_remote_paths})")
             return
 
-        refs.remove(remote_path)
+        removed = False
+        for p in remote_path:
+            if p in refs:
+                refs.remove(p)
+                removed = True
+            else:
+                self.log.warning(f"Chunk {_colored_hash} ref entry not found for <i>{escape_tag(p)}</i>, skip decref")
+
         if refs:
-            await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
-            self.log.debug(f"Chunk {_colored_hash} -ref → <g>{len(refs)}</g> (<i>{escape_tag(remote_path)}</i>)")
+            if removed:
+                await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
+                self.log.debug(f"Chunk {_colored_hash} -ref → <g>{len(refs)}</g> (<i>{_colored_remote_paths}</i>)")
+            else:
+                self.log.debug(f"Chunk {_colored_hash} -ref no change (<i>{_colored_remote_paths}</i>)")
         else:
             await chunks.unlink(ref_path, missing_ok=True)
             await chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
-            self.log.debug(f"Chunk {_colored_hash} ref=0, deleted data (<i>{escape_tag(remote_path)}</i>)")
+            self.log.debug(f"Chunk {_colored_hash} ref=0, deleted data (<i>{_colored_remote_paths}</i>)")
 
-    async def _chunk_transref(self, chunk_hash: str, src_path: str, dst_path: str, missing_ok: bool = False) -> None:
+    async def _chunk_transref(self, chunk_hash: str, *pairs: tuple[str, str], missing_ok: bool = False) -> None:
         chunks = self._ensure_chunks()
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
@@ -248,19 +263,22 @@ class IndexStorage(AbstractStorage):
                 raise FileNotFoundError(f"Chunk {chunk_hash} ref file missing for transref")
             refs = set()
 
-        if src_path not in refs:
-            if missing_ok:
-                self.log.warning(
-                    f"Chunk {_colored_hash} ref entry not found for transref: <i>{escape_tag(src_path)}</i>"
-                )
-            else:
-                raise FileNotFoundError(f"Chunk {chunk_hash} ref entry not found for transref: {src_path}")
+        for src_path, dst_path in pairs:
+            if src_path not in refs:
+                if missing_ok:
+                    self.log.warning(
+                        f"Chunk {_colored_hash} ref entry not found for transref: <i>{escape_tag(src_path)}</i>"
+                    )
+                else:
+                    raise FileNotFoundError(f"Chunk {chunk_hash} ref entry not found for transref: {src_path}")
 
-        refs.remove(src_path)
-        refs.add(dst_path)
+            refs.remove(src_path)
+            refs.add(dst_path)
+
         await chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
         self.log.debug(
-            f"Chunk {_colored_hash} transref: <i>{escape_tag(src_path)}</i> → <i>{escape_tag(dst_path)}</i> "
+            f"Chunk {_colored_hash} transref: "
+            f"{", ".join(f"<i>{escape_tag(src)}</i> → <i>{escape_tag(dst)}</i>" for src, dst in pairs)} "
             f"(<g>{len(refs)}</g> refs)"
         )
 
@@ -624,7 +642,7 @@ class IndexStorage(AbstractStorage):
                 await index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in src_meta.chunks:
-                        tg.start_soon(self._chunk_transref, chunk_hash, src, dst)
+                        tg.start_soon(self._chunk_transref, chunk_hash, (src, dst))
             await index.unlink(src)
 
         self.log.info(
@@ -655,19 +673,12 @@ class IndexStorage(AbstractStorage):
                 raise FileExistsError(f"Destination file already exists: {dst}")
 
             new_dst_meta = FileMeta(
-                info=FileInfo(
-                    path=dst,
-                    name=Path(dst).name,
-                    is_dir=False,
-                    size=src_meta.info.size,
-                    modified=src_meta.info.modified,
-                    created=src_meta.info.created,
-                ),
-                chunks=src_meta.chunks,
+                info=dataclasses.replace(src_meta.info, path=dst, name=PurePosixPath(dst).name),
+                chunks=src_meta.chunks.copy(),
             )
             new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
             async with self._lock_chunks(src_meta.chunks):
-                await index.mkdir(Path(dst).parent.as_posix(), parents=True, exist_ok=True)
+                await index.mkdir(PurePosixPath(dst).parent.as_posix(), parents=True, exist_ok=True)
                 await index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in src_meta.chunks:
@@ -698,12 +709,165 @@ class IndexStorage(AbstractStorage):
         async with anyio.create_task_group() as tg:
             async for info in index.iterdir(path):
                 count += 1
-                if info.is_dir:
-                    tg.start_soon(self.rmtree, info.path)
-                else:
-                    tg.start_soon(self.unlink, info.path)
+                tg.start_soon(self.rmtree if info.is_dir else self.unlink, self._to_abs_path(info.path))
         await index.rmdir(path)
         self.log.info(f"RmTree complete: {_colored_path} (<g>{count}</g> entries removed)")
+
+    @override
+    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        _colored_src = f"<y>{escape_tag(src)}</y>"
+        _colored_dst = f"<y>{escape_tag(dst)}</y>"
+        self.log.info(f"CopyTree: {_colored_src} → {_colored_dst}")
+
+        index = self._ensure_index()
+
+        # 类型和策略校验
+        if not await index.is_dir(src):
+            raise NotADirectoryError(f"Not a directory: {src}")
+        if not overwrite and await index.is_dir(dst):
+            raise FileExistsError(f"Destination already exists: {dst}")
+
+        src_prefix = src.rstrip("/")
+        dst_prefix = dst.rstrip("/")
+
+        # walk 收集源树所有文件
+        async def _collect_chunk_updates(info: FileInfo) -> None:
+            meta = await self._get_file_meta(info.path)
+            if meta is None:
+                raise FileNotFoundError(f"File not found: {info.path}")
+            files.append(meta)
+            file_rel = meta.info.path[len(src_prefix) :]
+            for chunk_hash in meta.chunks:
+                chunk_updates[chunk_hash].add(dst_prefix + file_rel)
+
+        files: list[FileMeta] = []
+        dir_rels: list[str] = []
+        chunk_updates: dict[str, set[str]] = defaultdict(set)
+        async with anyio.create_task_group() as tg:
+            async for _, sd, sf in index.walk(src):
+                for info in sf:
+                    tg.start_soon(_collect_chunk_updates, info)
+                dir_rels.extend(self._to_abs_path(d.path)[len(src_prefix) :] for d in sd)
+
+        # 创建目标目录结构
+        await self.mkdir(dst, parents=True, exist_ok=True)
+        for rel in sorted(dir_rels, key=lambda r: r.count("/")):
+            await self.mkdir(dst_prefix + rel, parents=True, exist_ok=True)
+
+        # 并发更新 chunk refs
+        async def _batch_incref(chunk_hash: str, dst_paths: set[str]) -> None:
+            async with self._lock_chunk(chunk_hash):
+                await self._chunk_incref(chunk_hash, *dst_paths)
+
+        async with anyio.create_task_group() as tg:
+            for chunk_hash, dst_paths in chunk_updates.items():
+                tg.start_soon(_batch_incref, chunk_hash, dst_paths)
+
+        # 并发创建目标文件元数据
+        async def _create_dst_meta(src_meta: FileMeta) -> None:
+            dst_file = dst_prefix + src_meta.info.path[len(src_prefix) :]
+            async with self._lock_index(dst_file):
+                if old_meta := await self._get_file_meta(dst_file):
+                    async with self._lock_chunks(old_meta.chunks), anyio.create_task_group() as inner_tg:
+                        for chunk_hash in old_meta.chunks:
+                            inner_tg.start_soon(self._chunk_decref, chunk_hash, dst_file)
+                dst_meta = FileMeta(
+                    info=dataclasses.replace(src_meta.info, path=dst_file, name=PurePosixPath(dst_file).name),
+                    chunks=src_meta.chunks.copy(),
+                )
+                dst_meta_bytes = dst_meta.model_dump_json().encode()
+                await index.upload_bytes(dst_meta_bytes, dst_meta.info.path, overwrite=True)
+
+        async with anyio.create_task_group() as tg:
+            for src_meta in files:
+                tg.start_soon(_create_dst_meta, src_meta)
+
+        self.log.info(
+            f"CopyTree complete: {_colored_src} → {_colored_dst} "
+            f"(<g>{len(files)}</g> files, <g>{len(dir_rels)}</g> dirs)"
+        )
+
+    @override
+    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        _colored_src = f"<y>{escape_tag(src)}</y>"
+        _colored_dst = f"<y>{escape_tag(dst)}</y>"
+        self.log.info(f"MoveTree: {_colored_src} → {_colored_dst}")
+
+        index = self._ensure_index()
+
+        # 类型和策略校验
+        if not await index.is_dir(src):
+            raise NotADirectoryError(f"Not a directory: {src}")
+        if not overwrite and await index.is_dir(dst):
+            raise FileExistsError(f"Destination already exists: {dst}")
+
+        src_prefix = src.rstrip("/")
+        dst_prefix = dst.rstrip("/")
+
+        # walk 收集源树所有文件
+        async def _collect(info: FileInfo) -> None:
+            meta = await self._get_file_meta(info.path)
+            if meta is None:
+                raise FileNotFoundError(f"File not found: {info.path}")
+            files.append(meta)
+            src_file = meta.info.path
+            dst_file = dst_prefix + meta.info.path[len(src_prefix) :]
+            for chunk_hash in meta.chunks:
+                chunk_transrefs[chunk_hash].append((src_file, dst_file))
+
+        files: list[FileMeta] = []
+        dir_rels: list[str] = []
+        chunk_transrefs: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        async with anyio.create_task_group() as tg:
+            async for _, sd, sf in index.walk(src):
+                for info in sf:
+                    tg.start_soon(_collect, info)
+                dir_rels.extend(self._to_abs_path(d.path)[len(src_prefix) :] for d in sd)
+
+        # 创建目标目录结构
+        await self.mkdir(dst, parents=True, exist_ok=True)
+        for rel in sorted(dir_rels, key=lambda r: r.count("/")):
+            await self.mkdir(dst_prefix + rel, parents=True, exist_ok=True)
+
+        # 批量 transref: 每个 chunk 一把锁，一次处理全部 (src,dst) 对
+        async def _batch_transref(chunk_hash: str, pairs: list[tuple[str, str]]) -> None:
+            async with self._lock_chunk(chunk_hash):
+                await self._chunk_transref(chunk_hash, *pairs)
+
+        async with anyio.create_task_group() as tg:
+            for chunk_hash, pairs in chunk_transrefs.items():
+                tg.start_soon(_batch_transref, chunk_hash, pairs)
+
+        # 移动文件 meta (锁 src+dst, 写 dst, 删 src)
+        async def _move_meta(src_meta: FileMeta) -> None:
+            src_file = src_meta.info.path
+            dst_file = dst_prefix + src_file[len(src_prefix) :]
+            async with self._lock_indexes(src_file, dst_file):
+                # overwrite: 清理目标端旧 chunks
+                if old_meta := await self._get_file_meta(dst_file):
+                    async with self._lock_chunks(old_meta.chunks), anyio.create_task_group() as inner_tg:
+                        for chunk_hash in old_meta.chunks:
+                            inner_tg.start_soon(self._chunk_decref, chunk_hash, dst_file)
+                dst_meta = FileMeta(
+                    info=dataclasses.replace(src_meta.info, path=dst_file, name=PurePosixPath(dst_file).name),
+                    chunks=src_meta.chunks.copy(),
+                )
+                await index.upload_bytes(dst_meta.model_dump_json().encode(), dst_file, overwrite=True)
+                await index.unlink(src_file)
+
+        async with anyio.create_task_group() as tg:
+            for src_meta in files:
+                tg.start_soon(_move_meta, src_meta)
+
+        # 清理源目录结构 (自底向上)
+        for rel in sorted(dir_rels, key=lambda r: r.count("/"), reverse=True):
+            await index.rmdir(src_prefix + rel)
+        await index.rmdir(src)
+
+        self.log.info(
+            f"MoveTree complete: {_colored_src} → {_colored_dst} "
+            f"(<g>{len(files)}</g> files, <g>{len(dir_rels)}</g> dirs)"
+        )
 
     @override
     async def exists(self, path: str) -> bool:
@@ -737,7 +901,14 @@ class IndexStorage(AbstractStorage):
             raise NotADirectoryError(f"Not a directory: {path}")
         async for entry in index.iterdir(path):
             if entry.is_dir:
-                yield entry
+                yield FileInfo(
+                    path=self._to_abs_path(entry.path),
+                    name=entry.name,
+                    is_dir=True,
+                    size=entry.size,
+                    modified=entry.modified,
+                    created=entry.created,
+                )
             else:
                 meta = await self._get_file_meta(entry.path)
                 if meta is not None:
@@ -760,7 +931,21 @@ class IndexStorage(AbstractStorage):
                 for entry in sf:
                     tg.start_soon(_fetch_meta, entry.path)
             files.sort(key=lambda x: x.name)
-            yield sp, sd, files
+            yield (
+                self._to_abs_path(sp),
+                [
+                    FileInfo(
+                        path=self._to_abs_path(d.path),
+                        name=d.name,
+                        is_dir=True,
+                        size=d.size,
+                        modified=d.modified,
+                        created=d.created,
+                    )
+                    for d in sd
+                ],
+                files,
+            )
 
     @override
     async def list_(self, path: str) -> list[FileInfo]:
@@ -777,7 +962,16 @@ class IndexStorage(AbstractStorage):
         async with anyio.create_task_group() as tg:
             async for entry in index.iterdir(path):
                 if entry.is_dir:
-                    files.append(entry)
+                    files.append(
+                        FileInfo(
+                            path=self._to_abs_path(entry.path),
+                            name=entry.name,
+                            is_dir=True,
+                            size=entry.size,
+                            modified=entry.modified,
+                            created=entry.created,
+                        )
+                    )
                 else:
                     tg.start_soon(_fetch_meta, entry.path)
 

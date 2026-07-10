@@ -252,6 +252,105 @@ class MemoryStorage(AbstractStorage):
             if key == target or key.startswith(prefix):
                 self._dirs.discard(key)
 
+    @override
+    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        target_src = self._resolve(src)
+        target_dst = self._resolve(dst)
+
+        # 类型校验
+        if not (target_src in self._dirs or target_src == "" or self._is_dir(target_src)):
+            raise NotADirectoryError(f"Not a directory: {src}")
+
+        # 覆盖策略
+        if not overwrite and (target_dst in self._dirs or target_dst == "" or self._is_dir(target_dst)):
+            raise FileExistsError(f"Destination already exists: {dst}")
+
+        src_prefix = target_src + "/" if target_src else ""
+
+        # 收集源下所有文件和目录
+        files_to_copy: list[tuple[str, str]] = []
+        for key in self._files:
+            if key == target_src or key.startswith(src_prefix):
+                rel = key[len(src_prefix) :] if target_src else key
+                dst_path = target_dst + "/" + rel if target_dst else rel
+                files_to_copy.append((key, dst_path))
+
+        dirs_to_create: list[str] = []
+        for key in self._dirs:
+            if key == target_src:
+                dirs_to_create.append(target_dst)
+            elif key.startswith(src_prefix):
+                rel = key[len(src_prefix) :] if target_src else key
+                dirs_to_create.append(target_dst + "/" + rel)
+
+        # overwrite: 清理目标端已有数据
+        if overwrite:
+            dst_prefix = target_dst + "/" if target_dst else ""
+            for key in list(self._files):
+                if key == target_dst or key.startswith(dst_prefix):
+                    del self._files[key]
+            for key in list(self._dirs):
+                if key == target_dst or key.startswith(dst_prefix):
+                    self._dirs.discard(key)
+
+        # 创建目标目录结构
+        for d in dirs_to_create:
+            self._dirs.add(d)
+        if target_dst and target_dst not in self._dirs:
+            self._dirs.add(target_dst)
+        self._ensure_parent_dirs(target_dst)
+
+        # 复制所有文件 (bytes 不可变, 共享引用安全)
+        for src_path, dst_path in files_to_copy:
+            self._files[dst_path] = self._files[src_path]
+
+    @override
+    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+        target_src = self._resolve(src)
+        target_dst = self._resolve(dst)
+
+        # 类型校验
+        if not (target_src in self._dirs or target_src == "" or self._is_dir(target_src)):
+            raise NotADirectoryError(f"Not a directory: {src}")
+
+        # 覆盖策略
+        if not overwrite and (target_dst in self._dirs or target_dst == "" or self._is_dir(target_dst)):
+            raise FileExistsError(f"Destination already exists: {dst}")
+
+        src_prefix = target_src + "/" if target_src else ""
+
+        # overwrite: 清理目标端已有数据
+        if overwrite:
+            dst_prefix = target_dst + "/" if target_dst else ""
+            for key in list(self._files):
+                if key == target_dst or key.startswith(dst_prefix):
+                    del self._files[key]
+            for key in list(self._dirs):
+                if key == target_dst or key.startswith(dst_prefix):
+                    self._dirs.discard(key)
+
+        # 移动文件 (键重命名)
+        moved_files: dict[str, bytes] = {}
+        for key in list(self._files):
+            if key == target_src or key.startswith(src_prefix):
+                rel = key[len(src_prefix) :] if target_src else key
+                dst_path = target_dst + "/" + rel if target_dst else rel
+                moved_files[dst_path] = self._files.pop(key)
+        self._files.update(moved_files)
+
+        # 移动目录
+        for key in list(self._dirs):
+            if key == target_src:
+                self._dirs.discard(key)
+                self._dirs.add(target_dst)
+            elif key.startswith(src_prefix):
+                rel = key[len(src_prefix) :] if target_src else key
+                dst_path = target_dst + "/" + rel if target_dst else rel
+                self._dirs.discard(key)
+                self._dirs.add(dst_path)
+
+        self._ensure_parent_dirs(target_dst)
+
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
