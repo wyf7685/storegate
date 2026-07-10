@@ -4,7 +4,7 @@ from typing import final, override
 
 from wsgidav.dav_provider import DAVCollection as BaseDAVCollection
 
-from app.storage import AbstractStorage
+from app.storage import AbstractStorage, FileInfo
 
 from .resource import StorageResource
 from .utils import NativeHandlerResult, call_with_catch, run_async
@@ -17,6 +17,26 @@ class StorageCollection(BaseDAVCollection):
         super().__init__(path, environ)
         self._storage = storage
         self._pure_path = PurePosixPath(path)
+        self._info: FileInfo | None = None
+
+    def _get_file_info(self) -> FileInfo:
+        if self._info is None:
+            self._info = run_async(self._storage.stat, self.path)
+        return self._info
+
+    @override
+    def get_creation_date(self) -> float | None:
+        info = self._get_file_info()
+        return info.created.timestamp() if info.created else None
+
+    @override
+    def support_modified(self) -> bool:
+        return True
+
+    @override
+    def get_last_modified(self) -> float | None:
+        info = self._get_file_info()
+        return info.modified.timestamp() if info.modified else None
 
     @override
     def create_empty_resource(self, name: str) -> StorageResource:
