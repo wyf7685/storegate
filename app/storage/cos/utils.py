@@ -15,10 +15,6 @@ from app.utils import logger_wrapper
 from .cos_client import AsyncCosClient, MultipartUploadPart
 
 
-def get_object_key(key: str) -> str:
-    return key
-
-
 def serialize_file_info(info: FileInfo) -> bytes:
     """将 ``FileInfo`` 序列化为 JSON bytes，用作目录标记对象的值。"""
     data: dict[str, object] = {
@@ -63,10 +59,6 @@ class MultipartUploadTask:
         self._next_part_number = 1
         self._parts_lock = anyio.Lock()
         self.log = logger_wrapper(f"cos.multipart <i><c>{escape_tag(self.key)}</></>")
-
-    @property
-    def colored_key(self) -> str:
-        return f"<i><c>{escape_tag(self.key)}</></>"
 
     @classmethod
     @contextlib.asynccontextmanager

@@ -254,13 +254,11 @@ class CosStorage(AbstractStorage):
                 objects_to_delete.append(key)
                 continue
 
-            # 2. 目录：检查为空后删除标记对象
-            if await self.is_dir(path):
+            # 2. 目录：内联检查（复用已计算的 dir_key，避免 is_dir 的冗余 head_object）
+            dir_key = self._dir_key(path)
+            if dir_key is not None and await client.head_object(key=dir_key) is not None:
                 if not await self._is_dir_empty(path):
                     raise OSError(f"Directory not empty: {path}")
-
-                dir_key = self._dir_key(path)
-                assert dir_key is not None  # is_dir=True 且不是根目录
                 objects_to_delete.append(dir_key)
                 continue
 
@@ -481,7 +479,7 @@ class CosStorage(AbstractStorage):
             return True  # 根目录始终为目录
 
         dir_key = self._dir_key(path)
-        if dir_key is None:
+        if dir_key is None:  # pragma: no cover
             return False
         return await self._ensure_client().head_object(key=dir_key) is not None
 
