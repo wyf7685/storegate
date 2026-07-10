@@ -6,6 +6,7 @@ chunk semantics: multi-block upload/download integrity, deduplication, and
 ref counting.
 """
 
+import contextlib
 import hashlib
 import os
 from contextlib import AbstractContextManager
@@ -67,6 +68,25 @@ class TestDeduplication:
             await index_storage.upload_bytes(data, path1)
             await index_storage.upload_bytes(data, path2)
 
+            meta1 = await index_storage._get_file_meta(path1)  # noqa: SLF001
+            meta2 = await index_storage._get_file_meta(path2)  # noqa: SLF001
+            assert meta1 is not None
+            assert meta2 is not None
+            assert meta1.chunks == meta2.chunks, "Identical files must share the same chunk hashes"
+            assert len(meta1.chunks) == 2
+
+            # Verify each chunk .bin exists once and .ref lists both paths
+            for chunk_hash in meta1.chunks:
+                assert await index_storage._chunks.exists(  # noqa: SLF001
+                    f"{hash_to_path_stem(chunk_hash)}.bin"
+                ), f"Chunk {chunk_hash[:8]} .bin should exist"
+                refs = await index_storage._chunk_load_refs(chunk_hash)  # noqa: SLF001
+                assert refs is not None, f"Chunk {chunk_hash[:8]} .ref should exist"
+                abs1 = f"/{path1}"
+                abs2 = f"/{path2}"
+                assert abs1 in refs, f"Chunk {chunk_hash[:8]} refs should include {abs1}"
+                assert abs2 in refs, f"Chunk {chunk_hash[:8]} refs should include {abs2}"
+
             info1 = await index_storage.stat(path1)
             info2 = await index_storage.stat(path2)
             assert info1.size == info2.size == len(data)
@@ -86,9 +106,26 @@ class TestRefCounting:
     async def test_unlink_decrefs_chunks(self, index_storage: IndexStorage):
         data = b"B" * BLOCK_SIZE
         path = f"test-refc-unlink-{uid()}"
+
         await index_storage.upload_bytes(data, path)
+        meta_before = await index_storage._get_file_meta(path)  # noqa: SLF001
+        assert meta_before is not None
+        chunk_hashes = meta_before.chunks[:]
+
         await index_storage.unlink(path)
         assert not await index_storage.exists(path)
+
+        # Verify chunk .bin + .ref cleaned up (refs reached 0)
+        for chunk_hash in chunk_hashes:
+            assert not await index_storage._chunks.exists(  # noqa: SLF001
+                f"{hash_to_path_stem(chunk_hash)}.bin"
+            ), f"Chunk {chunk_hash[:8]} .bin should be deleted after unlink"
+            assert not await index_storage._chunks.exists(  # noqa: SLF001
+                f"{hash_to_path_stem(chunk_hash)}.ref"
+            ), f"Chunk {chunk_hash[:8]} .ref should be deleted after unlink"
+
+        # Verify FileMeta removed from index
+        assert await index_storage._get_file_meta(path) is None  # noqa: SLF001
 
     async def test_copy_increfs_chunks(self, index_storage: IndexStorage):
         data = b"C" * BLOCK_SIZE
@@ -96,9 +133,37 @@ class TestRefCounting:
         dst = f"test-refc-copy-dst-{uid()}"
         try:
             await index_storage.upload_bytes(data, src)
+
+            src_meta = await index_storage._get_file_meta(src)  # noqa: SLF001
+            assert src_meta is not None
+            refs_before: dict[str, set[str]] = {}
+            for h in src_meta.chunks:
+                r = await index_storage._chunk_load_refs(h)  # noqa: SLF001
+                refs_before[h] = r or set()
+
             await index_storage.copy(src, dst)
             assert await index_storage.exists(src)
             assert await index_storage.exists(dst)
+
+            dst_meta = await index_storage._get_file_meta(dst)  # noqa: SLF001
+            assert dst_meta is not None
+            assert dst_meta.chunks == src_meta.chunks, "Copy must preserve chunk hash list"
+
+            # Verify incref: src + dst both in ref files, count increased by 1
+            for chunk_hash in src_meta.chunks:
+                assert await index_storage._chunks.exists(  # noqa: SLF001
+                    f"{hash_to_path_stem(chunk_hash)}.bin"
+                ), f"Chunk {chunk_hash[:8]} .bin must exist after copy"
+                refs = await index_storage._chunk_load_refs(chunk_hash)  # noqa: SLF001
+                assert refs is not None, f"Chunk {chunk_hash[:8]} .ref must exist"
+                abs_src = f"/{src}"
+                abs_dst = f"/{dst}"
+                assert abs_src in refs, f"src path must remain in chunk {chunk_hash[:8]} refs"
+                assert abs_dst in refs, f"dst path must be added to chunk {chunk_hash[:8]} refs"
+                assert len(refs) == len(refs_before[chunk_hash]) + 1, (
+                    f"Chunk {chunk_hash[:8]} ref count should increase by 1 after copy"
+                )
+
             assert await index_storage.download_bytes(src) == data
             assert await index_storage.download_bytes(dst) == data
         finally:
@@ -111,9 +176,37 @@ class TestRefCounting:
         dst = f"test-refc-move-dst-{uid()}"
         try:
             await index_storage.upload_bytes(data, src)
+
+            src_meta = await index_storage._get_file_meta(src)  # noqa: SLF001
+            assert src_meta is not None
+            refs_before: dict[str, set[str]] = {}
+            for h in src_meta.chunks:
+                r = await index_storage._chunk_load_refs(h)  # noqa: SLF001
+                refs_before[h] = r or set()
+
             await index_storage.move(src, dst)
             assert not await index_storage.exists(src)
             assert await index_storage.exists(dst)
+
+            dst_meta = await index_storage._get_file_meta(dst)  # noqa: SLF001
+            assert dst_meta is not None
+            assert dst_meta.chunks == src_meta.chunks, "Move must preserve chunk hash list"
+
+            # Verify transref: src removed, dst added, count unchanged
+            abs_src = f"/{src}"
+            abs_dst = f"/{dst}"
+            for chunk_hash in src_meta.chunks:
+                assert await index_storage._chunks.exists(  # noqa: SLF001
+                    f"{hash_to_path_stem(chunk_hash)}.bin"
+                ), f"Chunk {chunk_hash[:8]} .bin must exist after move"
+                refs = await index_storage._chunk_load_refs(chunk_hash)  # noqa: SLF001
+                assert refs is not None, f"Chunk {chunk_hash[:8]} .ref must exist"
+                assert abs_src not in refs, f"src path must be removed from chunk {chunk_hash[:8]} refs"
+                assert abs_dst in refs, f"dst path must be added to chunk {chunk_hash[:8]} refs"
+                assert len(refs) == len(refs_before[chunk_hash]), (
+                    f"Chunk {chunk_hash[:8]} ref count unchanged after move (transfer, not create+destroy)"
+                )
+
             assert await index_storage.download_bytes(dst) == data
         finally:
             await index_storage.delete(dst)
@@ -132,8 +225,28 @@ class TestDirectoryOperations:
             await index_storage.upload_bytes(b"y", f"{base}/f2.txt")
             assert await index_storage.is_dir(base)
 
+            # Collect chunk hashes before deletion
+            all_chunks: list[str] = []
+            for fname in ("f1.txt", "f2.txt"):
+                meta = await index_storage._get_file_meta(f"{base}/{fname}")  # noqa: SLF001
+                assert meta is not None
+                all_chunks.extend(meta.chunks)
+
             await index_storage.rmtree(base)
             assert not await index_storage.exists(base)
+
+            # Verify chunk .bin + .ref are cleaned up
+            for chunk_hash in set(all_chunks):
+                assert not await index_storage._chunks.exists(  # noqa: SLF001
+                    f"{hash_to_path_stem(chunk_hash)}.bin"
+                ), f"Chunk {chunk_hash[:8]} .bin not cleaned up by rmtree"
+                assert not await index_storage._chunks.exists(  # noqa: SLF001
+                    f"{hash_to_path_stem(chunk_hash)}.ref"
+                ), f"Chunk {chunk_hash[:8]} .ref not cleaned up by rmtree"
+
+            # Verify individual file metas removed from index
+            assert await index_storage._get_file_meta(f"{base}/f1.txt") is None  # noqa: SLF001
+            assert await index_storage._get_file_meta(f"{base}/f2.txt") is None  # noqa: SLF001
         finally:
             with suppress_exc():
                 await index_storage.rmtree(base)
@@ -150,6 +263,23 @@ class TestDirectoryOperations:
             assert await index_storage.is_dir(dst)
             downloaded = await index_storage.download_bytes(f"{dst}/file.txt")
             assert downloaded == data
+
+            # Verify chunk refs are shared between src and dst
+            src_file = f"{src}/file.txt"
+            dst_file = f"{dst}/file.txt"
+            meta_src = await index_storage._get_file_meta(src_file)  # noqa: SLF001
+            meta_dst = await index_storage._get_file_meta(dst_file)  # noqa: SLF001
+            assert meta_src is not None
+            assert meta_dst is not None
+            assert meta_src.chunks == meta_dst.chunks, "Source and destination must share chunk hashes after copytree"
+
+            for chunk_hash in meta_src.chunks:
+                refs = await index_storage._chunk_load_refs(chunk_hash)  # noqa: SLF001
+                assert refs is not None, f"Chunk {chunk_hash[:8]} .ref must exist"
+                abs_src_file = f"/{src_file}"
+                abs_dst_file = f"/{dst_file}"
+                assert abs_src_file in refs, f"src must retain ref to chunk {chunk_hash[:8]}"
+                assert abs_dst_file in refs, f"dst must have ref to chunk {chunk_hash[:8]}"
         finally:
             with suppress_exc():
                 await index_storage.rmtree(src)
@@ -166,8 +296,8 @@ class TestOverwriteRefCleanup:
         #   B 被清理
         #   C 已创建
         block_a = b"A" * BLOCK_SIZE
-        old_data = block_a + b"B" * BLOCK_SIZE   # A + B
-        new_data = block_a + b"C" * BLOCK_SIZE   # A + C
+        old_data = block_a + b"B" * BLOCK_SIZE  # A + B
+        new_data = block_a + b"C" * BLOCK_SIZE  # A + C
         path = f"test-ow-clean-{uid()}"
         try:
             await index_storage.upload_bytes(old_data, path)
@@ -181,21 +311,22 @@ class TestOverwriteRefCleanup:
             hash_b = _hash_block(b"B" * BLOCK_SIZE)
             hash_c = _hash_block(b"C" * BLOCK_SIZE)
 
+            chunks = index_storage._chunks  # noqa: SLF001
             # 共享块 A 仍然存在
-            assert await index_storage._chunks.exists(f"{hash_to_path_stem(hash_a)}.bin")
-            assert await index_storage._chunks.exists(f"{hash_to_path_stem(hash_a)}.ref")
+            assert await chunks.exists(f"{hash_to_path_stem(hash_a)}.bin")
+            assert await chunks.exists(f"{hash_to_path_stem(hash_a)}.ref")
 
             # 旧块 B 应该被清理
-            assert not await index_storage._chunks.exists(
-                f"{hash_to_path_stem(hash_b)}.bin"
-            ), f"Old chunk B {hash_b[:8]} .bin not cleaned up"
-            assert not await index_storage._chunks.exists(
-                f"{hash_to_path_stem(hash_b)}.ref"
-            ), f"Old chunk B {hash_b[:8]} .ref not cleaned up"
+            assert not await chunks.exists(f"{hash_to_path_stem(hash_b)}.bin"), (
+                f"Old chunk B {hash_b[:8]} .bin not cleaned up"
+            )
+            assert not await chunks.exists(f"{hash_to_path_stem(hash_b)}.ref"), (
+                f"Old chunk B {hash_b[:8]} .ref not cleaned up"
+            )
 
             # 新块 C 已创建
-            assert await index_storage._chunks.exists(f"{hash_to_path_stem(hash_c)}.bin")
-            assert await index_storage._chunks.exists(f"{hash_to_path_stem(hash_c)}.ref")
+            assert await chunks.exists(f"{hash_to_path_stem(hash_c)}.bin")
+            assert await chunks.exists(f"{hash_to_path_stem(hash_c)}.ref")
 
             await index_storage.delete(path)
         finally:
@@ -206,6 +337,7 @@ class TestOverwriteRefCleanup:
 def _hash_block(data: bytes) -> str:
     """Return the SHA-256 hex digest of a single block."""
     import hashlib
+
     return hashlib.sha256(data).hexdigest()
 
 
@@ -216,6 +348,106 @@ def hash_to_path_stem(chunk_hash: str) -> str:
 
 def suppress_exc() -> AbstractContextManager[None]:
     """Return a contextlib.suppress for all exceptions."""
-    import contextlib
-
     return contextlib.suppress(Exception)
+
+
+class TestDownloadStreamOffset:
+    """download_stream with offset > 0."""
+
+    async def test_offset_middle(self, index_storage: IndexStorage):
+        data = b"0123456789" * 100  # 1000 bytes
+        path = f"test-dl-offset-{uid()}"
+        try:
+            await index_storage.upload_bytes(data, path)
+            chunks = [chunk async for chunk in index_storage.download_stream(path, offset=500)]
+            result = b"".join(chunks)
+            assert result == data[500:]
+        finally:
+            await index_storage.delete(path)
+
+    async def test_offset_beyond_file(self, index_storage: IndexStorage):
+        data = b"short"
+        path = f"test-dl-offbeyond-{uid()}"
+        try:
+            await index_storage.upload_bytes(data, path)
+            chunks = [chunk async for chunk in index_storage.download_stream(path, offset=100)]
+            assert b"".join(chunks) == b""
+        finally:
+            await index_storage.delete(path)
+
+    async def test_offset_at_chunk_boundary(self, index_storage: IndexStorage):
+        # upload 2+ blocks so offset falls at exact chunk boundary
+        block_a = b"A" * BLOCK_SIZE
+        block_b = b"B" * BLOCK_SIZE
+        data = block_a + block_b
+        path = f"test-dl-offchunk-{uid()}"
+        try:
+            await index_storage.upload_bytes(data, path)
+            chunks = [chunk async for chunk in index_storage.download_stream(path, offset=BLOCK_SIZE)]
+            result = b"".join(chunks)
+            assert result == block_b
+        finally:
+            await index_storage.delete(path)
+
+
+class TestSkipLocking:
+    """IndexStorage with skip_locking=True."""
+
+    async def test_upload_without_locking(self):
+        async with (
+            MemoryStorage("/") as idx,
+            MemoryStorage("/") as chunks,
+            IndexStorage(idx, chunks, block_size=BLOCK_SIZE, skip_locking=True) as s,
+        ):
+            path = f"test-nolock-{uid()}"
+            try:
+                await s.upload_bytes(b"hello", path)
+                assert await s.download_bytes(path) == b"hello"
+            finally:
+                await s.delete(path)
+
+
+class TestListDirectory:
+    """list_() method."""
+
+    async def test_list_mixed_entries(self, index_storage: IndexStorage):
+        base = f"test-idx-list-{uid()}"
+        try:
+            await index_storage.mkdir(base)
+            await index_storage.mkdir(f"{base}/sub", parents=True)
+            await index_storage.upload_bytes(b"x", f"{base}/a.txt")
+            await index_storage.upload_bytes(b"y", f"{base}/b.txt")
+
+            entries = await index_storage.list_(base)
+            names = {e.name for e in entries}
+            assert "sub" in names
+            assert "a.txt" in names
+            assert "b.txt" in names
+            assert len(entries) == 3
+        finally:
+            await index_storage.rmtree(base)
+
+
+class TestCopyTreeNested:
+    """copytree with nested subdirectories (exercises the directory creation loop)."""
+
+    async def test_copytree_nested_dirs(self, index_storage: IndexStorage):
+        src = f"test-idx-cpnest-src-{uid()}"
+        dst = f"test-idx-cpnest-dst-{uid()}"
+        try:
+            await index_storage.mkdir(f"{src}/a/b", parents=True)
+            await index_storage.upload_bytes(b"x", f"{src}/f1.txt")
+            await index_storage.upload_bytes(b"y", f"{src}/a/f2.txt")
+            await index_storage.upload_bytes(b"z", f"{src}/a/b/f3.txt")
+
+            await index_storage.copytree(src, dst)
+            assert await index_storage.exists(dst)
+            assert await index_storage.exists(f"{dst}/f1.txt")
+            assert await index_storage.exists(f"{dst}/a/f2.txt")
+            assert await index_storage.exists(f"{dst}/a/b/f3.txt")
+            assert await index_storage.download_bytes(f"{dst}/a/b/f3.txt") == b"z"
+        finally:
+            with contextlib.suppress(Exception):
+                await index_storage.rmtree(src)
+            with contextlib.suppress(Exception):
+                await index_storage.rmtree(dst)
