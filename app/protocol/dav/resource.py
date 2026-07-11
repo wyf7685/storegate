@@ -72,21 +72,23 @@ class ResourceWriter:
         self,
         upload_fn: Callable[[AsyncIterable[bytes]], Awaitable[object]],
     ) -> None:
-        self._send, self._recv = anyio.create_memory_object_stream[bytes](max_buffer_size=2)
+        self._send, self._recv = anyio.create_memory_object_stream[bytes](2)
         self._closed = False
         self._upload_fn = upload_fn
         self._token = current_event_loop_token.get()
         self._scope = None
         self._scope_lock = threading.Lock()
-        self._worker_thread: threading.Thread = threading.Thread(
+        self._worker_thread = threading.Thread(
             target=self._run,
             name="ResourceWriterWorker",
             daemon=True,
         )
+        self._worker_ready = threading.Event()
 
     def write(self, data: bytes) -> None:
         if self._closed:
             raise ValueError("I/O operation on closed file.")
+        self._worker_ready.wait()
         run_async(self._send.send, data)
 
     def close(self) -> None:
@@ -107,6 +109,7 @@ class ResourceWriter:
             with anyio.CancelScope() as scope, self._recv:
                 with self._scope_lock:
                     self._scope = scope
+                self._worker_ready.set()
                 await self._upload_fn(self._recv)
         finally:
             with self._scope_lock:
@@ -114,6 +117,7 @@ class ResourceWriter:
 
     def start(self) -> None:
         self._worker_thread.start()
+        self._worker_ready.wait()
 
     def abort(self) -> None:
         with self._scope_lock:
