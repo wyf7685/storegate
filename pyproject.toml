@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "a2wsgi>=1.10.10",
-    "aiosqlite>=0.22.1",
     "anyio>=4.14.1",
     "ayafileio>=1.4.7",
     "expiringdictx>=1.1.0",
