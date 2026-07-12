@@ -10,8 +10,6 @@ from .abstract import AbstractStorage
 
 def resolve_dot_notation(obj_str: str, prefix: str) -> Any:
     modulename, _, cls = obj_str.partition(":")
-    # if prefix and modulename.startswith("~"):
-    #     modulename = prefix + modulename[1:]
     if prefix:
         if modulename.startswith("~."):
             modulename = prefix + modulename[1:]
