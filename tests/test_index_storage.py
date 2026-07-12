@@ -489,9 +489,7 @@ class TestRollback:
     # copy() — incref failure → rollback_chunks
     # ------------------------------------------------------------------
 
-    async def test_copy_incref_failure_rolls_back(
-        self, index_storage: IndexStorage, mocker: MockerFixture
-    ):
+    async def test_copy_incref_failure_rolls_back(self, index_storage: IndexStorage, mocker: MockerFixture):
         """When _chunk_incref raises during copy, rollback decrefs any incref'd chunks."""
         s = index_storage
         data = b"C" * (BLOCK_SIZE * 2)  # 32 KB → 2 blocks
@@ -538,9 +536,7 @@ class TestRollback:
     # copy() — meta write failure → rollback_chunks
     # ------------------------------------------------------------------
 
-    async def test_copy_meta_failure_rolls_back(
-        self, index_storage: IndexStorage, mocker: MockerFixture
-    ):
+    async def test_copy_meta_failure_rolls_back(self, index_storage: IndexStorage, mocker: MockerFixture):
         """When meta write fails after incref, all incref'd chunks are rolled back."""
         s = index_storage
         data = b"D" * BLOCK_SIZE
@@ -582,9 +578,7 @@ class TestRollback:
     # move() — transref failure → rollback_chunks
     # ------------------------------------------------------------------
 
-    async def test_move_transref_failure_rolls_back(
-        self, index_storage: IndexStorage, mocker: MockerFixture
-    ):
+    async def test_move_transref_failure_rolls_back(self, index_storage: IndexStorage, mocker: MockerFixture):
         """When _chunk_transref raises during move, rollback reverse-transrefs."""
         s = index_storage
         data = b"M" * BLOCK_SIZE
@@ -624,9 +618,7 @@ class TestRollback:
     # move() — meta write failure → rollback_chunks (reverse transref)
     # ------------------------------------------------------------------
 
-    async def test_move_meta_failure_rolls_back(
-        self, index_storage: IndexStorage, mocker: MockerFixture
-    ):
+    async def test_move_meta_failure_rolls_back(self, index_storage: IndexStorage, mocker: MockerFixture):
         """When meta write fails after transref, chunks are reverse-transref'd back to src."""
         s = index_storage
         data = b"N" * BLOCK_SIZE
@@ -667,9 +659,7 @@ class TestRollback:
     # copytree — overwrite cleans up old chunks
     # ------------------------------------------------------------------
 
-    async def test_copytree_overwrite_cleans_old_chunks(
-        self, index_storage: IndexStorage
-    ):
+    async def test_copytree_overwrite_cleans_old_chunks(self, index_storage: IndexStorage):
         """copytree with overwrite decrefs old chunks in the destination."""
         s = index_storage
         old_data = b"OLD" * 4096  # 12 KB fits in one block
@@ -722,9 +712,7 @@ class TestRollback:
     # movetree — overwrite cleans up old chunks
     # ------------------------------------------------------------------
 
-    async def test_movetree_overwrite_cleans_old_chunks(
-        self, index_storage: IndexStorage
-    ):
+    async def test_movetree_overwrite_cleans_old_chunks(self, index_storage: IndexStorage):
         """movetree with overwrite decrefs old chunks and transfers refs."""
         s = index_storage
         old_data = b"OLD!" * 4096  # 16 KB

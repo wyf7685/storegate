@@ -33,13 +33,18 @@ def uid() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _param_of(impl: str):  # noqa: ANN202
+    """Return a pytest.param for the given storage implementation."""
+    return pytest.param(impl, marks=getattr(pytest.mark, impl), id=impl)
+
+
 @pytest.fixture(
     params=[
-        pytest.param("memory", id="memory"),
-        pytest.param("local", id="local"),
-        pytest.param("cos", id="cos"),
-        pytest.param("cached", id="cached"),
-        pytest.param("index", id="index"),
+        _param_of("memory"),
+        _param_of("local"),
+        _param_of("cos"),
+        _param_of("cached"),
+        _param_of("index"),
     ]
 )
 async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStorage]:
@@ -81,9 +86,9 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
             from app.storage.index import IndexStorage
             from app.storage.memory import MemoryStorage
 
-            async with (
-                MemoryStorage("/") as index_backend,
-                MemoryStorage("/") as chunks_backend,
-                IndexStorage(index_backend, chunks_backend, block_size=16 * 1024) as s,
-            ):
+            async with IndexStorage(
+                index=MemoryStorage("/"),
+                chunks=MemoryStorage("/"),
+                block_size=16 * 1024,
+            ) as s:
                 yield s

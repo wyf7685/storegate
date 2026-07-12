@@ -157,8 +157,7 @@ class TestStat:
             info_rel = await storage.stat(path)
             info_abs = await storage.stat(f"/{path}")
             assert info_rel.path == info_abs.path, (
-                f"Relative input gave {info_rel.path!r}, "
-                f"absolute gave {info_abs.path!r}"
+                f"Relative input gave {info_rel.path!r}, absolute gave {info_abs.path!r}"
             )
             assert info_rel.size == info_abs.size
         finally:
@@ -349,8 +348,7 @@ class TestIterdir:
 
             async for entry in storage.iterdir(base):
                 assert entry.path.startswith("/"), (
-                    f"Expected absolute path, got {entry.path!r} "
-                    f"for entry {entry.name!r}"
+                    f"Expected absolute path, got {entry.path!r} for entry {entry.name!r}"
                 )
         finally:
             await storage.rmtree(base)
@@ -405,17 +403,11 @@ class TestWalk:
             await storage.upload_bytes(b"x", f"{base}/f.txt")
 
             async for root_path, dirs, files in storage.walk(base):
-                assert root_path.startswith("/"), (
-                    f"Walk root path must be absolute, got {root_path!r}"
-                )
+                assert root_path.startswith("/"), f"Walk root path must be absolute, got {root_path!r}"
                 for d in dirs:
-                    assert d.path.startswith("/"), (
-                        f"Dir path must be absolute, got {d.path!r}"
-                    )
+                    assert d.path.startswith("/"), f"Dir path must be absolute, got {d.path!r}"
                 for f in files:
-                    assert f.path.startswith("/"), (
-                        f"File path must be absolute, got {f.path!r}"
-                    )
+                    assert f.path.startswith("/"), f"File path must be absolute, got {f.path!r}"
         finally:
             await storage.rmtree(base)
 
@@ -524,10 +516,7 @@ class TestList:
 
             result = await storage.list_(base)
             for e in result:
-                assert e.path.startswith("/"), (
-                    f"Expected absolute path, got {e.path!r} "
-                    f"for entry {e.name!r}"
-                )
+                assert e.path.startswith("/"), f"Expected absolute path, got {e.path!r} for entry {e.name!r}"
         finally:
             await storage.rmtree(base)
 

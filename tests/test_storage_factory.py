@@ -12,6 +12,7 @@ from app.storage.memory import MemoryStorage
 # Importable helpers — referenced by ObjectSpec factory strings in tests
 # ---------------------------------------------------------------------------
 
+
 def bundle(storage: AbstractStorage, payload: dict[str, list[int]], records: list[dict[str, str]]) -> tuple:
     """Return args unchanged; used to verify nested ObjectSpec + container parsing."""
     return storage, payload, records
@@ -33,6 +34,7 @@ NOT_CALLABLE = 123
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestObjectSpecResolve:
     def test_nested_storage_and_containers(self):
