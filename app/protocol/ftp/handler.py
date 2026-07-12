@@ -713,8 +713,6 @@ class FTPHandler:
             " MDTM",
             " UTF8",
             " PASV",
-            " EPRT",
-            " EPSV",
         ]
         lines = "\r\n".join(f" {f}" for f in features)
         return f"{R.SYSTEM_STATUS.value}-Features\r\n{lines}\r\n{R.SYSTEM_STATUS.value} End"
