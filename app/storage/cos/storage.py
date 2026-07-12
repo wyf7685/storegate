@@ -279,7 +279,17 @@ class CosStorage(AbstractStorage):
         dst_key = self._remote_path_to_key(dst)
         self.log.info(f"Move: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y>")
         await self.copy(src, dst)
-        await self.unlink(src)
+        try:
+            await self._ensure_client().delete_object(key=src_key)
+        except Exception as exc:
+            self.log.error(  # noqa: TRY400
+                f"Failed to delete source after move: <y>{escape_tag(src_key)}</y> — <r>{escape_tag(repr(exc))}</r>"
+            )
+            try:
+                await self._ensure_client().delete_object(key=dst_key)
+            except Exception:
+                self.log.exception(f"Failed to rollback destination after failed move: <y>{escape_tag(dst_key)}</y>")
+            raise OSError(f"Failed to delete source after move: {src}") from exc
 
     @override
     async def copy(
@@ -429,23 +439,58 @@ class CosStorage(AbstractStorage):
             all_dst_dirs.add(dst.joinpath(src_file.relative_to(src)).parent)
 
         dir_created = datetime.now(UTC)
-        for d in sorted(all_dst_dirs, key=lambda p: len(p.parts)):
-            if dir_key := self._dir_key(d):
-                info = FileInfo(
-                    path=d.as_posix(),
-                    name=d.name,
-                    is_dir=True,
-                    size=0,
-                    modified=dir_created,
-                    created=dir_created,
+        dir_create_done: set[str] = set()
+        try:
+            for d in sorted(all_dst_dirs, key=lambda p: len(p.parts)):
+                if dir_key := self._dir_key(d):
+                    info = FileInfo(
+                        path=d.as_posix(),
+                        name=d.name,
+                        is_dir=True,
+                        size=0,
+                        modified=dir_created,
+                        created=dir_created,
+                    )
+                    await client.put_object(key=dir_key, data=serialize_file_info(info))
+                    dir_create_done.add(dir_key)
+        except Exception as exc:
+            self.log.error(  # noqa: TRY400
+                f"Failed to create directory: <y>{escape_tag(d)}</y> — <r>{escape_tag(repr(exc))}</r>"
+            )
+            # 回滚已创建的目录标记对象
+            try:
+                with anyio.CancelScope(shield=True):
+                    await client.delete_objects(dir_create_done)
+            except Exception:
+                self.log.exception(
+                    f"Failed to rollback created directories: <y>{escape_tag(repr(dir_create_done))}</y>"
                 )
-                await client.put_object(key=dir_key, data=serialize_file_info(info))
+            raise OSError(f"Failed to create directory: {d}") from exc
 
         # 并发复制所有文件
-        async with anyio.create_task_group() as tg:
-            for src_file in file_paths:
-                dst_file = dst.joinpath(src_file.relative_to(src))
-                tg.start_soon(self.copy, src_file, dst_file)
+        started_dst_keys: set[str] = set()
+        try:
+            async with anyio.create_task_group() as tg:
+                for src_file in file_paths:
+                    dst_file = dst.joinpath(src_file.relative_to(src))
+                    tg.start_soon(self.copy, src_file, dst_file)
+                    started_dst_keys.add(self._remote_path_to_key(dst_file))
+                    await anyio.lowlevel.checkpoint()
+        except Exception as exc:
+            self.log.error(  # noqa: TRY400
+                f"Failed to copy tree: <y>{escape_tag(src)}</y> → <y>{escape_tag(dst)}</y>"
+                f" — <r>{escape_tag(repr(exc))}</r>"
+            )
+            # 回滚已复制的文件
+            try:
+                with anyio.CancelScope(shield=True):
+                    await client.delete_objects(started_dst_keys | dir_create_done)
+            except Exception:
+                self.log.exception(
+                    f"Failed to rollback copied files and created directories: "
+                    f"<y>{escape_tag(repr(started_dst_keys | dir_create_done))}</y>"
+                )
+            raise OSError(f"Failed to copy tree: {src} → {dst}") from exc
 
     @override
     async def exists(self, path: PathLike) -> bool:
@@ -617,8 +662,13 @@ class CosStorage(AbstractStorage):
             f"Multipart copy: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y> "
             f"(<g>{src_size}</g> bytes in <g>{num_parts}</g> parts)"
         )
-
-        upload_id = await client.create_multipart_upload(dst_key)
+        try:
+            upload_id = await client.create_multipart_upload(dst_key)
+        except Exception as exc:
+            self.log.error(  # noqa: TRY400
+                f"Failed to create multipart upload: <y>{escape_tag(dst_key)}</y> — <r>{escape_tag(repr(exc))}</r>"
+            )
+            raise OSError(f"Failed to create multipart upload: {dst_key}") from exc
 
         try:
             parts: list[MultipartUploadPart] = []
@@ -641,10 +691,13 @@ class CosStorage(AbstractStorage):
 
             await client.complete_multipart_upload(dst_key, upload_id, parts)
             self.log.debug(f"Multipart copy complete: <y>{escape_tag(dst_key)}</y>")
-        except Exception:
-            with contextlib.suppress(Exception):
-                await client.abort_multipart_upload(dst_key, upload_id)
-            raise
+        except Exception as exc:
+            try:
+                with anyio.CancelScope(shield=True):
+                    await client.abort_multipart_upload(dst_key, upload_id)
+            except Exception:
+                self.log.exception(f"Failed to abort multipart upload after failed copy: <y>{escape_tag(dst_key)}</y>")
+            raise OSError(f"Failed to copy object: {src_key} → {dst_key}") from exc
 
     @override
     async def _is_dir_empty(self, path: PathLike) -> bool:
