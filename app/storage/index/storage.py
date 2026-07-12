@@ -11,7 +11,7 @@ from typing import final, override
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.log import escape_tag
 
@@ -184,7 +184,10 @@ class IndexStorage(AbstractStorage):
             return None
         if not meta_bytes:
             return None
-        return FileMeta.model_validate_json(meta_bytes.decode())
+        try:
+            return FileMeta.model_validate_json(meta_bytes.decode())
+        except ValidationError as e:
+            raise OSError(f"Corrupted file metadata for {path}") from e
 
     async def _chunk_load_refs(self, chunk_hash: str) -> set[str] | None:
         ref_path = hash_to_path(chunk_hash, "ref")
@@ -945,7 +948,10 @@ class IndexStorage(AbstractStorage):
         if stat.is_dir:
             return stat
         meta_bytes = await self._index.download_bytes(path)
-        meta = FileMeta.model_validate_json(meta_bytes.decode())
+        try:
+            meta = FileMeta.model_validate_json(meta_bytes.decode())
+        except ValidationError as e:
+            raise OSError(f"Corrupted file metadata for {path}") from e
         return meta.info
 
     @override

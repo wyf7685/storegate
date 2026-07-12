@@ -1,6 +1,6 @@
 import contextlib
 import itertools
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import final, override
@@ -10,10 +10,11 @@ import anyio.lowlevel
 
 from app.log import escape_tag
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
-from app.utils import coalesce_chunks
+from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
 from .cos_client import (
     AsyncCosClient,
+    CosClientError,
     CosConfig,
     CosHttpStatusError,
     ListObjectsDir,
@@ -27,6 +28,19 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 # Files larger than this are copied via multipart upload to stay within
 # the PUT Object - Copy 5 GiB limit and to allow parallel part copies.
 COPY_MULTIPART_THRESHOLD = 4 * 1024 * 1024  # 4 MiB
+
+
+translator = ExceptionTranslator(
+    bypass=OSError,
+    catch=CosClientError,
+    default=OSError,
+)
+
+
+@translator.handles(CosHttpStatusError)
+def _(exc_group: ExceptionGroup[CosHttpStatusError], msg: str) -> OSError:
+    first = next(flatten_exception_group(exc_group))
+    return {404: FileNotFoundError, 403: PermissionError}.get(first.status_code, OSError)(f"{msg}: {first}")
 
 
 @final
@@ -95,6 +109,7 @@ class CosStorage(AbstractStorage):
         return key + "/"
 
     @override
+    @translator.wrap("Failed to upload stream to {remote_path} (overwrite={overwrite})")
     async def upload_stream(
         self,
         stream: AsyncIterable[BytesLike],
@@ -142,12 +157,13 @@ class CosStorage(AbstractStorage):
             await task.upload_from(chunk_iter)
 
     @override
+    @translator.wrap_agen("Failed to download stream from {remote_path} (offset={offset})")
     async def download_stream(
         self,
         remote_path: PathLike,
         *,
         offset: int = 0,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes]:
         client = self._ensure_client()
         key = self._remote_path_to_key(remote_path)
         head = await client.head_object(key=key)
@@ -172,6 +188,7 @@ class CosStorage(AbstractStorage):
             yield chunk
 
     @override
+    @translator.wrap("Failed to unlink {path} (missing_ok={missing_ok})")
     async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
@@ -191,6 +208,7 @@ class CosStorage(AbstractStorage):
             raise FileNotFoundError(f"File not found: {path}")
 
     @override
+    @translator.wrap("Failed to remove directory {path}")
     async def rmdir(self, path: PathLike) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
@@ -213,6 +231,7 @@ class CosStorage(AbstractStorage):
         # 3. 不存在：静默成功
 
     @override
+    @translator.wrap("Failed to delete {path}")
     async def delete(self, path: PathLike) -> None:
         """Delete a file or an empty directory.
 
@@ -243,6 +262,7 @@ class CosStorage(AbstractStorage):
         # 3. 不存在：静默成功
 
     @override
+    @translator.wrap("Failed to delete objects: {paths}")
     async def delete_many(self, *paths: PathLike) -> None:
         client = self._ensure_client()
         objects_to_delete: list[str] = []
@@ -292,6 +312,7 @@ class CosStorage(AbstractStorage):
             raise OSError(f"Failed to delete source after move: {src}") from exc
 
     @override
+    @translator.wrap("Failed to copy {src} → {dst}")
     async def copy(
         self,
         src: PathLike,
@@ -313,6 +334,7 @@ class CosStorage(AbstractStorage):
             await self._copy_multipart(src_key, dst_key, head.content_length)
 
     @override
+    @translator.wrap("Failed to create directory {path} (parents={parents}, exist_ok={exist_ok})")
     async def mkdir(
         self,
         path: PathLike,
@@ -366,6 +388,7 @@ class CosStorage(AbstractStorage):
         self.log.info(f"MkDir: <y>{escape_tag(key)}</y>")
 
     @override
+    @translator.wrap("Failed to remove directory tree {path}")
     async def rmtree(self, path: PathLike) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
@@ -493,6 +516,7 @@ class CosStorage(AbstractStorage):
             raise OSError(f"Failed to copy tree: {src} → {dst}") from exc
 
     @override
+    @translator.wrap("Failed to check existence of {path}")
     async def exists(self, path: PathLike) -> bool:
         key = self._remote_path_to_key(path)
         if key == "":
@@ -512,12 +536,14 @@ class CosStorage(AbstractStorage):
         return False
 
     @override
+    @translator.wrap("Failed to check if path is a file: {path}")
     async def is_file(self, path: PathLike) -> bool:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
         return await client.head_object(key=key) is not None
 
     @override
+    @translator.wrap("Failed to check if path is a directory: {path}")
     async def is_dir(self, path: PathLike) -> bool:
         key = self._remote_path_to_key(path)
         if key == "":
@@ -529,6 +555,7 @@ class CosStorage(AbstractStorage):
         return await self._ensure_client().head_object(key=dir_key) is not None
 
     @override
+    @translator.wrap("Failed to stat {path}")
     async def stat(self, path: PathLike) -> FileInfo:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
@@ -560,11 +587,13 @@ class CosStorage(AbstractStorage):
         raise FileNotFoundError(f"Object not found: {path}")
 
     @override
+    @translator.wrap_agen("Failed to iterate directory {path}")
     def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
         key = self._remote_path_to_key(path)
         return self._iterdir(key)
 
     @override
+    @translator.wrap_agen("Failed to walk directory {path}")
     def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         key = self._remote_path_to_key(path)
         return self._walk(key)
@@ -613,6 +642,7 @@ class CosStorage(AbstractStorage):
                 yield sp, sd, sf
 
     @override
+    @translator.wrap("Failed to list directory {path}")
     async def list_(self, path: PathLike) -> list[FileInfo]:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
