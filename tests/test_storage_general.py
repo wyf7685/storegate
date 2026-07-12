@@ -1,6 +1,7 @@
 """General storage interface tests — run against all storage backends."""
 
 import contextlib
+from pathlib import PurePosixPath
 
 import pytest
 
@@ -90,6 +91,10 @@ class TestIsDir:
         assert await storage.is_dir("/")
         assert await storage.is_dir("")
 
+    async def test_dot(self, storage: AbstractStorage):
+        """Dot is treated as root directory."""
+        assert await storage.is_dir(".")
+
     async def test_nonexistent(self, storage: AbstractStorage):
         assert not await storage.is_dir(f"nonexistent-{uid()}")
 
@@ -134,6 +139,44 @@ class TestStat:
         with pytest.raises(FileNotFoundError):
             await storage.stat(f"nonexistent-{uid()}")
 
+    async def test_path_is_absolute(self, storage: AbstractStorage):
+        """stat() returns FileInfo.path as an absolute POSIX path."""
+        path = f"test-stat-abs-{uid()}"
+        try:
+            await storage.upload_bytes(b"hello", path)
+            info = await storage.stat(path)
+            assert info.path.startswith("/"), f"Expected absolute path, got {info.path!r}"
+        finally:
+            await storage.delete(path)
+
+    async def test_path_relative_absolute_equivalent(self, storage: AbstractStorage):
+        """stat() returns the same FileInfo.path for relative and absolute input."""
+        path = f"test-stat-equiv-{uid()}"
+        try:
+            await storage.upload_bytes(b"hello", path)
+            info_rel = await storage.stat(path)
+            info_abs = await storage.stat(f"/{path}")
+            assert info_rel.path == info_abs.path, (
+                f"Relative input gave {info_rel.path!r}, "
+                f"absolute gave {info_abs.path!r}"
+            )
+            assert info_rel.size == info_abs.size
+        finally:
+            await storage.delete(path)
+
+    async def test_with_pure_posix_path(self, storage: AbstractStorage):
+        """stat() accepts PurePosixPath as input."""
+        from pathlib import PurePosixPath
+
+        path = f"test-stat-ppp-{uid()}"
+        try:
+            await storage.upload_bytes(b"data", path)
+            info = await storage.stat(PurePosixPath(path))
+            assert info.path.startswith("/")
+            assert info.size == 4
+        finally:
+            await storage.delete(path)
+
 
 class TestExists:
     """exists() tests."""
@@ -157,6 +200,10 @@ class TestExists:
     async def test_root(self, storage: AbstractStorage):
         assert await storage.exists("/")
         assert await storage.exists("")
+
+    async def test_dot(self, storage: AbstractStorage):
+        """Dot is treated as root directory."""
+        assert await storage.exists(".")
 
     async def test_nonexistent(self, storage: AbstractStorage):
         assert not await storage.exists(f"nonexistent-{uid()}")
@@ -293,6 +340,32 @@ class TestIterdir:
         finally:
             await storage.rmtree(base)
 
+    async def test_child_paths_are_absolute(self, storage: AbstractStorage):
+        """iterdir() returns FileInfo.path as absolute POSIX paths."""
+        base = f"test-itd-abs-{uid()}"
+        try:
+            await storage.mkdir(f"{base}/sub", parents=True)
+            await storage.upload_bytes(b"a", f"{base}/a.txt")
+
+            async for entry in storage.iterdir(base):
+                assert entry.path.startswith("/"), (
+                    f"Expected absolute path, got {entry.path!r} "
+                    f"for entry {entry.name!r}"
+                )
+        finally:
+            await storage.rmtree(base)
+
+    async def test_root_directory(self, storage: AbstractStorage):
+        """iterdir("/") lists root-level entries."""
+        path = f"test-itd-root-{uid()}"
+        try:
+            await storage.upload_bytes(b"x", path)
+            entries = [e async for e in storage.iterdir("/")]
+            names = {e.name for e in entries}
+            assert path in names, f"{path!r} not found in root listing: {names}"
+        finally:
+            await storage.delete(path)
+
 
 class TestWalk:
     """walk() + rmtree round-trip."""
@@ -323,6 +396,46 @@ class TestWalk:
         finally:
             with contextlib.suppress(Exception):
                 await storage.rmtree(base)
+
+    async def test_paths_are_absolute(self, storage: AbstractStorage):
+        """walk() yields absolute paths for root and all child entries."""
+        base = f"test-walk-abs-{uid()}"
+        try:
+            await storage.mkdir(f"{base}/sub", parents=True)
+            await storage.upload_bytes(b"x", f"{base}/f.txt")
+
+            async for root_path, dirs, files in storage.walk(base):
+                assert root_path.startswith("/"), (
+                    f"Walk root path must be absolute, got {root_path!r}"
+                )
+                for d in dirs:
+                    assert d.path.startswith("/"), (
+                        f"Dir path must be absolute, got {d.path!r}"
+                    )
+                for f in files:
+                    assert f.path.startswith("/"), (
+                        f"File path must be absolute, got {f.path!r}"
+                    )
+        finally:
+            await storage.rmtree(base)
+
+    async def test_root_directory(self, storage: AbstractStorage):
+        """walk("/") yields absolute root and lists root-level children."""
+        path = f"test-walk-root-{uid()}"
+        try:
+            await storage.mkdir(path)
+            await storage.upload_bytes(b"x", f"{path}/f.txt")
+
+            found = False
+            async for sp, sd, _sf in storage.walk("/"):
+                assert sp.startswith("/"), f"Root path must be absolute, got {sp!r}"
+                for d in sd:
+                    if d.name == path:
+                        found = True
+                        assert d.is_dir
+            assert found, f"{path!r} not found in root walk"
+        finally:
+            await storage.rmtree(path)
 
 
 class TestUploadStream:
@@ -401,6 +514,22 @@ class TestList:
             assert len(result) == 0
         finally:
             await storage.delete(base)
+
+    async def test_paths_are_absolute(self, storage: AbstractStorage):
+        """list_() returns FileInfo.path as absolute POSIX paths."""
+        base = f"test-list-abs-{uid()}"
+        try:
+            await storage.mkdir(base)
+            await storage.upload_bytes(b"hello", f"{base}/a.txt")
+
+            result = await storage.list_(base)
+            for e in result:
+                assert e.path.startswith("/"), (
+                    f"Expected absolute path, got {e.path!r} "
+                    f"for entry {e.name!r}"
+                )
+        finally:
+            await storage.rmtree(base)
 
 
 class TestMove:
@@ -628,3 +757,37 @@ class TestDownloadStream:
             assert result == b""
         finally:
             await storage.delete(path)
+
+
+class TestNormalizePath:
+    """Unit tests for AbstractStorage.normalize_path()."""
+
+    def test_relative_path(self):
+        result = AbstractStorage.normalize_path("foo/bar")
+        assert result == PurePosixPath("/foo/bar")
+
+    def test_already_absolute(self):
+        result = AbstractStorage.normalize_path("/foo/bar")
+        assert result == PurePosixPath("/foo/bar")
+
+    def test_pure_posix_path_input(self):
+        result = AbstractStorage.normalize_path(PurePosixPath("foo/bar"))
+        assert result == PurePosixPath("/foo/bar")
+
+    def test_empty_string(self):
+        result = AbstractStorage.normalize_path("")
+        assert result == PurePosixPath("/")
+
+    def test_dot(self):
+        result = AbstractStorage.normalize_path(".")
+        assert result == PurePosixPath("/")
+
+    def test_root(self):
+        result = AbstractStorage.normalize_path("/")
+        assert result == PurePosixPath("/")
+
+    def test_idempotent(self):
+        # normalize_path is idempotent — applying twice gives same result
+        once = AbstractStorage.normalize_path("foo")
+        twice = AbstractStorage.normalize_path(once)
+        assert once == twice == PurePosixPath("/foo")

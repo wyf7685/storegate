@@ -269,8 +269,8 @@ class TestDirectoryOperations:
             dst_file = f"{dst}/file.txt"
             meta_src = await index_storage._get_file_meta(src_file)  # noqa: SLF001
             meta_dst = await index_storage._get_file_meta(dst_file)  # noqa: SLF001
-            assert meta_src is not None
-            assert meta_dst is not None
+            assert meta_src is not None, "Source file meta must exist after copytree"
+            assert meta_dst is not None, "Destination file meta must exist after copytree"
             assert meta_src.chunks == meta_dst.chunks, "Source and destination must share chunk hashes after copytree"
 
             for chunk_hash in meta_src.chunks:
