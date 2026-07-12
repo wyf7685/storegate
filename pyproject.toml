@@ -21,11 +21,15 @@ dependencies = [
 
 [dependency-groups]
 dev = [{ include-group = "lint" }, { include-group = "test" }]
-lint = ["ruff>=0.15.21", "ty>=0.0.58"]
+lint = [
+    "ruff>=0.15.21",
+    "ty>=0.0.58",
+]
 test = [
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",
   "pytest-cov>=7.1.0",
+  "pytest-mock>=3.15.1",
   "pytest-xdist>=3.8.0",
 ]
 
