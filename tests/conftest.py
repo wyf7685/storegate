@@ -65,7 +65,7 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
             from app.storage.cos import CosStorage
 
             config_path = Path("data/cos/mock.json")
-            if not config_path.exists():  # noqa: ASYNC240
+            if not config_path.exists():
                 pytest.skip("COS config file not found")
             async with CosStorage(config_path) as s:
                 yield s

@@ -1,5 +1,4 @@
 """Unit tests for FTP handler command dispatch and FEAT consistency."""
-# ruff: noqa: SLF001  Tests intentionally access private handler methods.
 
 from unittest.mock import MagicMock
 

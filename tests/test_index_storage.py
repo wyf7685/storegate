@@ -68,8 +68,8 @@ class TestDeduplication:
             await index_storage.upload_bytes(data, path1)
             await index_storage.upload_bytes(data, path2)
 
-            meta1 = await index_storage._get_file_meta(path1)  # noqa: SLF001
-            meta2 = await index_storage._get_file_meta(path2)  # noqa: SLF001
+            meta1 = await index_storage._get_file_meta(path1)
+            meta2 = await index_storage._get_file_meta(path2)
             assert meta1 is not None
             assert meta2 is not None
             assert meta1.chunks == meta2.chunks, "Identical files must share the same chunk hashes"
@@ -77,10 +77,10 @@ class TestDeduplication:
 
             # Verify each chunk .bin exists once and .ref lists both paths
             for chunk_hash in meta1.chunks:
-                assert await index_storage._chunks.exists(  # noqa: SLF001
-                    f"{hash_to_path_stem(chunk_hash)}.bin"
-                ), f"Chunk {chunk_hash[:8]} .bin should exist"
-                refs = await index_storage._chunk_load_refs(chunk_hash)  # noqa: SLF001
+                assert await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin"), (
+                    f"Chunk {chunk_hash[:8]} .bin should exist"
+                )
+                refs = await index_storage._chunk_load_refs(chunk_hash)
                 assert refs is not None, f"Chunk {chunk_hash[:8]} .ref should exist"
                 abs1 = f"/{path1}"
                 abs2 = f"/{path2}"
@@ -108,7 +108,7 @@ class TestRefCounting:
         path = f"test-refc-unlink-{uid()}"
 
         await index_storage.upload_bytes(data, path)
-        meta_before = await index_storage._get_file_meta(path)  # noqa: SLF001
+        meta_before = await index_storage._get_file_meta(path)
         assert meta_before is not None
         chunk_hashes = meta_before.chunks[:]
 
@@ -117,15 +117,15 @@ class TestRefCounting:
 
         # Verify chunk .bin + .ref cleaned up (refs reached 0)
         for chunk_hash in chunk_hashes:
-            assert not await index_storage._chunks.exists(  # noqa: SLF001
-                f"{hash_to_path_stem(chunk_hash)}.bin"
-            ), f"Chunk {chunk_hash[:8]} .bin should be deleted after unlink"
-            assert not await index_storage._chunks.exists(  # noqa: SLF001
-                f"{hash_to_path_stem(chunk_hash)}.ref"
-            ), f"Chunk {chunk_hash[:8]} .ref should be deleted after unlink"
+            assert not await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin"), (
+                f"Chunk {chunk_hash[:8]} .bin should be deleted after unlink"
+            )
+            assert not await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.ref"), (
+                f"Chunk {chunk_hash[:8]} .ref should be deleted after unlink"
+            )
 
         # Verify FileMeta removed from index
-        assert await index_storage._get_file_meta(path) is None  # noqa: SLF001
+        assert await index_storage._get_file_meta(path) is None
 
     async def test_copy_increfs_chunks(self, index_storage: IndexStorage):
         data = b"C" * BLOCK_SIZE
@@ -134,27 +134,27 @@ class TestRefCounting:
         try:
             await index_storage.upload_bytes(data, src)
 
-            src_meta = await index_storage._get_file_meta(src)  # noqa: SLF001
+            src_meta = await index_storage._get_file_meta(src)
             assert src_meta is not None
             refs_before: dict[str, set[str]] = {}
             for h in src_meta.chunks:
-                r = await index_storage._chunk_load_refs(h)  # noqa: SLF001
+                r = await index_storage._chunk_load_refs(h)
                 refs_before[h] = r or set()
 
             await index_storage.copy(src, dst)
             assert await index_storage.exists(src)
             assert await index_storage.exists(dst)
 
-            dst_meta = await index_storage._get_file_meta(dst)  # noqa: SLF001
+            dst_meta = await index_storage._get_file_meta(dst)
             assert dst_meta is not None
             assert dst_meta.chunks == src_meta.chunks, "Copy must preserve chunk hash list"
 
             # Verify incref: src + dst both in ref files, count increased by 1
             for chunk_hash in src_meta.chunks:
-                assert await index_storage._chunks.exists(  # noqa: SLF001
-                    f"{hash_to_path_stem(chunk_hash)}.bin"
-                ), f"Chunk {chunk_hash[:8]} .bin must exist after copy"
-                refs = await index_storage._chunk_load_refs(chunk_hash)  # noqa: SLF001
+                assert await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin"), (
+                    f"Chunk {chunk_hash[:8]} .bin must exist after copy"
+                )
+                refs = await index_storage._chunk_load_refs(chunk_hash)
                 assert refs is not None, f"Chunk {chunk_hash[:8]} .ref must exist"
                 abs_src = f"/{src}"
                 abs_dst = f"/{dst}"
@@ -177,18 +177,18 @@ class TestRefCounting:
         try:
             await index_storage.upload_bytes(data, src)
 
-            src_meta = await index_storage._get_file_meta(src)  # noqa: SLF001
+            src_meta = await index_storage._get_file_meta(src)
             assert src_meta is not None
             refs_before: dict[str, set[str]] = {}
             for h in src_meta.chunks:
-                r = await index_storage._chunk_load_refs(h)  # noqa: SLF001
+                r = await index_storage._chunk_load_refs(h)
                 refs_before[h] = r or set()
 
             await index_storage.move(src, dst)
             assert not await index_storage.exists(src)
             assert await index_storage.exists(dst)
 
-            dst_meta = await index_storage._get_file_meta(dst)  # noqa: SLF001
+            dst_meta = await index_storage._get_file_meta(dst)
             assert dst_meta is not None
             assert dst_meta.chunks == src_meta.chunks, "Move must preserve chunk hash list"
 
@@ -196,10 +196,10 @@ class TestRefCounting:
             abs_src = f"/{src}"
             abs_dst = f"/{dst}"
             for chunk_hash in src_meta.chunks:
-                assert await index_storage._chunks.exists(  # noqa: SLF001
-                    f"{hash_to_path_stem(chunk_hash)}.bin"
-                ), f"Chunk {chunk_hash[:8]} .bin must exist after move"
-                refs = await index_storage._chunk_load_refs(chunk_hash)  # noqa: SLF001
+                assert await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin"), (
+                    f"Chunk {chunk_hash[:8]} .bin must exist after move"
+                )
+                refs = await index_storage._chunk_load_refs(chunk_hash)
                 assert refs is not None, f"Chunk {chunk_hash[:8]} .ref must exist"
                 assert abs_src not in refs, f"src path must be removed from chunk {chunk_hash[:8]} refs"
                 assert abs_dst in refs, f"dst path must be added to chunk {chunk_hash[:8]} refs"
@@ -228,7 +228,7 @@ class TestDirectoryOperations:
             # Collect chunk hashes before deletion
             all_chunks: list[str] = []
             for fname in ("f1.txt", "f2.txt"):
-                meta = await index_storage._get_file_meta(f"{base}/{fname}")  # noqa: SLF001
+                meta = await index_storage._get_file_meta(f"{base}/{fname}")
                 assert meta is not None
                 all_chunks.extend(meta.chunks)
 
@@ -237,16 +237,16 @@ class TestDirectoryOperations:
 
             # Verify chunk .bin + .ref are cleaned up
             for chunk_hash in set(all_chunks):
-                assert not await index_storage._chunks.exists(  # noqa: SLF001
-                    f"{hash_to_path_stem(chunk_hash)}.bin"
-                ), f"Chunk {chunk_hash[:8]} .bin not cleaned up by rmtree"
-                assert not await index_storage._chunks.exists(  # noqa: SLF001
-                    f"{hash_to_path_stem(chunk_hash)}.ref"
-                ), f"Chunk {chunk_hash[:8]} .ref not cleaned up by rmtree"
+                assert not await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin"), (
+                    f"Chunk {chunk_hash[:8]} .bin not cleaned up by rmtree"
+                )
+                assert not await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.ref"), (
+                    f"Chunk {chunk_hash[:8]} .ref not cleaned up by rmtree"
+                )
 
             # Verify individual file metas removed from index
-            assert await index_storage._get_file_meta(f"{base}/f1.txt") is None  # noqa: SLF001
-            assert await index_storage._get_file_meta(f"{base}/f2.txt") is None  # noqa: SLF001
+            assert await index_storage._get_file_meta(f"{base}/f1.txt") is None
+            assert await index_storage._get_file_meta(f"{base}/f2.txt") is None
         finally:
             with suppress_exc():
                 await index_storage.rmtree(base)
@@ -267,14 +267,14 @@ class TestDirectoryOperations:
             # Verify chunk refs are shared between src and dst
             src_file = f"{src}/file.txt"
             dst_file = f"{dst}/file.txt"
-            meta_src = await index_storage._get_file_meta(src_file)  # noqa: SLF001
-            meta_dst = await index_storage._get_file_meta(dst_file)  # noqa: SLF001
+            meta_src = await index_storage._get_file_meta(src_file)
+            meta_dst = await index_storage._get_file_meta(dst_file)
             assert meta_src is not None, "Source file meta must exist after copytree"
             assert meta_dst is not None, "Destination file meta must exist after copytree"
             assert meta_src.chunks == meta_dst.chunks, "Source and destination must share chunk hashes after copytree"
 
             for chunk_hash in meta_src.chunks:
-                refs = await index_storage._chunk_load_refs(chunk_hash)  # noqa: SLF001
+                refs = await index_storage._chunk_load_refs(chunk_hash)
                 assert refs is not None, f"Chunk {chunk_hash[:8]} .ref must exist"
                 abs_src_file = f"/{src_file}"
                 abs_dst_file = f"/{dst_file}"
@@ -311,7 +311,7 @@ class TestOverwriteRefCleanup:
             hash_b = _hash_block(b"B" * BLOCK_SIZE)
             hash_c = _hash_block(b"C" * BLOCK_SIZE)
 
-            chunks = index_storage._chunks  # noqa: SLF001
+            chunks = index_storage._chunks
             # 共享块 A 仍然存在
             assert await chunks.exists(f"{hash_to_path_stem(hash_a)}.bin")
             assert await chunks.exists(f"{hash_to_path_stem(hash_a)}.ref")

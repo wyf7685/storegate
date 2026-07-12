@@ -97,8 +97,15 @@ fixture-parentheses = false
 mark-parentheses = false
 
 [lint.isort]
-known-first-party = ["cos_ftp", "tests/*"]
+known-first-party = ["app", "tests/*"]
 extra-standard-library = ["typing_extensions"]
 
 [lint.pyupgrade]
 keep-runtime-typing = true
+
+[lint.extend-per-file-ignores]
+"tests/*.py" = [
+  "T201",     # print
+  "ASYNC240", # blocking-path-method-in-async-function
+  "SLF001",   # private-member-access
+]
