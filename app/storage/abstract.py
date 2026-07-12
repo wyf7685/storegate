@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Self
 
 import anyio
@@ -25,6 +25,7 @@ class FileInfo:
 
 
 type BytesLike = bytes | bytearray | memoryview
+type PathLike = str | PurePath
 
 
 class AbstractStorage(ABC):
@@ -42,6 +43,11 @@ class AbstractStorage(ABC):
     def id(self) -> str:
         """Return a unique identifier for this storage instance."""
         raise NotImplementedError
+
+    @staticmethod
+    def normalize_path(path: PathLike) -> PurePosixPath:
+        """Normalize a path to a POSIX-style absolute path."""
+        return "/" / PurePosixPath(path)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -82,7 +88,7 @@ class AbstractStorage(ABC):
     async def upload_stream(
         self,
         stream: AsyncIterable[BytesLike],
-        remote_path: str,
+        remote_path: PathLike,
         *,
         overwrite: bool = True,
     ) -> None:
@@ -92,7 +98,7 @@ class AbstractStorage(ABC):
     async def upload_bytes(
         self,
         data: BytesLike,
-        remote_path: str,
+        remote_path: PathLike,
         *,
         overwrite: bool = True,
     ) -> None:
@@ -110,14 +116,14 @@ class AbstractStorage(ABC):
 
     async def upload_file(
         self,
-        local_path: str | Path,
-        remote_path: str,
+        local_path: PathLike,
+        remote_path: PathLike,
         *,
         overwrite: bool = True,
     ) -> None:
         """Upload a local file."""
 
-        async with ayafileio.open(local_path, "rb") as file:
+        async with ayafileio.open(Path(local_path), "rb") as file:
             await self.upload_stream(file.chunk(1024 * 1024), remote_path, overwrite=overwrite)
 
     # ------------------------------------------------------------------
@@ -127,7 +133,7 @@ class AbstractStorage(ABC):
     @abstractmethod
     async def download_stream(
         self,
-        remote_path: str,
+        remote_path: PathLike,
         *,
         offset: int = 0,
     ) -> AsyncIterator[bytes]:
@@ -142,7 +148,7 @@ class AbstractStorage(ABC):
 
     async def download_bytes(
         self,
-        remote_path: str,
+        remote_path: PathLike,
     ) -> bytes:
         """Download as bytes."""
         buffer = bytearray()
@@ -152,11 +158,11 @@ class AbstractStorage(ABC):
 
     async def download_file(
         self,
-        remote_path: str,
-        local_path: str | Path,
+        remote_path: PathLike,
+        local_path: PathLike,
     ) -> None:
         """Download to a local file."""
-        async with ayafileio.open(local_path, "wb") as file:
+        async with ayafileio.open(Path(local_path), "wb") as file:
             async for chunk in self.download_stream(remote_path):
                 await file.write(chunk)
 
@@ -165,7 +171,7 @@ class AbstractStorage(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
+    async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
         """Delete a file.
 
         Args:
@@ -179,7 +185,7 @@ class AbstractStorage(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def rmdir(self, path: str) -> None:
+    async def rmdir(self, path: PathLike) -> None:
         """Delete an empty directory.
 
         Raises:
@@ -190,7 +196,7 @@ class AbstractStorage(ABC):
         """
         raise NotImplementedError
 
-    async def delete(self, path: str) -> None:
+    async def delete(self, path: PathLike) -> None:
         """Delete a file or an empty directory.
 
         Convenience method that calls :meth:`rmdir` if *path* is a directory,
@@ -201,7 +207,7 @@ class AbstractStorage(ABC):
         else:
             await self.unlink(path)
 
-    async def delete_many(self, *paths: str) -> None:
+    async def delete_many(self, *paths: PathLike) -> None:
         """Delete multiple files or empty directories.
 
         **Fail-fast semantics**: raises on the first error encountered.
@@ -218,8 +224,8 @@ class AbstractStorage(ABC):
     @abstractmethod
     async def move(
         self,
-        src: str,
-        dst: str,
+        src: PathLike,
+        dst: PathLike,
     ) -> None:
         """Move or rename."""
         raise NotImplementedError
@@ -227,8 +233,8 @@ class AbstractStorage(ABC):
     @abstractmethod
     async def copy(
         self,
-        src: str,
-        dst: str,
+        src: PathLike,
+        dst: PathLike,
     ) -> None:
         """
         Copy a file.
@@ -244,7 +250,7 @@ class AbstractStorage(ABC):
     @abstractmethod
     async def mkdir(
         self,
-        path: str,
+        path: PathLike,
         *,
         parents: bool = False,
         exist_ok: bool = False,
@@ -253,12 +259,12 @@ class AbstractStorage(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def rmtree(self, path: str) -> None:
+    async def rmtree(self, path: PathLike) -> None:
         """Recursively remove a directory."""
         raise NotImplementedError
 
     @abstractmethod
-    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+    async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         """Recursively copy a directory tree.
 
         Args:
@@ -274,7 +280,7 @@ class AbstractStorage(ABC):
         """
         raise NotImplementedError
 
-    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+    async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         """Recursively move a directory tree.
 
         The default implementation copies the tree then removes the source.
@@ -299,22 +305,22 @@ class AbstractStorage(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def exists(self, path: str) -> bool:
+    async def exists(self, path: PathLike) -> bool:
         """Return whether a path exists."""
         raise NotImplementedError
 
     @abstractmethod
-    async def is_file(self, path: str) -> bool:
+    async def is_file(self, path: PathLike) -> bool:
         """Return whether the path is a file."""
         raise NotImplementedError
 
     @abstractmethod
-    async def is_dir(self, path: str) -> bool:
+    async def is_dir(self, path: PathLike) -> bool:
         """Return whether the path is a directory."""
         raise NotImplementedError
 
     @abstractmethod
-    async def stat(self, path: str) -> FileInfo:
+    async def stat(self, path: PathLike) -> FileInfo:
         """Return metadata."""
         raise NotImplementedError
 
@@ -322,23 +328,23 @@ class AbstractStorage(ABC):
     # Listing
     # ------------------------------------------------------------------
 
-    async def list_(self, path: str) -> list[FileInfo]:
+    async def list_(self, path: PathLike) -> list[FileInfo]:
         """List directory."""
         return [item async for item in self.iterdir(path)]
 
     @abstractmethod
-    async def iterdir(self, path: str) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
         """Iterate directory entries."""
         raise NotImplementedError
         yield
 
     @abstractmethod
-    async def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         """Recursively walk a directory tree."""
         raise NotImplementedError
         yield
 
-    async def _is_dir_empty(self, path: str) -> bool:
+    async def _is_dir_empty(self, path: PathLike) -> bool:
         """Check if a directory is empty."""
         async for _ in self.iterdir(path):
             return False

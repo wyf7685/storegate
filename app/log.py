@@ -11,7 +11,7 @@ import loguru
 logger: loguru.Logger = loguru.logger
 
 
-def escape_tag(s: str) -> str:
+def escape_tag(s: object) -> str:
     """用于记录带颜色日志时转义 `<tag>` 类型特殊标签
 
     参考: [loguru color 标签](https://loguru.readthedocs.io/en/stable/api/logger.html#color)
@@ -19,7 +19,7 @@ def escape_tag(s: str) -> str:
     参数:
         s: 需要转义的字符串
     """
-    return re.sub(r"</?((?:[fb]g\s)?[^<>\s]*)>", r"\\\g<0>", s)
+    return re.sub(r"</?((?:[fb]g\s)?[^<>\s]*)>", r"\\\g<0>", str(s))
 
 
 # https://loguru.readthedocs.io/en/stable/overview.html#entirely-compatible-with-standard-logging
