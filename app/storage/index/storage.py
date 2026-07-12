@@ -1,5 +1,6 @@
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import uuid
 from collections import defaultdict
@@ -425,7 +426,7 @@ class IndexStorage(AbstractStorage):
                 meta = FileMeta(
                     info=FileInfo(
                         path=remote_path.as_posix(),
-                        name=PurePosixPath(remote_path).name,
+                        name=remote_path.name,
                         is_dir=False,
                         size=total_size,
                         modified=now,
@@ -623,7 +624,7 @@ class IndexStorage(AbstractStorage):
             new_dst_meta = FileMeta(
                 info=FileInfo(
                     path=dst.as_posix(),
-                    name=PurePosixPath(dst).name,
+                    name=dst.name,
                     is_dir=False,
                     size=src_meta.info.size,
                     modified=src_meta.info.modified,
@@ -632,12 +633,46 @@ class IndexStorage(AbstractStorage):
                 chunks=src_meta.chunks,
             )
             new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
+
+            async def rollback_chunks() -> None:
+                try:
+                    with anyio.CancelScope(shield=True):
+                        async with anyio.create_task_group() as tg:
+                            for chunk_hash in src_meta.chunks:
+                                pfunc = functools.partial(
+                                    self._chunk_transref,
+                                    chunk_hash,
+                                    (dst, src),
+                                    missing_ok=True,
+                                )
+                                tg.start_soon(pfunc)
+                except Exception:
+                    self.log.exception(f"Failed to rollback chunks for move: {_colored_src} → {_colored_dst}")
+
             async with self._lock_chunks(src_meta.chunks):
-                await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
-                await self._index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
-                async with anyio.create_task_group() as tg:
-                    for chunk_hash in src_meta.chunks:
-                        tg.start_soon(self._chunk_transref, chunk_hash, (src, dst))
+                try:
+                    async with anyio.create_task_group() as tg:
+                        for chunk_hash in src_meta.chunks:
+                            tg.start_soon(self._chunk_transref, chunk_hash, (src, dst))
+                except Exception as exc:
+                    self.log.error(  # noqa: TRY400
+                        f"Failed to transref chunks for move: {_colored_src} → {_colored_dst} "
+                        f"— <r>{escape_tag(repr(exc))}</r>"
+                    )
+                    await rollback_chunks()
+                    raise
+
+                try:
+                    await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
+                    await self._index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
+                except Exception as exc:
+                    self.log.error(  # noqa: TRY400
+                        f"Failed to upload metadata for move: {_colored_src} → {_colored_dst} "
+                        f"— <r>{escape_tag(repr(exc))}</r>"
+                    )
+                    await rollback_chunks()
+                    raise
+
             await self._index.unlink(src)
 
         self.log.info(
@@ -669,16 +704,37 @@ class IndexStorage(AbstractStorage):
                 raise FileExistsError(f"Destination file already exists: {dst}")
 
             new_dst_meta = FileMeta(
-                info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=PurePosixPath(dst).name),
+                info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=dst.name),
                 chunks=src_meta.chunks.copy(),
             )
             new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
+
+            async def rollback_chunks() -> None:
+                try:
+                    with anyio.CancelScope(shield=True):
+                        async with anyio.create_task_group() as tg:
+                            for chunk_hash in src_meta.chunks:
+                                tg.start_soon(self._chunk_decref, chunk_hash, dst)
+                except Exception:
+                    self.log.exception(f"Failed to rollback chunks for {_colored_dst}")
+
             async with self._lock_chunks(src_meta.chunks):
-                await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
-                await self._index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
-                async with anyio.create_task_group() as tg:
-                    for chunk_hash in src_meta.chunks:
-                        tg.start_soon(self._chunk_incref, chunk_hash, dst)
+                try:
+                    async with anyio.create_task_group() as tg:
+                        for chunk_hash in src_meta.chunks:
+                            tg.start_soon(self._chunk_incref, chunk_hash, dst)
+                except Exception as exc:
+                    self.log.error(f"Failed to incref chunks for {_colored_dst}: — <r>{escape_tag(repr(exc))}</r>")  # noqa: TRY400
+                    await rollback_chunks()
+                    raise
+
+                try:
+                    await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
+                    await self._index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
+                except Exception as exc:
+                    self.log.error(f"Failed to upload metadata for {_colored_dst}: — <r>{escape_tag(repr(exc))}</r>")  # noqa: TRY400
+                    await rollback_chunks()
+                    raise
 
         self.log.info(
             f"Copied: {_colored_src} → {_colored_dst} "
@@ -724,7 +780,7 @@ class IndexStorage(AbstractStorage):
             raise FileExistsError(f"Destination already exists: {dst}")
 
         # walk 收集源树所有文件
-        async def _collect_chunk_updates(info: FileInfo) -> None:
+        async def collect_chunk_updates(info: FileInfo) -> None:
             meta = await self._get_file_meta(info.path)
             if meta is None:
                 raise FileNotFoundError(f"File not found: {info.path}")
@@ -739,13 +795,13 @@ class IndexStorage(AbstractStorage):
         async with anyio.create_task_group() as tg:
             async for _, sd, sf in self._index.walk(src):
                 for info in sf:
-                    tg.start_soon(_collect_chunk_updates, info)
+                    tg.start_soon(collect_chunk_updates, info)
                 dir_rels.extend(self.normalize_path(d.path).relative_to(src) for d in sd)
 
         # 创建目标目录结构
-        await self.mkdir(dst, parents=True, exist_ok=True)
+        await self._index.mkdir(dst, parents=True, exist_ok=True)
         for rel in sorted(dir_rels, key=lambda r: len(r.parts)):
-            await self.mkdir(dst.joinpath(rel), parents=True, exist_ok=True)
+            await self._index.mkdir(dst.joinpath(rel), parents=True, exist_ok=True)
 
         # 并发更新 chunk refs
         async def batch_incref(chunk_hash: str, dst_paths: set[PurePosixPath]) -> None:
@@ -768,7 +824,7 @@ class IndexStorage(AbstractStorage):
                     info=dataclasses.replace(
                         src_meta.info,
                         path=dst_file.as_posix(),
-                        name=PurePosixPath(dst_file).name,
+                        name=dst_file.name,
                     ),
                     chunks=src_meta.chunks.copy(),
                 )
@@ -807,11 +863,11 @@ class IndexStorage(AbstractStorage):
             src_file = self.normalize_path(meta.info.path)
             dst_file = dst.joinpath(src_file.relative_to(src))
             for chunk_hash in meta.chunks:
-                chunk_transrefs[chunk_hash].append((src_file, dst_file))
+                chunk_transrefs[chunk_hash].add((src_file, dst_file))
 
         files: list[FileMeta] = []
         dir_rels: list[PurePosixPath] = []
-        chunk_transrefs: dict[str, list[tuple[PathLike, PathLike]]] = defaultdict(list)
+        chunk_transrefs: dict[str, set[tuple[PathLike, PathLike]]] = defaultdict(set)
         async with anyio.create_task_group() as tg:
             async for _, sd, sf in self._index.walk(src):
                 for info in sf:
@@ -824,7 +880,7 @@ class IndexStorage(AbstractStorage):
             await self.mkdir(dst.joinpath(rel).as_posix(), parents=True, exist_ok=True)
 
         # 批量 transref: 每个 chunk 一把锁，一次处理全部 (src,dst) 对
-        async def batch_transref(chunk_hash: str, pairs: list[tuple[PathLike, PathLike]]) -> None:
+        async def batch_transref(chunk_hash: str, pairs: set[tuple[PathLike, PathLike]]) -> None:
             async with self._lock_chunk(chunk_hash):
                 await self._chunk_transref(chunk_hash, *pairs)
 
@@ -846,7 +902,7 @@ class IndexStorage(AbstractStorage):
                     info=dataclasses.replace(
                         src_meta.info,
                         path=dst_file.as_posix(),
-                        name=PurePosixPath(dst_file).name,
+                        name=dst_file.name,
                     ),
                     chunks=src_meta.chunks.copy(),
                 )
@@ -918,7 +974,7 @@ class IndexStorage(AbstractStorage):
         if not await self._index.is_dir(path):
             raise NotADirectoryError(f"Not a directory: {path}")
 
-        async def _fetch_meta(path: PathLike) -> None:
+        async def _fetch_meta(path: PathLike, files: list[FileInfo]) -> None:
             meta = await self._get_file_meta(path)
             if meta is not None:
                 files.append(meta.info)
@@ -927,7 +983,7 @@ class IndexStorage(AbstractStorage):
             files: list[FileInfo] = []
             async with anyio.create_task_group() as tg:
                 for entry in sf:
-                    tg.start_soon(_fetch_meta, entry.path)
+                    tg.start_soon(_fetch_meta, entry.path, files)
             files.sort(key=lambda x: x.name)
             dirs = [
                 FileInfo(
