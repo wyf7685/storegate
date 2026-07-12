@@ -11,7 +11,7 @@ import anyio.lowlevel
 import anyio.to_thread
 import ayafileio
 
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
+from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
 
 
 @final
@@ -57,19 +57,15 @@ class LocalStorage(AbstractStorage):
     # Path helpers
     # ------------------------------------------------------------------
 
-    def _resolve(self, path: str) -> Path:
+    def _resolve(self, path: PathLike) -> Path:
         """Resolve *path* to an absolute ``Path`` under ``self._root``.
 
         Raises :exc:`ValueError` if *path* attempts to escape the root
         directory.
         """
         # Normalise: treat every path as relative.
-        p = PurePosixPath(path)
-        if p.is_absolute():
-            p = p.relative_to("/")
-
-        raw = os.path.normpath(str(self._root / str(p)))
-        full = Path(raw)
+        p = self.normalize_path(path).relative_to("/")
+        full = Path(os.path.normpath(self._root / p))
 
         try:
             full.relative_to(self._root)
@@ -86,7 +82,7 @@ class LocalStorage(AbstractStorage):
     async def upload_stream(
         self,
         stream: AsyncIterable[BytesLike],
-        remote_path: str,
+        remote_path: PathLike,
         *,
         overwrite: bool = True,
     ) -> None:
@@ -114,7 +110,7 @@ class LocalStorage(AbstractStorage):
     @override
     async def download_stream(
         self,
-        remote_path: str,
+        remote_path: PathLike,
         *,
         offset: int = 0,
     ) -> AsyncIterator[bytes]:
@@ -134,17 +130,17 @@ class LocalStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
+    async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
         target = self._resolve(path)
         await anyio.Path(target).unlink(missing_ok=missing_ok)
 
     @override
-    async def rmdir(self, path: str) -> None:
+    async def rmdir(self, path: PathLike) -> None:
         target = self._resolve(path)
         await anyio.Path(target).rmdir()
 
     @override
-    async def move(self, src: str, dst: str) -> None:
+    async def move(self, src: PathLike, dst: PathLike) -> None:
         source = self._resolve(src)
         dest = self._resolve(dst)
 
@@ -152,7 +148,7 @@ class LocalStorage(AbstractStorage):
         await anyio.Path(source).rename(dest)
 
     @override
-    async def copy(self, src: str, dst: str) -> None:
+    async def copy(self, src: PathLike, dst: PathLike) -> None:
         source = self._resolve(src)
         dest = self._resolve(dst)
 
@@ -166,7 +162,7 @@ class LocalStorage(AbstractStorage):
     @override
     async def mkdir(
         self,
-        path: str,
+        path: PathLike,
         *,
         parents: bool = False,
         exist_ok: bool = False,
@@ -175,26 +171,24 @@ class LocalStorage(AbstractStorage):
         await anyio.Path(target).mkdir(parents=parents, exist_ok=exist_ok)
 
     @override
-    async def rmtree(self, path: str) -> None:
+    async def rmtree(self, path: PathLike) -> None:
         target = self._resolve(path)
-        await anyio.to_thread.run_sync(shutil.rmtree, str(target))
+        await anyio.to_thread.run_sync(shutil.rmtree, target)
 
     @override
-    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+    async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._resolve(src)
-        dest = self._resolve(dst)
+        destination = self._resolve(dst)
 
         if not await anyio.Path(source).is_dir():
             raise NotADirectoryError(f"Not a directory: {src}")
-        if not overwrite and await anyio.Path(dest).exists():
+        if not overwrite and await anyio.Path(destination).exists():
             raise FileExistsError(f"Destination already exists: {dst}")
 
-        await anyio.to_thread.run_sync(
-            functools.partial(shutil.copytree, str(source), str(dest), dirs_exist_ok=overwrite)
-        )
+        await anyio.to_thread.run_sync(functools.partial(shutil.copytree, source, destination, dirs_exist_ok=overwrite))
 
     @override
-    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+    async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._resolve(src)
         dest = self._resolve(dst)
 
@@ -214,19 +208,19 @@ class LocalStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def exists(self, path: str) -> bool:
+    async def exists(self, path: PathLike) -> bool:
         return await anyio.Path(self._resolve(path)).exists()
 
     @override
-    async def is_file(self, path: str) -> bool:
+    async def is_file(self, path: PathLike) -> bool:
         return await anyio.Path(self._resolve(path)).is_file()
 
     @override
-    async def is_dir(self, path: str) -> bool:
+    async def is_dir(self, path: PathLike) -> bool:
         return await anyio.Path(self._resolve(path)).is_dir()
 
     @override
-    async def stat(self, path: str) -> FileInfo:
+    async def stat(self, path: PathLike) -> FileInfo:
         target = self._resolve(path)
         p = anyio.Path(target)
 
@@ -237,7 +231,7 @@ class LocalStorage(AbstractStorage):
         is_dir = await p.is_dir()
 
         return FileInfo(
-            path=path,
+            path=self.normalize_path(path).as_posix(),
             name=target.name,
             is_dir=is_dir,
             size=0 if is_dir else stat_result.st_size,
@@ -250,7 +244,7 @@ class LocalStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def iterdir(self, path: str) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
         target = self._resolve(path)
         p = anyio.Path(target)
 
@@ -261,7 +255,9 @@ class LocalStorage(AbstractStorage):
             stat_result = await entry.stat()
             entry_is_dir = await entry.is_dir()
             yield FileInfo(
-                path=str(entry.relative_to(self._root)).replace("\\", "/"),
+                path=self.normalize_path(
+                    PurePosixPath(str(entry.relative_to(self._root)).replace("\\", "/"))
+                ).as_posix(),
                 name=entry.name,
                 is_dir=entry_is_dir,
                 size=0 if entry_is_dir else stat_result.st_size,
@@ -270,7 +266,7 @@ class LocalStorage(AbstractStorage):
             )
 
     @override
-    async def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         target = self._resolve(path)
         p = anyio.Path(target)
 
@@ -284,7 +280,9 @@ class LocalStorage(AbstractStorage):
             stat_result = await entry.stat()
             entry_is_dir = await entry.is_dir()
             info = FileInfo(
-                path=str(entry.relative_to(self._root)).replace("\\", "/"),
+                path=self.normalize_path(
+                    PurePosixPath(str(entry.relative_to(self._root)).replace("\\", "/"))
+                ).as_posix(),
                 name=entry.name,
                 is_dir=entry_is_dir,
                 size=0 if entry_is_dir else stat_result.st_size,
@@ -293,7 +291,7 @@ class LocalStorage(AbstractStorage):
             )
             (dirs if entry_is_dir else files).append(info)
 
-        yield path, dirs, files
+        yield self.normalize_path(path).as_posix(), dirs, files
 
         for d in dirs:
             async for sub_path, sub_dirs, sub_files in self.walk(d.path):

@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from app.log import escape_tag
 
-from ..abstract import AbstractStorage, BytesLike, FileInfo
+from ..abstract import AbstractStorage, BytesLike, FileInfo, PathLike
 
 BLOCK_SIZE = 64 * 1024 * 1024  # 64 MB
 MAX_CONCURRENT_UPLOADS = 2
@@ -57,12 +57,6 @@ class IndexStorage(AbstractStorage):
         self._max_concurrent_uploads = max_concurrent_uploads
         self._skip_locking = skip_locking
 
-    @staticmethod
-    def _to_abs_path(path: str) -> str:
-        if not path.startswith("/"):
-            return "/" + path
-        return path
-
     @property
     @override
     def id(self) -> str:
@@ -104,7 +98,7 @@ class IndexStorage(AbstractStorage):
     async def ping(self) -> bool:
         return await self._index.ping() and await self._chunks.ping()
 
-    async def _acquire_storage_file_lock(self, storage: AbstractStorage, lock_path: str) -> None:
+    async def _acquire_storage_file_lock(self, storage: AbstractStorage, lock_path: PathLike) -> None:
         _colored_path = f"<y>{escape_tag(lock_path)}</y>"
         if self._skip_locking:
             self.log.trace(f"Lock {_colored_path} disabled, skipping ...")
@@ -124,7 +118,7 @@ class IndexStorage(AbstractStorage):
 
         self.log.trace(f"Lock {_colored_path} acquired")
 
-    async def _release_storage_file_lock(self, storage: AbstractStorage, *lock_paths: str) -> None:
+    async def _release_storage_file_lock(self, storage: AbstractStorage, *lock_paths: PathLike) -> None:
         if self._skip_locking or not lock_paths:
             return
 
@@ -136,7 +130,7 @@ class IndexStorage(AbstractStorage):
             self.log.trace(f"Locks <y>{", ".join(escape_tag(p) for p in lock_paths)}</y> released")
 
     @contextlib.asynccontextmanager
-    async def _lock_index(self, index_path: str) -> AsyncGenerator[None]:
+    async def _lock_index(self, index_path: PathLike) -> AsyncGenerator[None]:
         lock_path = f"{index_path}.lock"
 
         try:
@@ -158,7 +152,7 @@ class IndexStorage(AbstractStorage):
                 await self._release_storage_file_lock(self._chunks, lock_path)
 
     @contextlib.asynccontextmanager
-    async def _lock_indexes(self, *index_paths: str) -> AsyncGenerator[None]:
+    async def _lock_indexes(self, *index_paths: PathLike) -> AsyncGenerator[None]:
         try:
             for index_path in sorted(set(index_paths)):
                 await self._acquire_storage_file_lock(self._index, f"{index_path}.lock")
@@ -182,10 +176,9 @@ class IndexStorage(AbstractStorage):
                     self._chunks, *(hash_to_path(chunk_hash, "lock") for chunk_hash in unique_hashes)
                 )
 
-    async def _get_file_meta(self, path: str) -> FileMeta | None:
-        path = self._to_abs_path(path)
+    async def _get_file_meta(self, path: PathLike) -> FileMeta | None:
         try:
-            meta_bytes = await self._index.download_bytes(path)
+            meta_bytes = await self._index.download_bytes(self.normalize_path(path))
         except FileNotFoundError:
             return None
         if not meta_bytes:
@@ -200,18 +193,18 @@ class IndexStorage(AbstractStorage):
             return None
         return set(ref_bytes.decode().splitlines())
 
-    async def _chunk_incref(self, chunk_hash: str, *remote_path: str) -> None:
+    async def _chunk_incref(self, chunk_hash: str, *remote_path: PathLike) -> None:
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
         _colored_remote_paths = ", ".join(f"<i>{escape_tag(p)}</i>" for p in remote_path)
 
         refs: set[str] = await self._chunk_load_refs(chunk_hash) or set()
 
-        refs.update(remote_path)
+        refs.update(self.normalize_path(p).as_posix() for p in remote_path)
         await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
         self.log.debug(f"Chunk {_colored_hash} +ref → <g>{len(refs)}</g> ({_colored_remote_paths})")
 
-    async def _chunk_decref(self, chunk_hash: str, *remote_path: str) -> None:
+    async def _chunk_decref(self, chunk_hash: str, *remote_path: PathLike) -> None:
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
         _colored_remote_paths = ", ".join(f"<i>{escape_tag(p)}</i>" for p in remote_path)
@@ -223,6 +216,7 @@ class IndexStorage(AbstractStorage):
 
         removed = False
         for p in remote_path:
+            p = self.normalize_path(p).as_posix()
             if p in refs:
                 refs.remove(p)
                 removed = True
@@ -240,7 +234,12 @@ class IndexStorage(AbstractStorage):
             await self._chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
             self.log.debug(f"Chunk {_colored_hash} ref=0, deleted data (<i>{_colored_remote_paths}</i>)")
 
-    async def _chunk_transref(self, chunk_hash: str, *pairs: tuple[str, str], missing_ok: bool = False) -> None:
+    async def _chunk_transref(
+        self,
+        chunk_hash: str,
+        *pairs: tuple[PathLike, PathLike],
+        missing_ok: bool = False,
+    ) -> None:
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
 
@@ -251,6 +250,8 @@ class IndexStorage(AbstractStorage):
             refs = set()
 
         for src_path, dst_path in pairs:
+            src_path = self.normalize_path(src_path).as_posix()
+            dst_path = self.normalize_path(dst_path).as_posix()
             if src_path not in refs:
                 if missing_ok:
                     self.log.warning(
@@ -325,11 +326,11 @@ class IndexStorage(AbstractStorage):
     async def upload_stream(
         self,
         stream: AsyncIterable[BytesLike],
-        remote_path: str,
+        remote_path: PathLike,
         *,
         overwrite: bool = True,
     ) -> None:
-        remote_path = self._to_abs_path(remote_path)
+        remote_path = self.normalize_path(remote_path)
 
         try:
             info = await self.stat(remote_path)
@@ -354,7 +355,7 @@ class IndexStorage(AbstractStorage):
                 # 取出旧元数据，用于后续清理不再引用的旧分块
                 old_meta = await self._get_file_meta(remote_path)
 
-                send, recv = anyio.create_memory_object_stream[tuple[str, bytes, str]](max_workers * 2)
+                send, recv = anyio.create_memory_object_stream[tuple[str, bytes, PathLike]](max_workers * 2)
 
                 async with anyio.create_task_group() as tg, send:
                     for worker_idx in range(max_workers):
@@ -423,7 +424,7 @@ class IndexStorage(AbstractStorage):
                 now = datetime.now(UTC)
                 meta = FileMeta(
                     info=FileInfo(
-                        path=remote_path,
+                        path=remote_path.as_posix(),
                         name=PurePosixPath(remote_path).name,
                         is_dir=False,
                         size=total_size,
@@ -432,16 +433,8 @@ class IndexStorage(AbstractStorage):
                     ),
                     chunks=chunk_hashes,
                 )
-                await self._index.mkdir(
-                    PurePosixPath(remote_path).parent.as_posix(),
-                    parents=True,
-                    exist_ok=True,
-                )
-                await self._index.upload_bytes(
-                    meta.model_dump_json().encode(),
-                    remote_path,
-                    overwrite=True,
-                )
+                await self._index.mkdir(remote_path.parent, parents=True, exist_ok=True)
+                await self._index.upload_bytes(meta.model_dump_json().encode(), remote_path, overwrite=True)
 
             # 清理旧文件不再引用的分块
             if old_meta is not None:
@@ -469,10 +462,11 @@ class IndexStorage(AbstractStorage):
     @override
     async def download_stream(
         self,
-        remote_path: str,
+        remote_path: PathLike,
         *,
         offset: int = 0,
     ) -> AsyncIterator[bytes]:
+        remote_path = self.normalize_path(remote_path)
         _colored_path = f"<y>{escape_tag(remote_path)}</y>"
         self.log.debug(f"Download starting: {_colored_path}{f" (offset=<g>{offset}</g>)" if offset else ""}")
 
@@ -570,8 +564,8 @@ class IndexStorage(AbstractStorage):
                 )
 
     @override
-    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
-        path = self._to_abs_path(path)
+    async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
+        path = self.normalize_path(path)
         _colored_path = f"<y>{escape_tag(path)}</y>"
 
         if await self._index.is_dir(path):
@@ -591,11 +585,13 @@ class IndexStorage(AbstractStorage):
         self.log.info(f"Deleted: {_colored_path} (<g>{meta.info.size}</g> bytes, <g>{len(meta.chunks)}</g> chunks)")
 
     @override
-    async def rmdir(self, path: str) -> None:
-        if await self._index.is_file(path):
+    async def rmdir(self, path: PathLike) -> None:
+        try:
+            info = await self._index.stat(path)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Directory not found: {path}") from e
+        if not info.is_dir:
             raise NotADirectoryError(f"Not a directory: {path}")
-        if not await self._index.is_dir(path):
-            raise FileNotFoundError(f"Directory not found: {path}")
         if not await self._is_dir_empty(path):
             raise OSError(f"Directory not empty: {path}")
 
@@ -604,11 +600,11 @@ class IndexStorage(AbstractStorage):
     @override
     async def move(
         self,
-        src: str,
-        dst: str,
+        src: PathLike,
+        dst: PathLike,
     ) -> None:
-        src = self._to_abs_path(src)
-        dst = self._to_abs_path(dst)
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         if src == dst:
             return
 
@@ -626,7 +622,7 @@ class IndexStorage(AbstractStorage):
 
             new_dst_meta = FileMeta(
                 info=FileInfo(
-                    path=dst,
+                    path=dst.as_posix(),
                     name=PurePosixPath(dst).name,
                     is_dir=False,
                     size=src_meta.info.size,
@@ -637,7 +633,7 @@ class IndexStorage(AbstractStorage):
             )
             new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
             async with self._lock_chunks(src_meta.chunks):
-                await self._index.mkdir(PurePosixPath(dst).parent.as_posix(), parents=True, exist_ok=True)
+                await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
                 await self._index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in src_meta.chunks:
@@ -652,11 +648,11 @@ class IndexStorage(AbstractStorage):
     @override
     async def copy(
         self,
-        src: str,
-        dst: str,
+        src: PathLike,
+        dst: PathLike,
     ) -> None:
-        src = self._to_abs_path(src)
-        dst = self._to_abs_path(dst)
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         if src == dst:
             return
 
@@ -673,12 +669,12 @@ class IndexStorage(AbstractStorage):
                 raise FileExistsError(f"Destination file already exists: {dst}")
 
             new_dst_meta = FileMeta(
-                info=dataclasses.replace(src_meta.info, path=dst, name=PurePosixPath(dst).name),
+                info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=PurePosixPath(dst).name),
                 chunks=src_meta.chunks.copy(),
             )
             new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
             async with self._lock_chunks(src_meta.chunks):
-                await self._index.mkdir(PurePosixPath(dst).parent.as_posix(), parents=True, exist_ok=True)
+                await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
                 await self._index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in src_meta.chunks:
@@ -692,16 +688,16 @@ class IndexStorage(AbstractStorage):
     @override
     async def mkdir(
         self,
-        path: str,
+        path: PathLike,
         *,
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
-        return await self._index.mkdir(self._to_abs_path(path), parents=parents, exist_ok=exist_ok)
+        return await self._index.mkdir(self.normalize_path(path), parents=parents, exist_ok=exist_ok)
 
     @override
-    async def rmtree(self, path: str) -> None:
-        path = self._to_abs_path(path)
+    async def rmtree(self, path: PathLike) -> None:
+        path = self.normalize_path(path)
         _colored_path = f"<y>{escape_tag(path)}</y>"
         self.log.info(f"RmTree: {_colored_path}")
 
@@ -709,14 +705,14 @@ class IndexStorage(AbstractStorage):
         async with anyio.create_task_group() as tg:
             async for info in self._index.iterdir(path):
                 count += 1
-                tg.start_soon(self.rmtree if info.is_dir else self.unlink, self._to_abs_path(info.path))
+                tg.start_soon(self.rmtree if info.is_dir else self.unlink, self.normalize_path(info.path))
         await self._index.rmdir(path)
         self.log.info(f"RmTree complete: {_colored_path} (<g>{count}</g> entries removed)")
 
     @override
-    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
-        src = self._to_abs_path(src)
-        dst = self._to_abs_path(dst)
+    async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         _colored_src = f"<y>{escape_tag(src)}</y>"
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
         self.log.info(f"CopyTree: {_colored_src} → {_colored_dst}")
@@ -727,53 +723,53 @@ class IndexStorage(AbstractStorage):
         if not overwrite and await self._index.is_dir(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
 
-        src_prefix = src.rstrip("/")
-        dst_prefix = dst.rstrip("/")
-
         # walk 收集源树所有文件
         async def _collect_chunk_updates(info: FileInfo) -> None:
             meta = await self._get_file_meta(info.path)
             if meta is None:
                 raise FileNotFoundError(f"File not found: {info.path}")
             files.append(meta)
-            file_rel = meta.info.path[len(src_prefix) :]
+            file_rel = self.normalize_path(meta.info.path).relative_to(src)
             for chunk_hash in meta.chunks:
-                chunk_updates[chunk_hash].add(dst_prefix + file_rel)
+                chunk_updates[chunk_hash].add(dst.joinpath(file_rel))
 
         files: list[FileMeta] = []
-        dir_rels: list[str] = []
-        chunk_updates: dict[str, set[str]] = defaultdict(set)
+        dir_rels: list[PurePosixPath] = []
+        chunk_updates: dict[str, set[PathLike]] = defaultdict(set)
         async with anyio.create_task_group() as tg:
             async for _, sd, sf in self._index.walk(src):
                 for info in sf:
                     tg.start_soon(_collect_chunk_updates, info)
-                abs_src_prefix = self._to_abs_path(src_prefix)
-                dir_rels.extend(self._to_abs_path(d.path)[len(abs_src_prefix) :] for d in sd)
+                dir_rels.extend(self.normalize_path(d.path).relative_to(src) for d in sd)
 
         # 创建目标目录结构
         await self.mkdir(dst, parents=True, exist_ok=True)
-        for rel in sorted(dir_rels, key=lambda r: r.count("/")):
-            await self.mkdir(dst_prefix + rel, parents=True, exist_ok=True)
+        for rel in sorted(dir_rels, key=lambda r: len(r.parts)):
+            await self.mkdir(dst.joinpath(rel), parents=True, exist_ok=True)
 
         # 并发更新 chunk refs
-        async def _batch_incref(chunk_hash: str, dst_paths: set[str]) -> None:
+        async def batch_incref(chunk_hash: str, dst_paths: set[PurePosixPath]) -> None:
             async with self._lock_chunk(chunk_hash):
                 await self._chunk_incref(chunk_hash, *dst_paths)
 
         async with anyio.create_task_group() as tg:
             for chunk_hash, dst_paths in chunk_updates.items():
-                tg.start_soon(_batch_incref, chunk_hash, dst_paths)
+                tg.start_soon(batch_incref, chunk_hash, dst_paths)
 
         # 并发创建目标文件元数据
-        async def _create_dst_meta(src_meta: FileMeta) -> None:
-            dst_file = dst_prefix + src_meta.info.path[len(src_prefix) :]
+        async def create_dst_meta(src_meta: FileMeta) -> None:
+            dst_file = dst.joinpath(self.normalize_path(src_meta.info.path).relative_to(src))
             async with self._lock_index(dst_file):
                 if old_meta := await self._get_file_meta(dst_file):
                     async with self._lock_chunks(old_meta.chunks), anyio.create_task_group() as inner_tg:
                         for chunk_hash in old_meta.chunks:
                             inner_tg.start_soon(self._chunk_decref, chunk_hash, dst_file)
                 dst_meta = FileMeta(
-                    info=dataclasses.replace(src_meta.info, path=dst_file, name=PurePosixPath(dst_file).name),
+                    info=dataclasses.replace(
+                        src_meta.info,
+                        path=dst_file.as_posix(),
+                        name=PurePosixPath(dst_file).name,
+                    ),
                     chunks=src_meta.chunks.copy(),
                 )
                 dst_meta_bytes = dst_meta.model_dump_json().encode()
@@ -781,7 +777,7 @@ class IndexStorage(AbstractStorage):
 
         async with anyio.create_task_group() as tg:
             for src_meta in files:
-                tg.start_soon(_create_dst_meta, src_meta)
+                tg.start_soon(create_dst_meta, src_meta)
 
         self.log.info(
             f"CopyTree complete: {_colored_src} → {_colored_dst} "
@@ -789,9 +785,9 @@ class IndexStorage(AbstractStorage):
         )
 
     @override
-    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
-        src = self._to_abs_path(src)
-        dst = self._to_abs_path(dst)
+    async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         _colored_src = f"<y>{escape_tag(src)}</y>"
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
         self.log.info(f"MoveTree: {_colored_src} → {_colored_dst}")
@@ -802,48 +798,44 @@ class IndexStorage(AbstractStorage):
         if not overwrite and await self._index.is_dir(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
 
-        src_prefix = src.rstrip("/")
-        dst_prefix = dst.rstrip("/")
-
         # walk 收集源树所有文件
-        async def _collect(info: FileInfo) -> None:
+        async def collect_chunks(info: FileInfo) -> None:
             meta = await self._get_file_meta(info.path)
             if meta is None:
                 raise FileNotFoundError(f"File not found: {info.path}")
             files.append(meta)
-            src_file = meta.info.path
-            dst_file = dst_prefix + meta.info.path[len(src_prefix) :]
+            src_file = self.normalize_path(meta.info.path)
+            dst_file = dst.joinpath(src_file.relative_to(src))
             for chunk_hash in meta.chunks:
                 chunk_transrefs[chunk_hash].append((src_file, dst_file))
 
         files: list[FileMeta] = []
-        dir_rels: list[str] = []
-        chunk_transrefs: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        dir_rels: list[PurePosixPath] = []
+        chunk_transrefs: dict[str, list[tuple[PathLike, PathLike]]] = defaultdict(list)
         async with anyio.create_task_group() as tg:
             async for _, sd, sf in self._index.walk(src):
                 for info in sf:
-                    tg.start_soon(_collect, info)
-                abs_src_prefix = self._to_abs_path(src_prefix)
-                dir_rels.extend(self._to_abs_path(d.path)[len(abs_src_prefix) :] for d in sd)
+                    tg.start_soon(collect_chunks, info)
+                dir_rels.extend(self.normalize_path(d.path).relative_to(src) for d in sd)
 
         # 创建目标目录结构
         await self.mkdir(dst, parents=True, exist_ok=True)
-        for rel in sorted(dir_rels, key=lambda r: r.count("/")):
-            await self.mkdir(dst_prefix + rel, parents=True, exist_ok=True)
+        for rel in sorted(dir_rels, key=lambda r: len(r.parts)):
+            await self.mkdir(dst.joinpath(rel).as_posix(), parents=True, exist_ok=True)
 
         # 批量 transref: 每个 chunk 一把锁，一次处理全部 (src,dst) 对
-        async def _batch_transref(chunk_hash: str, pairs: list[tuple[str, str]]) -> None:
+        async def batch_transref(chunk_hash: str, pairs: list[tuple[PathLike, PathLike]]) -> None:
             async with self._lock_chunk(chunk_hash):
                 await self._chunk_transref(chunk_hash, *pairs)
 
         async with anyio.create_task_group() as tg:
             for chunk_hash, pairs in chunk_transrefs.items():
-                tg.start_soon(_batch_transref, chunk_hash, pairs)
+                tg.start_soon(batch_transref, chunk_hash, pairs)
 
         # 移动文件 meta (锁 src+dst, 写 dst, 删 src)
-        async def _move_meta(src_meta: FileMeta) -> None:
-            src_file = src_meta.info.path
-            dst_file = dst_prefix + src_file[len(src_prefix) :]
+        async def move_meta(src_meta: FileMeta) -> None:
+            src_file = self.normalize_path(src_meta.info.path)
+            dst_file = dst.joinpath(src_file.relative_to(src))
             async with self._lock_indexes(src_file, dst_file):
                 # overwrite: 清理目标端旧 chunks
                 if old_meta := await self._get_file_meta(dst_file):
@@ -851,7 +843,11 @@ class IndexStorage(AbstractStorage):
                         for chunk_hash in old_meta.chunks:
                             inner_tg.start_soon(self._chunk_decref, chunk_hash, dst_file)
                 dst_meta = FileMeta(
-                    info=dataclasses.replace(src_meta.info, path=dst_file, name=PurePosixPath(dst_file).name),
+                    info=dataclasses.replace(
+                        src_meta.info,
+                        path=dst_file.as_posix(),
+                        name=PurePosixPath(dst_file).name,
+                    ),
                     chunks=src_meta.chunks.copy(),
                 )
                 await self._index.upload_bytes(dst_meta.model_dump_json().encode(), dst_file, overwrite=True)
@@ -859,11 +855,11 @@ class IndexStorage(AbstractStorage):
 
         async with anyio.create_task_group() as tg:
             for src_meta in files:
-                tg.start_soon(_move_meta, src_meta)
+                tg.start_soon(move_meta, src_meta)
 
         # 清理源目录结构 (自底向上)
-        for rel in sorted(dir_rels, key=lambda r: r.count("/"), reverse=True):
-            await self._index.rmdir(src_prefix + rel)
+        for rel in sorted(dir_rels, key=lambda r: len(r.parts), reverse=True):
+            await self._index.rmdir(src.joinpath(rel))
         await self._index.rmdir(src)
 
         self.log.info(
@@ -872,19 +868,20 @@ class IndexStorage(AbstractStorage):
         )
 
     @override
-    async def exists(self, path: str) -> bool:
-        return await self._index.exists(path)
+    async def exists(self, path: PathLike) -> bool:
+        return await self._index.exists(self.normalize_path(path))
 
     @override
-    async def is_file(self, path: str) -> bool:
-        return await self._index.is_file(path)
+    async def is_file(self, path: PathLike) -> bool:
+        return await self._index.is_file(self.normalize_path(path))
 
     @override
-    async def is_dir(self, path: str) -> bool:
-        return await self._index.is_dir(path)
+    async def is_dir(self, path: PathLike) -> bool:
+        return await self._index.is_dir(self.normalize_path(path))
 
     @override
-    async def stat(self, path: str) -> FileInfo:
+    async def stat(self, path: PathLike) -> FileInfo:
+        path = self.normalize_path(path)
         try:
             stat = await self._index.stat(path)
         except FileNotFoundError as e:
@@ -896,13 +893,14 @@ class IndexStorage(AbstractStorage):
         return meta.info
 
     @override
-    async def iterdir(self, path: str) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
+        path = self.normalize_path(path)
         if not await self._index.is_dir(path):
             raise NotADirectoryError(f"Not a directory: {path}")
         async for entry in self._index.iterdir(path):
             if entry.is_dir:
                 yield FileInfo(
-                    path=self._to_abs_path(entry.path),
+                    path=self.normalize_path(entry.path).as_posix(),
                     name=entry.name,
                     is_dir=True,
                     size=entry.size,
@@ -915,11 +913,12 @@ class IndexStorage(AbstractStorage):
                     yield meta.info
 
     @override
-    async def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+        path = self.normalize_path(path)
         if not await self._index.is_dir(path):
             raise NotADirectoryError(f"Not a directory: {path}")
 
-        async def _fetch_meta(path: str) -> None:
+        async def _fetch_meta(path: PathLike) -> None:
             meta = await self._get_file_meta(path)
             if meta is not None:
                 files.append(meta.info)
@@ -930,28 +929,26 @@ class IndexStorage(AbstractStorage):
                 for entry in sf:
                     tg.start_soon(_fetch_meta, entry.path)
             files.sort(key=lambda x: x.name)
-            yield (
-                self._to_abs_path(sp),
-                [
-                    FileInfo(
-                        path=self._to_abs_path(d.path),
-                        name=d.name,
-                        is_dir=True,
-                        size=d.size,
-                        modified=d.modified,
-                        created=d.created,
-                    )
-                    for d in sd
-                ],
-                files,
-            )
+            dirs = [
+                FileInfo(
+                    path=self.normalize_path(d.path).as_posix(),
+                    name=d.name,
+                    is_dir=True,
+                    size=d.size,
+                    modified=d.modified,
+                    created=d.created,
+                )
+                for d in sd
+            ]
+            yield (self.normalize_path(sp).as_posix(), dirs, files)
 
     @override
-    async def list_(self, path: str) -> list[FileInfo]:
+    async def list_(self, path: PathLike) -> list[FileInfo]:
+        path = self.normalize_path(path)
         if not await self._index.is_dir(path):
             raise NotADirectoryError(f"Not a directory: {path}")
 
-        async def _fetch_meta(path: str) -> None:
+        async def _fetch_meta(path: PathLike) -> None:
             meta = await self._get_file_meta(path)
             if meta is not None:
                 files.append(meta.info)
@@ -962,7 +959,7 @@ class IndexStorage(AbstractStorage):
                 if entry.is_dir:
                     files.append(
                         FileInfo(
-                            path=self._to_abs_path(entry.path),
+                            path=self.normalize_path(entry.path).as_posix(),
                             name=entry.name,
                             is_dir=True,
                             size=entry.size,

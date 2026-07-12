@@ -9,7 +9,7 @@ import anyio
 import anyio.lowlevel
 
 from app.log import escape_tag
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
+from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
 from app.utils import coalesce_chunks
 
 from .cos_client import (
@@ -77,13 +77,13 @@ class CosStorage(AbstractStorage):
             raise RuntimeError("Client is not connected.")
         return self._client
 
-    def _remote_path_to_key(self, remote_path: str) -> str:
+    def _remote_path_to_key(self, remote_path: PathLike) -> str:
         path = PurePosixPath(remote_path)
         if path.is_absolute():
             path = path.relative_to("/")
         return str(path) if path != PurePosixPath(".") else ""
 
-    def _dir_key(self, path: str) -> str | None:
+    def _dir_key(self, path: PathLike) -> str | None:
         """返回目录标记对象的 COS 键。
 
         目录标记对象使用尾随 ``/`` 的键存储。
@@ -98,10 +98,11 @@ class CosStorage(AbstractStorage):
     async def upload_stream(
         self,
         stream: AsyncIterable[BytesLike],
-        remote_path: str,
+        remote_path: PathLike,
         *,
         overwrite: bool = True,
     ) -> None:
+        remote_path = self.normalize_path(remote_path)
         try:
             info = await self.stat(remote_path)
         except FileNotFoundError:
@@ -115,7 +116,7 @@ class CosStorage(AbstractStorage):
         client = self._ensure_client()
         key = self._remote_path_to_key(remote_path)
         self.log.info(f"Upload: <y>{escape_tag(key)}</y>")
-        await self.mkdir(PurePosixPath(remote_path).parent.as_posix(), parents=True, exist_ok=True)
+        await self.mkdir(remote_path.parent.as_posix(), parents=True, exist_ok=True)
 
         chunk_iter = aiter(coalesce_chunks(stream, UPLOAD_CHUNK_SIZE))
         first_chunk = await anext(chunk_iter, None)
@@ -143,7 +144,7 @@ class CosStorage(AbstractStorage):
     @override
     async def download_stream(
         self,
-        remote_path: str,
+        remote_path: PathLike,
         *,
         offset: int = 0,
     ) -> AsyncIterator[bytes]:
@@ -171,7 +172,7 @@ class CosStorage(AbstractStorage):
             yield chunk
 
     @override
-    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
+    async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
 
@@ -190,7 +191,7 @@ class CosStorage(AbstractStorage):
             raise FileNotFoundError(f"File not found: {path}")
 
     @override
-    async def rmdir(self, path: str) -> None:
+    async def rmdir(self, path: PathLike) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
 
@@ -212,7 +213,7 @@ class CosStorage(AbstractStorage):
         # 3. 不存在：静默成功
 
     @override
-    async def delete(self, path: str) -> None:
+    async def delete(self, path: PathLike) -> None:
         """Delete a file or an empty directory.
 
         Uses inline branching to minimize COS API calls, rather than the
@@ -242,7 +243,7 @@ class CosStorage(AbstractStorage):
         # 3. 不存在：静默成功
 
     @override
-    async def delete_many(self, *paths: str) -> None:
+    async def delete_many(self, *paths: PathLike) -> None:
         client = self._ensure_client()
         objects_to_delete: list[str] = []
 
@@ -271,8 +272,8 @@ class CosStorage(AbstractStorage):
     @override
     async def move(
         self,
-        src: str,
-        dst: str,
+        src: PathLike,
+        dst: PathLike,
     ) -> None:
         src_key = self._remote_path_to_key(src)
         dst_key = self._remote_path_to_key(dst)
@@ -283,8 +284,8 @@ class CosStorage(AbstractStorage):
     @override
     async def copy(
         self,
-        src: str,
-        dst: str,
+        src: PathLike,
+        dst: PathLike,
     ) -> None:
         src_key = self._remote_path_to_key(src)
         dst_key = self._remote_path_to_key(dst)
@@ -304,7 +305,7 @@ class CosStorage(AbstractStorage):
     @override
     async def mkdir(
         self,
-        path: str,
+        path: PathLike,
         *,
         parents: bool = False,
         exist_ok: bool = False,
@@ -342,9 +343,10 @@ class CosStorage(AbstractStorage):
 
         # 创建标记对象
         now = datetime.now(UTC)
+        np = self.normalize_path(path)
         info = FileInfo(
-            path=path,
-            name=PurePosixPath(path).name,
+            path=np.as_posix(),
+            name=np.name,
             is_dir=True,
             size=0,
             modified=now,
@@ -354,7 +356,7 @@ class CosStorage(AbstractStorage):
         self.log.info(f"MkDir: <y>{escape_tag(key)}</y>")
 
     @override
-    async def rmtree(self, path: str) -> None:
+    async def rmtree(self, path: PathLike) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
         self.log.info(f"RmTree: <y>{escape_tag(key)}</y>")
@@ -395,7 +397,7 @@ class CosStorage(AbstractStorage):
         )
 
     @override
-    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+    async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         client = self._ensure_client()
 
         # 类型和策略校验
@@ -404,36 +406,34 @@ class CosStorage(AbstractStorage):
         if not overwrite and await self.is_dir(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
 
-        # walk 收集源树所有文件和目录
-        file_paths: list[str] = []
-        dir_paths: list[str] = []
-        async for _sp, _sd, sf in self.walk(src):
-            file_paths.extend(f.path for f in sf)
-            dir_paths.extend(d.path for d in _sd)
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
 
-        src_prefix = src.rstrip("/")
-        dst_prefix = dst.rstrip("/")
+        # walk 收集源树所有文件和目录
+        file_paths: list[PurePosixPath] = []
+        dir_paths: list[PurePosixPath] = []
+        async for _sp, _sd, sf in self.walk(src):
+            file_paths.extend(self.normalize_path(f.path) for f in sf)
+            dir_paths.extend(self.normalize_path(d.path) for d in _sd)
 
         self.log.info(
-            f"CopyTree: <y>{escape_tag(src_prefix)}</y> → "
-            f"<y>{escape_tag(dst_prefix)}</y> "
+            f"CopyTree: <y>{escape_tag(src)}</y> → <y>{escape_tag(dst)}</y> "
             f"(<g>{len(file_paths)}</g> files, <g>{len(dir_paths)}</g> subdirs)"
         )
 
         # 创建目标端所有目录标记 (按深度排序, 自上而下)
-        all_dst_dirs: set[str] = {dst}
+        all_dst_dirs: set[PurePosixPath] = {dst}
         for dir_path in dir_paths:
-            all_dst_dirs.add(dst_prefix + dir_path[len(src_prefix) :])
+            all_dst_dirs.add(dst.joinpath(dir_path.relative_to(src)))
         for src_file in file_paths:
-            rel = src_file[len(src_prefix) :]
-            all_dst_dirs.add(PurePosixPath(dst_prefix + rel).parent.as_posix())
+            all_dst_dirs.add(dst.joinpath(src_file.relative_to(src)).parent)
 
         dir_created = datetime.now(UTC)
-        for d in sorted(all_dst_dirs, key=lambda p: p.count("/")):
+        for d in sorted(all_dst_dirs, key=lambda p: len(p.parts)):
             if dir_key := self._dir_key(d):
                 info = FileInfo(
-                    path=d,
-                    name=PurePosixPath(d).name,
+                    path=d.as_posix(),
+                    name=d.name,
                     is_dir=True,
                     size=0,
                     modified=dir_created,
@@ -444,11 +444,11 @@ class CosStorage(AbstractStorage):
         # 并发复制所有文件
         async with anyio.create_task_group() as tg:
             for src_file in file_paths:
-                dst_file = dst_prefix + src_file[len(src_prefix) :]
+                dst_file = dst.joinpath(src_file.relative_to(src))
                 tg.start_soon(self.copy, src_file, dst_file)
 
     @override
-    async def exists(self, path: str) -> bool:
+    async def exists(self, path: PathLike) -> bool:
         key = self._remote_path_to_key(path)
         if key == "":
             return True  # 根目录始终存在
@@ -467,13 +467,13 @@ class CosStorage(AbstractStorage):
         return False
 
     @override
-    async def is_file(self, path: str) -> bool:
+    async def is_file(self, path: PathLike) -> bool:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
         return await client.head_object(key=key) is not None
 
     @override
-    async def is_dir(self, path: str) -> bool:
+    async def is_dir(self, path: PathLike) -> bool:
         key = self._remote_path_to_key(path)
         if key == "":
             return True  # 根目录始终为目录
@@ -484,20 +484,21 @@ class CosStorage(AbstractStorage):
         return await self._ensure_client().head_object(key=dir_key) is not None
 
     @override
-    async def stat(self, path: str) -> FileInfo:
+    async def stat(self, path: PathLike) -> FileInfo:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        np = self.normalize_path(path)
 
         # 根目录：不需要 COS 请求
         if key == "":
-            return FileInfo(path=path, name="", is_dir=True, size=0)
+            return FileInfo(path=np.as_posix(), name="", is_dir=True, size=0)
 
         # 1. 尝试作为常规文件
         head = await client.head_object(key=key)
         if head is not None:
             return FileInfo(
-                path=path,
-                name=PurePosixPath(path).name,
+                path=np.as_posix(),
+                name=np.name,
                 size=head.content_length,
                 is_dir=False,
                 modified=head.last_modified,
@@ -509,22 +510,23 @@ class CosStorage(AbstractStorage):
             head = await client.head_object(key=dir_key)
             if head is not None:
                 body = await client.get_object(key=dir_key)
-                return deserialize_file_info(path, body)
+                return deserialize_file_info(np.as_posix(), body)
 
         raise FileNotFoundError(f"Object not found: {path}")
 
     @override
-    def iterdir(self, path: str) -> AsyncIterator[FileInfo]:
+    def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
         key = self._remote_path_to_key(path)
         return self._iterdir(key)
 
     @override
-    def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         key = self._remote_path_to_key(path)
         return self._walk(key)
 
     async def _iterdir(self, key: str) -> AsyncIterator[FileInfo]:
         client = self._ensure_client()
+        key = key.removeprefix("/")
         prefix = (key + "/") if key else None
         async for obj in client.list_objects(prefix=prefix, delimiter="/"):
             if isinstance(obj, ListObjectsDir):
@@ -535,7 +537,7 @@ class CosStorage(AbstractStorage):
                 except CosHttpStatusError:
                     # 无标记对象 → 不是合法目录，跳过
                     continue
-                yield deserialize_file_info(dir_path, body)
+                yield deserialize_file_info(self.normalize_path(dir_path).as_posix(), body)
                 continue
 
             # 提取直接子级名称
@@ -547,7 +549,7 @@ class CosStorage(AbstractStorage):
                 continue
 
             yield FileInfo(
-                path=obj.key,
+                path=self.normalize_path(obj.key).as_posix(),
                 name=rest,
                 is_dir=False,
                 size=obj.size,
@@ -560,13 +562,13 @@ class CosStorage(AbstractStorage):
         async for file in self._iterdir(key):
             (dirs if file.is_dir else files).append(file)
 
-        yield key, dirs, files
+        yield self.normalize_path(key).as_posix(), dirs, files
         for dir in dirs:
             async for sp, sd, sf in self._walk(dir.path):
                 yield sp, sd, sf
 
     @override
-    async def list_(self, path: str) -> list[FileInfo]:
+    async def list_(self, path: PathLike) -> list[FileInfo]:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
         prefix = (key + "/") if key else None
@@ -578,7 +580,7 @@ class CosStorage(AbstractStorage):
             except CosHttpStatusError:
                 # 无标记对象 → 不是合法目录，跳过
                 return
-            infos.append(deserialize_file_info(dir_path, body))
+            infos.append(deserialize_file_info(self.normalize_path(dir_path).as_posix(), body))
 
         async with anyio.create_task_group() as tg:
             async for obj in client.list_objects(prefix=prefix, delimiter="/"):
@@ -597,7 +599,7 @@ class CosStorage(AbstractStorage):
 
                 infos.append(
                     FileInfo(
-                        path=obj.key,
+                        path=self.normalize_path(obj.key).as_posix(),
                         name=rest,
                         is_dir=False,
                         size=obj.size,
@@ -645,7 +647,7 @@ class CosStorage(AbstractStorage):
             raise
 
     @override
-    async def _is_dir_empty(self, path: str) -> bool:
+    async def _is_dir_empty(self, path: PathLike) -> bool:
         key = self._remote_path_to_key(path)
         prefix = (key + "/") if key else None
         async for item in self._ensure_client().list_objects(prefix=prefix, delimiter="/", max_keys=2):

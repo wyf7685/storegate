@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import final, override
 
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo
+from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
 
 _sid = itertools.count()
 
@@ -58,12 +58,9 @@ class MemoryStorage(AbstractStorage):
     # Path helpers
     # ------------------------------------------------------------------
 
-    def _resolve(self, path: str) -> str:
+    def _resolve(self, path: PathLike) -> str:
         """Normalise *path* relative to ``self._root``."""
-        p = PurePosixPath(path)
-        if p.is_absolute():
-            p = p.relative_to("/")
-        resolved = str(PurePosixPath(self._root) / p)
+        resolved = self._root.joinpath(self.normalize_path(path).relative_to("/")).as_posix()
         return "" if resolved in (".", "/") else resolved
 
     # ------------------------------------------------------------------
@@ -91,7 +88,7 @@ class MemoryStorage(AbstractStorage):
     async def upload_stream(
         self,
         stream: AsyncIterable[BytesLike],
-        remote_path: str,
+        remote_path: PathLike,
         *,
         overwrite: bool = True,
     ) -> None:
@@ -121,7 +118,7 @@ class MemoryStorage(AbstractStorage):
     @override
     async def download_stream(
         self,
-        remote_path: str,
+        remote_path: PathLike,
         *,
         offset: int = 0,
     ) -> AsyncIterator[bytes]:
@@ -145,7 +142,7 @@ class MemoryStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
+    async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
         target = self._resolve(path)
 
         if target in self._files:
@@ -161,7 +158,7 @@ class MemoryStorage(AbstractStorage):
         raise FileNotFoundError(f"File not found: {path}")
 
     @override
-    async def rmdir(self, path: str) -> None:
+    async def rmdir(self, path: PathLike) -> None:
         target = self._resolve(path)
 
         if target in self._files:
@@ -181,7 +178,7 @@ class MemoryStorage(AbstractStorage):
                 raise OSError(f"Directory not empty: {path}")
 
     @override
-    async def move(self, src: str, dst: str) -> None:
+    async def move(self, src: PathLike, dst: PathLike) -> None:
         source = self._resolve(src)
         dest = self._resolve(dst)
 
@@ -196,7 +193,7 @@ class MemoryStorage(AbstractStorage):
         self._files[dest] = self._files.pop(source)
 
     @override
-    async def copy(self, src: str, dst: str) -> None:
+    async def copy(self, src: PathLike, dst: PathLike) -> None:
         source = self._resolve(src)
         dest = self._resolve(dst)
 
@@ -217,7 +214,7 @@ class MemoryStorage(AbstractStorage):
     @override
     async def mkdir(
         self,
-        path: str,
+        path: PathLike,
         *,
         parents: bool = False,
         exist_ok: bool = False,
@@ -243,7 +240,7 @@ class MemoryStorage(AbstractStorage):
         self._dirs.add(target or "")
 
     @override
-    async def rmtree(self, path: str) -> None:
+    async def rmtree(self, path: PathLike) -> None:
         target = self._resolve(path)
 
         if target in self._files:
@@ -260,7 +257,7 @@ class MemoryStorage(AbstractStorage):
                 self._dirs.discard(key)
 
     @override
-    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+    async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         target_src = self._resolve(src)
         target_dst = self._resolve(dst)
 
@@ -314,7 +311,7 @@ class MemoryStorage(AbstractStorage):
             self._files[dst_path] = self._files[src_path]
 
     @override
-    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+    async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         target_src = self._resolve(src)
         target_dst = self._resolve(dst)
 
@@ -367,29 +364,29 @@ class MemoryStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def exists(self, path: str) -> bool:
+    async def exists(self, path: PathLike) -> bool:
         target = self._resolve(path)
         return target in self._files or target in self._dirs or self._is_dir(target)
 
     @override
-    async def is_file(self, path: str) -> bool:
+    async def is_file(self, path: PathLike) -> bool:
         return self._resolve(path) in self._files
 
     @override
-    async def is_dir(self, path: str) -> bool:
+    async def is_dir(self, path: PathLike) -> bool:
         target = self._resolve(path)
         if target in self._dirs:
             return True
         return target == "" or self._is_dir(target)
 
     @override
-    async def stat(self, path: str) -> FileInfo:
+    async def stat(self, path: PathLike) -> FileInfo:
         target = self._resolve(path)
         name = PurePosixPath(target).name if target else ""
 
         if target in self._files:
             return FileInfo(
-                path=path,
+                path=self.normalize_path(path).as_posix(),
                 name=name,
                 is_dir=False,
                 size=len(self._files[target]),
@@ -399,7 +396,7 @@ class MemoryStorage(AbstractStorage):
 
         if target in self._dirs or target == "" or self._is_dir(target):
             return FileInfo(
-                path=path,
+                path=self.normalize_path(path).as_posix(),
                 name=name,
                 is_dir=True,
                 size=0,
@@ -414,7 +411,7 @@ class MemoryStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def iterdir(self, path: str) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
         target = self._resolve(path)
 
         # Allow listing root that has files but hasn't been explicitly mkdir'd.
@@ -428,14 +425,14 @@ class MemoryStorage(AbstractStorage):
         for d in self._dirs:
             if d == target or not d.startswith(prefix):
                 continue
-            rest = d[len(prefix) :]
-            if "/" in rest:
-                continue  # not an immediate child
+            rest = d[len(prefix) :].lstrip("/")
+            if not rest or "/" in rest:
+                continue  # root marker or not an immediate child
             if rest in seen:
                 continue
             seen.add(rest)
             yield FileInfo(
-                path=f"{path}/{rest}" if path else rest,
+                path=self.normalize_path(path).joinpath(rest).as_posix(),
                 name=rest,
                 is_dir=True,
                 size=0,
@@ -447,14 +444,14 @@ class MemoryStorage(AbstractStorage):
         for fpath, content in self._files.items():
             if not fpath.startswith(prefix):
                 continue
-            rest = fpath[len(prefix) :]
-            if "/" in rest:
+            rest = fpath[len(prefix) :].lstrip("/")
+            if not rest or "/" in rest:
                 continue  # not an immediate child
             if rest in seen:
                 continue
             seen.add(rest)
             yield FileInfo(
-                path=f"{path}/{rest}" if path else rest,
+                path=self.normalize_path(path).joinpath(rest).as_posix(),
                 name=rest,
                 is_dir=False,
                 size=len(content),
@@ -463,7 +460,7 @@ class MemoryStorage(AbstractStorage):
             )
 
     @override
-    async def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         target = self._resolve(path)
 
         if target not in self._dirs and target != "" and not self._is_dir(target):
@@ -480,8 +477,8 @@ class MemoryStorage(AbstractStorage):
         for d in self._dirs:
             if d == target or not d.startswith(prefix):
                 continue
-            rest = d[len(prefix) :]
-            if "/" in rest:
+            rest = d[len(prefix) :].lstrip("/")
+            if not rest or "/" in rest:
                 continue
             if rest in seen:
                 continue
@@ -489,7 +486,7 @@ class MemoryStorage(AbstractStorage):
             dir_names.add(rest)
             dirs.append(
                 FileInfo(
-                    path=f"{path}/{rest}" if path else rest,
+                    path=self.normalize_path(path).joinpath(rest).as_posix(),
                     name=rest,
                     is_dir=True,
                     size=0,
@@ -501,15 +498,15 @@ class MemoryStorage(AbstractStorage):
         for fpath, content in self._files.items():
             if not fpath.startswith(prefix):
                 continue
-            rest = fpath[len(prefix) :]
-            if "/" in rest:
+            rest = fpath[len(prefix) :].lstrip("/")
+            if not rest or "/" in rest:
                 continue
             if rest in seen:
                 continue
             seen.add(rest)
             files.append(
                 FileInfo(
-                    path=f"{path}/{rest}" if path else rest,
+                    path=self.normalize_path(path).joinpath(rest).as_posix(),
                     name=rest,
                     is_dir=False,
                     size=len(content),
@@ -518,9 +515,9 @@ class MemoryStorage(AbstractStorage):
                 )
             )
 
-        yield path, dirs, files
+        yield self.normalize_path(path).as_posix(), dirs, files
 
         for d in sorted(dir_names):
-            sub_path = f"{path}/{d}" if path else d
+            sub_path = str(PurePosixPath(path) / d) if path else d
             async for sp, sd, sf in self.walk(sub_path):
                 yield sp, sd, sf

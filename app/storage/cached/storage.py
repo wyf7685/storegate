@@ -5,7 +5,7 @@ from typing import Literal, final, override
 
 from app.log import escape_tag
 
-from ..abstract import AbstractStorage, BytesLike, FileInfo
+from ..abstract import AbstractStorage, BytesLike, FileInfo, PathLike
 from .backend import CacheBackend
 from .backend.memory import MemoryCacheBackend
 
@@ -128,7 +128,7 @@ class CachedStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _normalize(path: str) -> str:
+    def _normalize(path: PathLike) -> str:
         """Normalise *path* into a cache key.
 
         Strips leading ``/`` and collapses ``"."`` to ``""``,
@@ -154,7 +154,7 @@ class CachedStorage(AbstractStorage):
 
     async def _invalidate_path(
         self,
-        path: str,
+        path: PathLike,
         *,
         exists: bool | None = None,
         is_file: bool | None = None,
@@ -224,7 +224,7 @@ class CachedStorage(AbstractStorage):
     async def upload_stream(
         self,
         stream: AsyncIterable[BytesLike],
-        remote_path: str,
+        remote_path: PathLike,
         *,
         overwrite: bool = True,
     ) -> None:
@@ -257,7 +257,7 @@ class CachedStorage(AbstractStorage):
     @override
     async def download_stream(
         self,
-        remote_path: str,
+        remote_path: PathLike,
         *,
         offset: int = 0,
     ) -> AsyncIterator[bytes]:
@@ -299,28 +299,28 @@ class CachedStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def unlink(self, path: str, *, missing_ok: bool = False) -> None:
+    async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
         await self._storage.unlink(path, missing_ok=missing_ok)
         await self._invalidate_path(path, exists=False, is_file=False, is_dir=False)
 
     @override
-    async def rmdir(self, path: str) -> None:
+    async def rmdir(self, path: PathLike) -> None:
         await self._storage.rmdir(path)
         await self._invalidate_path(path, exists=False, is_file=False, is_dir=False)
 
     @override
-    async def delete(self, path: str) -> None:
+    async def delete(self, path: PathLike) -> None:
         await self._storage.delete(path)
         await self._invalidate_path(path, exists=False, is_file=False, is_dir=False)
 
     @override
-    async def delete_many(self, *paths: str) -> None:
+    async def delete_many(self, *paths: PathLike) -> None:
         await self._storage.delete_many(*paths)
         for path in paths:
             await self._invalidate_path(path)
 
     @override
-    async def move(self, src: str, dst: str) -> None:
+    async def move(self, src: PathLike, dst: PathLike) -> None:
         await self._storage.move(src, dst)
 
         # Attempt to infer dst type from src cache (may be expired -> None)
@@ -334,7 +334,7 @@ class CachedStorage(AbstractStorage):
         await self._invalidate_path(dst, exists=True, is_file=dst_is_file, is_dir=dst_is_dir)
 
     @override
-    async def copy(self, src: str, dst: str) -> None:
+    async def copy(self, src: PathLike, dst: PathLike) -> None:
         await self._storage.copy(src, dst)
 
         # Attempt to infer dst type from src cache (may be expired -> None)
@@ -353,7 +353,7 @@ class CachedStorage(AbstractStorage):
     @override
     async def mkdir(
         self,
-        path: str,
+        path: PathLike,
         *,
         parents: bool = False,
         exist_ok: bool = False,
@@ -374,19 +374,19 @@ class CachedStorage(AbstractStorage):
             await self._invalidate_path(path, exists=True, is_file=False, is_dir=True)
 
     @override
-    async def rmtree(self, path: str) -> None:
+    async def rmtree(self, path: PathLike) -> None:
         await self._storage.rmtree(path)
         self.log.debug("RmTree — clearing all caches")
         await self._clear_all_caches()
 
     @override
-    async def copytree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+    async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         await self._storage.copytree(src, dst, overwrite=overwrite)
         self.log.debug("CopyTree — clearing all caches")
         await self._clear_all_caches()
 
     @override
-    async def movetree(self, src: str, dst: str, *, overwrite: bool = True) -> None:
+    async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         await self._storage.movetree(src, dst, overwrite=overwrite)
         self.log.debug("MoveTree — clearing all caches")
         await self._clear_all_caches()
@@ -396,7 +396,7 @@ class CachedStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def exists(self, path: str) -> bool:
+    async def exists(self, path: PathLike) -> bool:
         np = self._normalize(path)
         cached: bool | None = await self._cache.get("exists", np)
         if cached is not None:
@@ -416,7 +416,7 @@ class CachedStorage(AbstractStorage):
         return result
 
     @override
-    async def is_file(self, path: str) -> bool:
+    async def is_file(self, path: PathLike) -> bool:
         np = self._normalize(path)
         cached: bool | None = await self._cache.get("is_file", np)
         if cached is not None:
@@ -436,7 +436,7 @@ class CachedStorage(AbstractStorage):
         return result
 
     @override
-    async def is_dir(self, path: str) -> bool:
+    async def is_dir(self, path: PathLike) -> bool:
         np = self._normalize(path)
         cached: bool | None = await self._cache.get("is_dir", np)
         if cached is not None:
@@ -465,7 +465,7 @@ class CachedStorage(AbstractStorage):
         ]
 
     @override
-    async def stat(self, path: str) -> FileInfo:
+    async def stat(self, path: PathLike) -> FileInfo:
         np = self._normalize(path)
         cached: FileInfo | None = await self._cache.get("stat", np)
         if cached is not None:
@@ -482,7 +482,7 @@ class CachedStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def iterdir(self, path: str) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
         np = self._normalize(path)
         cached: list[FileInfo] | None = await self._cache.get("iterdir", np)
         if cached is not None:
@@ -501,18 +501,18 @@ class CachedStorage(AbstractStorage):
         self.log.debug(f"Cache miss: <le>iterdir</>(<y>{escape_tag(np)}</y>) → <g>{len(entries)}</g> entries")
 
     @override
-    async def walk(self, path: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
         dirs: list[FileInfo] = []
         files: list[FileInfo] = []
         async for entry in self.iterdir(path):
             (dirs if entry.is_dir else files).append(entry)
-        yield path, dirs, files
+        yield self.normalize_path(path).as_posix(), dirs, files
         for d in dirs:
             async for result in self.walk(d.path):
                 yield result
 
     @override
-    async def list_(self, path: str) -> list[FileInfo]:
+    async def list_(self, path: PathLike) -> list[FileInfo]:
         infos: list[FileInfo] = await self._storage.list_(path)
         await self._cache.mset(
             *itertools.chain.from_iterable(
