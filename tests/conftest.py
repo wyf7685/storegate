@@ -114,28 +114,31 @@ def _dav_server() -> Generator[str]:
     Runs in a dedicated thread + event loop so it is independent of the
     pytest-asyncio event loop scope. Returns the base URL.
     """
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
 
     from app.protocol.dav.server import DAVServer
     from app.storage.memory import MemoryStorage
 
-    server = DAVServer(MemoryStorage("/"), host="127.0.0.1", port=port)
     stop_event = asyncio.Event()
 
-    async def _runner():
+    async def _runner(port: int, stop_event: asyncio.Event) -> None:
+        server = DAVServer(MemoryStorage("/"), host="127.0.0.1", port=port)
+        server_task = asyncio.create_task(server.serve())
+        stop_task = asyncio.create_task(stop_event.wait())
         _, pending = await asyncio.wait(
-            (server.serve(), stop_event.wait()),
+            (server_task, stop_task),
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
             task.cancel()
 
-    thread = threading.Thread(target=asyncio.run, args=(_runner(),), daemon=True)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    thread = threading.Thread(target=lambda: asyncio.run(_runner(port, stop_event)), daemon=True)
     thread.start()
     _wait_dav_port("127.0.0.1", port)
+
     try:
         yield f"http://127.0.0.1:{port}"
     finally:
@@ -143,7 +146,7 @@ def _dav_server() -> Generator[str]:
         thread.join(timeout=5)
 
 
-def _wait_dav_port(host: str, port: int, timeout: float = 10.0) -> None:
+def _wait_dav_port(host: str, port: int, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
