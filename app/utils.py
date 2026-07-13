@@ -10,7 +10,7 @@ from collections.abc import (
     Generator,
     Iterable,
 )
-from typing import TYPE_CHECKING, Concatenate, Literal
+from typing import TYPE_CHECKING, Concatenate, Literal, TypedDict, Unpack
 
 from app.const import DEFAULT_CHUNK_SIZE
 
@@ -26,7 +26,17 @@ _valid_log_levels: set[_ValidLogLevel] = {
     "ERROR",
     "CRITICAL",
 }
-type _LogException = Exception | bool | None
+
+
+class LoguruOpts(TypedDict, total=False):
+    exception: bool | BaseException | None
+    record: bool
+    lazy: bool
+    colors: bool
+    raw: bool
+    capture: bool
+    depth: int
+    ansi: bool
 
 
 class LoggerWrapper:
@@ -38,21 +48,21 @@ class LoggerWrapper:
         self,
         level: _ValidLogLevel,
         message: str,
-        exception: _LogException = None,
+        **opts: Unpack[LoguruOpts],
     ) -> None:
-        self.logger.opt(colors=True, exception=exception).log(level, f"<m>{self.logger_name}</m> | {message}")
+        self.logger.opt(**{**opts, "colors": True}).log(level, f"<m>{self.logger_name}</m> | {message}")
 
     __call__ = log
 
     if TYPE_CHECKING:
 
-        def trace(self, message: str, exception: _LogException = None) -> None: ...
-        def debug(self, message: str, exception: _LogException = None) -> None: ...
-        def info(self, message: str, exception: _LogException = None) -> None: ...
-        def success(self, message: str, exception: _LogException = None) -> None: ...
-        def warning(self, message: str, exception: _LogException = None) -> None: ...
-        def error(self, message: str, exception: _LogException = None) -> None: ...
-        def critical(self, message: str, exception: _LogException = None) -> None: ...
+        def trace(self, message: str, **opts: Unpack[LoguruOpts]) -> None: ...
+        def debug(self, message: str, **opts: Unpack[LoguruOpts]) -> None: ...
+        def info(self, message: str, **opts: Unpack[LoguruOpts]) -> None: ...
+        def success(self, message: str, **opts: Unpack[LoguruOpts]) -> None: ...
+        def warning(self, message: str, **opts: Unpack[LoguruOpts]) -> None: ...
+        def error(self, message: str, **opts: Unpack[LoguruOpts]) -> None: ...
+        def critical(self, message: str, **opts: Unpack[LoguruOpts]) -> None: ...
     else:
 
         def __getattr__(self, item: str) -> Callable[[str, Exception | None], None]:
@@ -60,14 +70,14 @@ class LoggerWrapper:
             if level not in _valid_log_levels:
                 raise AttributeError(f"Invalid log level: {item}")
 
-            def method(message: str, exception: _LogException = None) -> None:
-                self.log(level, message, exception)
+            def method(message: str, **opts: Unpack[LoguruOpts]) -> None:
+                self.log(level, message, **opts)
 
             setattr(self, item, method)
             return method
 
-    def exception(self, message: str) -> None:
-        self.log("ERROR", message, exception=True)
+    def exception(self, message: str, **opts: Unpack[LoguruOpts]) -> None:
+        self.log("ERROR", message, **{**opts, "exception": True})
 
 
 def logger_wrapper(logger_name: str, /) -> LoggerWrapper:
