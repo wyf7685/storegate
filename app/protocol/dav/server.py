@@ -92,7 +92,7 @@ class DAVServer:
         self.host = host
         self.port = port
 
-    async def serve(self):
+    async def serve(self) -> None:
         import uvicorn
 
         configure_logging()

@@ -36,18 +36,22 @@ uv run ty check                  # 静态类型检查
 
 ```
 tests/
-├── conftest.py              # 核心 fixture：uid() + 参数化 storage（5 后端）
+├── conftest.py              # 核心 fixture：uid() + 参数化 storage（6 后端）+ _dav_server
 ├── test_storage_general.py  # 通用接口测试（对所有后端执行）
 ├── test_s3_internals.py     # S3 特有测试（标记 @pytest.mark.s3）
 ├── test_s3_rollback.py      # S3 回滚路径测试（mocked client）
 ├── test_s3_signer.py        # SigV4 签名向量单测（AWS 官方测试向量，无需 credentials）
 ├── test_cached_storage.py   # CachedStorage 缓存状态验证（16 测试）
 ├── test_index_storage.py    # IndexStorage 分块/引用计数验证（15 测试）
+├── test_dav_config.py       # DavConfig 校验 + auth builder 单测（无需网络）
+├── test_dav_xml.py          # multistatus XML 解析单测（无需网络）
+├── test_dav_rollback.py     # DavStorage 错误路径单测（mocked client）
+├── test_dav_internals.py    # DavStorage 集成测试（本地 wsgidav，标记 @pytest.mark.dav）
 ├── test_ftp_handler.py      # FTP 命令分发单元测试
 └── test_storage_factory.py  # ObjectSpec 序列化/反序列化测试
 ```
 
-**参数化 fixture**：`storage` fixture 将每个测试对 5 个后端各执行一次：`memory` / `local` / `s3` / `cached` / `index`。S3 在 credentials 缺失时 `pytest.skip()`。`cached` 和 `index` 均以 `MemoryStorage` 为内部后端，保证可重现。使用 `pytest-xdist` 并行执行测试（`-n auto`）。
+**参数化 fixture**：`storage` fixture 将每个测试对 6 个后端各执行一次：`memory` / `local` / `s3` / `cached` / `index` / `dav`。S3 在 credentials 缺失时 `pytest.skip()`。`cached` 和 `index` 均以 `MemoryStorage` 为内部后端，保证可重现。`dav` 通过 session 级 `_dav_server` fixture 在独立线程 + 事件循环中启动本地 wsgidav（以 `MemoryStorage` 为后端），`DavStorage` 客户端连入形成 client→server→MemoryStorage 闭环——因 wsgidav 已是依赖，`dav` 测试**始终运行**（不像 S3 skip）。使用 `pytest-xdist` 并行执行测试（`-n auto`）。
 
 **覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出覆盖报告。
 
@@ -80,7 +84,15 @@ app/
 │   ├── index/             # 分块索引层（大文件 → block 拆分 + ref-counted chunk）
 │   │   └── storage.py     # IndexStorage: index + chunks 双存储，乐观锁 file-lock
 │   ├── local/             # LocalStorage: 本地文件系统
-│   └── memory/            # MemoryStorage: 内存实现，测试/临时用途
+│   ├── memory/            # MemoryStorage: 内存实现，测试/临时用途
+│   └── dav/               # WebDAV 客户端实现（访问远程 WebDAV 服务器）
+│       ├── dav_client/    # 自研 WebDAV SDK (httpx-based)
+│       │   ├── auth.py     # build_auth: Basic / Bearer / Anonymous
+│       │   ├── client.py   # AsyncDavClient: httpx-based, PROPFIND/MKCOL/COPY/MOVE
+│       │   ├── errors.py   # DavClientError, DavHttpStatusError, DavResponseParseError
+│       │   └── models.py   # DavConfig, DavResource, AuthMode
+│       ├── storage.py     # DavStorage: WebDAV → AbstractStorage 映射
+│       └── utils.py       # multistatus XML 解析、DavResource → FileInfo
 ├── protocol/
 │   ├── dav/               # WebDAV 服务（wsgidav + uvicorn）
 │   │   ├── server.py      # DAVServer: 创建 wsgidav app, 包装 ASGI lifespan
@@ -96,19 +108,24 @@ app/
 │       ├── response.py    # FTP 响应码枚举 (R)
 │       └── listing.py     # Unix ls -l 格式输出
 tests/
-├── conftest.py            # uid(), 参数化 storage fixture（5 后端）
+├── conftest.py            # uid(), 参数化 storage fixture（6 后端）, _dav_server
 ├── test_storage_general.py
 ├── test_s3_internals.py
 ├── test_s3_rollback.py
 ├── test_s3_signer.py
 ├── test_cached_storage.py
-└── test_index_storage.py
+├── test_index_storage.py
+├── test_dav_config.py
+├── test_dav_xml.py
+├── test_dav_rollback.py
+└── test_dav_internals.py
 ```
 
 ### 核心抽象与设计模式
 
 **`AbstractStorage`** 是唯一存储接口，所有后端之间互相对称：
 - **简单后端**: `LocalStorage`, `MemoryStorage` — 直接实现存储
+- **网络后端**: `S3Storage`, `DavStorage` — 自研 async HTTP 客户端 SDK（`s3_client/` / `dav_client/`）+ 存储适配器，对称结构
 - **中间件模式**: `CachedStorage` 和 `IndexStorage` 都包装其他 `AbstractStorage` 实例，形成装饰器链。典型堆叠: `IndexStorage(CachedStorage(S3Storage(...), S3Storage(...)))`
 - **文件操作**: `upload/download_stream`、`unlink/rmdir/delete/delete_many`、`move/copy`
 - **目录操作**: `mkdir/rmtree`、`copytree/movetree`（`movetree` 默认实现为 copy + rmtree，后端可覆盖为更高效的实现）
@@ -123,20 +140,21 @@ tests/
 
 `AbstractStorage` 的文档（docstring）是各方法的权威契约。以下为已知的跨后端差异：
 
-| 方法 / 场景 | MemoryStorage | LocalStorage | S3Storage | IndexStorage |
-|---|---|---|---|---|
-| `rmdir` nonexistent | `FileNotFoundError` | `FileNotFoundError` | 静默成功 | `FileNotFoundError` |
-| `rmtree` 文件路径 | `NotADirectoryError` | `NotADirectoryError` | `NotADirectoryError` | 委托内部后端 |
-| `move` 目标为文件 | `FileExistsError` | 覆盖（POSIX rename） | 覆盖（copy+unlink） | `FileExistsError` |
-| `copy` 目标存在 | `FileExistsError` | 覆盖（shutil） | 覆盖（CopyObject） | `FileExistsError` |
-| `delete_many` | fail-fast（基类默认） | fail-fast（基类默认） | fail-fast（S3 批量优化） | fail-fast（基类默认） |
-| `upload_stream` 重复路径 | stat → IsADirectoryError/FileExistsError | ← 同 | ← 同 | ← 同 |
+| 方法 / 场景 | MemoryStorage | LocalStorage | S3Storage | IndexStorage | DavStorage |
+|---|---|---|---|---|---|
+| `rmdir` nonexistent | `FileNotFoundError` | `FileNotFoundError` | 静默成功 | `FileNotFoundError` | 静默成功（对齐 S3） |
+| `rmtree` 文件路径 | `NotADirectoryError` | `NotADirectoryError` | `NotADirectoryError` | 委托内部后端 | `NotADirectoryError` |
+| `move` 目标为文件 | `FileExistsError` | 覆盖（POSIX rename） | 覆盖（copy+unlink） | `FileExistsError` | 覆盖（MOVE Overwrite:T，412 时先删目标再重试） |
+| `copy` 目标存在 | `FileExistsError` | 覆盖（shutil） | 覆盖（CopyObject） | `FileExistsError` | 覆盖（COPY Overwrite:T） |
+| `delete_many` | fail-fast（基类默认） | fail-fast（基类默认） | fail-fast（S3 批量优化） | fail-fast（基类默认） | fail-fast（基类默认） |
+| `upload_stream` 重复路径 | stat → IsADirectoryError/FileExistsError | ← 同 | ← 同 | ← 同 | ← 同 |
 
 所有后端的 `upload_stream` 入口统一通过 `stat()` 网关检查：目录 → `IsADirectoryError`，文件 + overwrite=False → `FileExistsError`。
 
 ### 关键实现细节
 
 - **S3 目录模拟**: 以 `<key>/` 标记对象表示目录，其内容为序列化的 `FileInfo`。`s3_client/` 是手写的 S3 API 封装（基于 httpx，AWS SigV4 签名），支持 AWS S3 及所有 S3 兼容服务（MinIO、腾讯云 COS 等），通过 `S3Config.endpoint_url` + `path_style` 配置端点寻址（virtual-hosted / path-style）。大文件分片上传（`MultipartUploadTask`，支持重试和并发），大文件服务端拷贝自动切换为 multipart copy（>4MiB），`delete`/`delete_many` 内联分支减少请求（`delete_many` 复用已获取的 `dir_key` 而非通过 `is_dir()` 再次 `head_object`），`rmtree` 批量删除（每次 100 个），`copytree` 并发复制。**回滚支持**: `move`、`copytree`、`_copy_multipart` 失败时自动回滚（删除已复制的目标或 abort multipart upload）。
+- **DavStorage**: WebDAV 客户端后端，与 `S3Storage` 对称（自研 `dav_client/` SDK + `storage.py` 适配器，基于 httpx）。支持 Basic / Bearer / 匿名认证与 HTTPS/TLS（含自定义 CA `ca_cert_path`）。`root_prefix` 在 `base_url` 下隔离多实例（类比 S3 bucket）。方法映射：`PROPFIND`（Depth:0/1）→ stat/iterdir，`PUT`（httpx 流式 body）→ upload_stream，`GET`（Range）→ download_stream，`MKCOL` → mkdir，`DELETE` → unlink/rmdir/rmtree，`COPY`/`MOVE`（Overwrite 头）→ copy/move/copytree/movetree。`rmdir` 需 DELETE 前用 `iterdir` 预检空（WebDAV DELETE 天然递归）；`rmtree` 单次 DELETE 递归删集合；`walk` 用递归 Depth:1（避开被 Nextcloud/mod_dav 默认禁用的 infinity）；`copytree`/`movetree` 优先服务端 `COPY`/`MOVE` Depth:infinity，服务器返回 403/405/409/501 时回退 walk+逐文件 copy（回退失败 `rmtree(dst)` 回滚）。`move` 对 412（服务器拒覆盖）先删目标再重试以维持覆盖语义。`ExceptionTranslator` 映射 404→FileNotFoundError、403/423→PermissionError、412→FileExistsError；405 语义重载（MKCOL 已存在 / PUT 到集合）在各方法内联处理。multistatus XML 用 `xml.etree` + `{*}tag` 通配解析（与 S3 client 同法）。
 - **IndexStorage**: 大文件按 `BLOCK_SIZE (64MB)` 拆分分块，SHA-256 去重，引用计数管理。使用基于文件锁的乐观并发控制（`_acquire_storage_file_lock`）。分块存储在 `hash[:2]/hash[2:6]/hash[6:].{bin,ref,lock}` 路径下。`upload_stream` 使用 worker pool 并发上传分块，失败时回滚已写入分块的引用计数。覆盖写入时自动 decref 旧文件不再引用的分块。**所有公开入口方法统一调用 `_to_abs_path()` 规范化路径为绝对路径**，确保 `FileMeta` 和 chunk ref 文件中存储的路径一致。`copytree`/`movetree` 批量操作 chunk refs（`incref`/`transref`），`list_()`/`walk()` 并发获取文件元数据。`move` 和 `copy` 使用 `PurePosixPath` 而非 `Path`（跨平台一致性）。
 - **CachedStorage**: 6 个命名空间缓存 (`exists/is_file/is_dir/stat/iterdir/download`)。正结果交叉后填（如 `is_file=True` → 同时缓存 `exists=True, is_dir=False`）。写入操作回填已知状态。`CacheBackend` 抽象接口支持批量操作（`mget`/`mset`/`mdelete`），内置 `MemoryCacheBackend` 和 `RedisCacheBackend`。**`snapshot()` / `dump_cache()`** 内省 API 暴露缓存内部状态供测试验证命中/未命中/回填/失效行为。`list_()` 永远绕过 `iterdir` 缓存直接查询底层存储但回填逐条目元数据缓存。
 - **FTP**: 完全自研的异步实现，非 pyftpdlib。命令分发使用生产者-消费者模式（`cmd_send/cmd_receive` memory stream）。慢操作通过 `_execute_with_monitor` 在 task group 中运行，支持 ABOR 取消。数据通道支持 PASV/PORT。
@@ -147,5 +165,6 @@ tests/
 ### 配置与数据目录
 
 - S3 测试使用 `data/s3/mock.json`（复用腾讯云 COS 的 S3 兼容端点验证，不进 git）
+- DavStorage 配置示例 `data/dav/config.json`（`base_url`/`auth_mode`/`username`/`password`/`token`/`root_prefix`/`verify_ssl`/`ca_cert_path`，不进 git）；`dav` 测试用本地 wsgidav，无需配置文件
 - 日志输出到 `logs/` 目录，按日轮转
 - 根目录的 `test*.py` 和 `run*.py` 模式已加入 `.gitignore`（真实测试在 `tests/` 目录）

@@ -40,6 +40,7 @@ testpaths = ["tests"]
 addopts = "--cov=app --cov-report=term-missing -n auto"
 markers = [
   "s3: tests requiring S3Storage credentials (skipped when config unavailable)",
+  "dav: tests exercising DavStorage (local wsgidav server or mocked client)",
   "slow: tests that are unusually slow",
 ]
 

@@ -1,10 +1,14 @@
 """Shared fixtures for storage tests."""
 
+import asyncio
 import shutil
+import socket
 import sys
 import tempfile
+import threading
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Generator
 from pathlib import Path
 
 import pytest
@@ -45,6 +49,7 @@ def _param_of(impl: str):  # noqa: ANN202
         _param_of("s3"),
         _param_of("cached"),
         _param_of("index"),
+        _param_of("dav"),
     ]
 )
 async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStorage]:
@@ -92,3 +97,58 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
                 block_size=16 * 1024,
             ) as s:
                 yield s
+
+        case "dav":
+            from app.storage.dav import DavConfig, DavStorage
+
+            base_url = request.getfixturevalue("_dav_server")
+            config = DavConfig(base_url=base_url, auth_mode="anonymous")
+            async with DavStorage(config) as s:
+                yield s
+
+
+@pytest.fixture(scope="session")
+def _dav_server() -> Generator[str]:
+    """Start a local wsgidav server (backed by MemoryStorage) on a random port.
+
+    Runs in a dedicated thread + event loop so it is independent of the
+    pytest-asyncio event loop scope. Returns the base URL.
+    """
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    from app.protocol.dav.server import DAVServer
+    from app.storage.memory import MemoryStorage
+
+    server = DAVServer(MemoryStorage("/"), host="127.0.0.1", port=port)
+    stop_event = asyncio.Event()
+
+    async def _runner():
+        _, pending = await asyncio.wait(
+            (server.serve(), stop_event.wait()),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+
+    thread = threading.Thread(target=asyncio.run, args=(_runner(),), daemon=True)
+    thread.start()
+    _wait_dav_port("127.0.0.1", port)
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        stop_event.set()
+        thread.join(timeout=5)
+
+
+def _wait_dav_port(host: str, port: int, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError(f"DAV server did not start on {host}:{port}")
