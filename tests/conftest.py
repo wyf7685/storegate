@@ -42,7 +42,7 @@ def _param_of(impl: str):  # noqa: ANN202
     params=[
         _param_of("memory"),
         _param_of("local"),
-        _param_of("cos"),
+        _param_of("s3"),
         _param_of("cached"),
         _param_of("index"),
     ]
@@ -66,13 +66,13 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
             finally:
                 shutil.rmtree(root, ignore_errors=True)
 
-        case "cos":
-            from app.storage.cos import CosStorage
+        case "s3":
+            from app.storage.s3 import S3Storage
 
-            config_path = Path("data/cos/mock.json")
+            config_path = Path("data/s3/mock.json")
             if not config_path.exists():
-                pytest.skip("COS config file not found")
-            async with CosStorage(config_path) as s:
+                pytest.skip("S3 config file not found")
+            async with S3Storage(config_path) as s:
                 yield s
 
         case "cached":

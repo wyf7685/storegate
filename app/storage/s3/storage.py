@@ -12,57 +12,57 @@ from app.log import escape_tag
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
 from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
-from .cos_client import (
-    AsyncCosClient,
-    CosClientError,
-    CosConfig,
-    CosHttpStatusError,
-    ListObjectsDir,
-    ListObjectsItem,
-    MultipartUploadPart,
+from .s3_client import (
+    AsyncS3Client,
+    CompletedPart,
+    ListObjectsCommonPrefix,
+    ListObjectsContents,
+    S3ClientError,
+    S3Config,
+    S3HttpStatusError,
 )
 from .utils import MultipartUploadTask, deserialize_file_info, serialize_file_info
 
 UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 # Files larger than this are copied via multipart upload to stay within
-# the PUT Object - Copy 5 GiB limit and to allow parallel part copies.
+# the CopyObject 5 GiB limit and to allow parallel part copies.
 COPY_MULTIPART_THRESHOLD = 4 * 1024 * 1024  # 4 MiB
 
 
 translator = ExceptionTranslator(
     bypass=OSError,
-    catch=CosClientError,
+    catch=S3ClientError,
     default=OSError,
 )
 
 
-@translator.handles(CosHttpStatusError)
-def _(exc_group: ExceptionGroup[CosHttpStatusError], msg: str) -> OSError:
+@translator.handles(S3HttpStatusError)
+def _(exc_group: ExceptionGroup[S3HttpStatusError], msg: str) -> OSError:
     first = next(flatten_exception_group(exc_group))
     return {404: FileNotFoundError, 403: PermissionError}.get(first.status_code, OSError)(f"{msg}: {first}")
 
 
 @final
-class CosStorage(AbstractStorage):
-    _client: AsyncCosClient | None = None
-    _config: CosConfig
+class S3Storage(AbstractStorage):
+    _client: AsyncS3Client | None = None
+    _config: S3Config
 
-    def __init__(self, config: str | Path | CosConfig) -> None:
+    def __init__(self, config: str | Path | S3Config) -> None:
         super().__init__()
-        self._config = config if isinstance(config, CosConfig) else CosConfig.from_file(config)
+        self._config = config if isinstance(config, S3Config) else S3Config.from_file(config)
 
     @property
     @override
     def id(self) -> str:
-        return f"cos:{self._config.bucket}:{self._config.region}"
+        return f"s3:{self._config.bucket}:{self._config.region}"
 
     @override
     async def connect(self) -> None:
-        self._client = AsyncCosClient(self._config)
+        self._client = AsyncS3Client(self._config)
         await self._client.__aenter__()
         if not await self.ping():
-            raise RuntimeError("Failed to connect to COS bucket. Please check your configuration.")
+            raise RuntimeError("Failed to connect to S3 bucket. Please check your configuration.")
         self.log.info(f"Connected to bucket <c>{self._config.bucket}</c> in region <c>{self._config.region}</c>")
 
     @override
@@ -86,7 +86,7 @@ class CosStorage(AbstractStorage):
         else:
             return True
 
-    def _ensure_client(self) -> AsyncCosClient:
+    def _ensure_client(self) -> AsyncS3Client:
         if self._client is None:
             raise RuntimeError("Client is not connected.")
         return self._client
@@ -98,7 +98,7 @@ class CosStorage(AbstractStorage):
         return str(path) if path != PurePosixPath(".") else ""
 
     def _dir_key(self, path: PathLike) -> str | None:
-        """返回目录标记对象的 COS 键。
+        """返回目录标记对象的 S3 键。
 
         目录标记对象使用尾随 ``/`` 的键存储。
         根目录（``""``）没有标记对象，返回 ``None``。
@@ -235,7 +235,7 @@ class CosStorage(AbstractStorage):
     async def delete(self, path: PathLike) -> None:
         """Delete a file or an empty directory.
 
-        Uses inline branching to minimize COS API calls, rather than the
+        Uses inline branching to minimize S3 API calls, rather than the
         base class convenience method which would require an extra
         ``head_object`` via :meth:`is_dir`.
         """
@@ -327,7 +327,7 @@ class CosStorage(AbstractStorage):
             raise FileNotFoundError(f"Source not found: {src}")
 
         if head.content_length <= COPY_MULTIPART_THRESHOLD:
-            self.log.debug(f"Copy: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y> (PUT Object - Copy)")
+            self.log.debug(f"Copy: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y> (CopyObject)")
             await client.put_object_copy(src_key, dst_key)
         else:
             self.log.debug(f"Copy: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y> (multipart copy)")
@@ -561,7 +561,7 @@ class CosStorage(AbstractStorage):
         key = self._remote_path_to_key(path)
         np = self.normalize_path(path)
 
-        # 根目录：不需要 COS 请求
+        # 根目录：不需要 S3 请求
         if key == "":
             return FileInfo(path=np.as_posix(), name="", is_dir=True, size=0)
 
@@ -603,12 +603,12 @@ class CosStorage(AbstractStorage):
         key = key.removeprefix("/")
         prefix = (key + "/") if key else None
         async for obj in client.list_objects(prefix=prefix, delimiter="/"):
-            if isinstance(obj, ListObjectsDir):
+            if isinstance(obj, ListObjectsCommonPrefix):
                 dir_path = obj.prefix.rstrip("/")
                 # 读取标记对象获取完整 FileInfo
                 try:
                     body = await client.get_object(key=dir_path + "/")
-                except CosHttpStatusError:
+                except S3HttpStatusError:
                     # 无标记对象 → 不是合法目录，跳过
                     continue
                 yield deserialize_file_info(self.normalize_path(dir_path).as_posix(), body)
@@ -652,14 +652,14 @@ class CosStorage(AbstractStorage):
         async def _fetch_dir_info(dir_path: str) -> None:
             try:
                 body = await client.get_object(key=dir_path + "/")
-            except CosHttpStatusError:
+            except S3HttpStatusError:
                 # 无标记对象 → 不是合法目录，跳过
                 return
             infos.append(deserialize_file_info(self.normalize_path(dir_path).as_posix(), body))
 
         async with anyio.create_task_group() as tg:
             async for obj in client.list_objects(prefix=prefix, delimiter="/"):
-                if isinstance(obj, ListObjectsDir):
+                if isinstance(obj, ListObjectsCommonPrefix):
                     dir_path = obj.prefix.rstrip("/")
                     tg.start_soon(_fetch_dir_info, dir_path)
                     continue
@@ -701,7 +701,7 @@ class CosStorage(AbstractStorage):
             raise OSError(f"Failed to create multipart upload: {dst_key}") from exc
 
         try:
-            parts: list[MultipartUploadPart] = []
+            parts: list[CompletedPart] = []
             offset = 0
             part_number = 1
 
@@ -735,7 +735,7 @@ class CosStorage(AbstractStorage):
         prefix = (key + "/") if key else None
         async for item in self._ensure_client().list_objects(prefix=prefix, delimiter="/", max_keys=2):
             # skip directory marker object itself
-            if isinstance(item, ListObjectsItem) and item.key.rstrip("/") == key:
+            if isinstance(item, ListObjectsContents) and item.key.rstrip("/") == key:
                 continue
             return False
         return True

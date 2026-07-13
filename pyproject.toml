@@ -39,7 +39,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--cov=app --cov-report=term-missing -n auto"
 markers = [
-  "cos: tests requiring CosStorage credentials (skipped when config unavailable)",
+  "s3: tests requiring S3Storage credentials (skipped when config unavailable)",
   "slow: tests that are unusually slow",
 ]
 

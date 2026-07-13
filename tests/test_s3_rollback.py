@@ -1,6 +1,6 @@
-"""CosStorage rollback path tests using mocked AsyncCosClient.
+"""S3Storage rollback path tests using mocked AsyncS3Client.
 
-No real COS credentials required — the client is replaced with a MagicMock
+No real S3 credentials required — the client is replaced with a MagicMock
 and individual methods are patched per-test with ``AsyncMock`` side effects.
 """
 
@@ -10,24 +10,24 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pytest_mock import MockerFixture
 
-from app.storage.cos.cos_client.errors import CosHttpStatusError
-from app.storage.cos.cos_client.models import (
+from app.storage.s3.s3_client.errors import S3HttpStatusError
+from app.storage.s3.s3_client.models import (
     CopyPartResult,
-    CosConfig,
+    S3Config,
 )
-from app.storage.cos.storage import UPLOAD_CHUNK_SIZE, CosStorage
+from app.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
 
 
 @pytest.fixture
-def cos_mocked() -> CosStorage:
-    """CosStorage with a fake config and mocked connect / close / client."""
-    cfg = CosConfig(
-        secret_id="test-id",
-        secret_key="test-key",
+def s3_mocked() -> S3Storage:
+    """S3Storage with a fake config and mocked connect / close / client."""
+    cfg = S3Config(
+        access_key_id="test-id",
+        secret_access_key="test-key",
         region="ap-guangzhou",
         bucket="test-bucket",
     )
-    s = CosStorage(cfg)
+    s = S3Storage(cfg)
     s.connect = AsyncMock()
     s.close = AsyncMock()
     s._client = MagicMock()
@@ -40,9 +40,9 @@ def cos_mocked() -> CosStorage:
 
 
 class TestMoveRollback:
-    async def test_delete_src_fails_rolls_back_dst(self, cos_mocked: CosStorage, mocker: MockerFixture):
+    async def test_delete_src_fails_rolls_back_dst(self, s3_mocked: S3Storage, mocker: MockerFixture):
         """When delete_object(src) fails after copy, rollback deletes dst."""
-        s = cos_mocked
+        s = s3_mocked
         src = "/src.txt"
         dst = "/dst.txt"
 
@@ -53,7 +53,7 @@ class TestMoveRollback:
         async def _delete(key: str) -> None:
             calls.append(key)
             if key == "src.txt":
-                raise CosHttpStatusError("DELETE", "/src.txt", 500, "simulated")
+                raise S3HttpStatusError("DELETE", "/src.txt", 500, "simulated")
 
         mocker.patch.object(s._client, "delete_object", side_effect=_delete)
 
@@ -63,16 +63,16 @@ class TestMoveRollback:
         assert len(calls) == 2
         assert calls == ["src.txt", "dst.txt"]
 
-    async def test_rollback_itself_fails_still_raises(self, cos_mocked: CosStorage, mocker: MockerFixture):
+    async def test_rollback_itself_fails_still_raises(self, s3_mocked: S3Storage, mocker: MockerFixture):
         """When both delete_object(src) and rollback delete_object(dst) fail, still raises."""
-        s = cos_mocked
+        s = s3_mocked
         src = "/src.txt"
         dst = "/dst.txt"
 
         mocker.patch.object(s, "copy", new=AsyncMock())
 
         async def _delete(key: str) -> None:
-            raise CosHttpStatusError("DELETE", key, 500, "always-fails")
+            raise S3HttpStatusError("DELETE", key, 500, "always-fails")
 
         mock_delete = mocker.patch.object(s._client, "delete_object", side_effect=_delete)
 
@@ -88,9 +88,9 @@ class TestMoveRollback:
 
 
 class TestCopyMultipartRollback:
-    async def test_abort_on_part_copy_failure(self, cos_mocked: CosStorage, mocker: MockerFixture):
+    async def test_abort_on_part_copy_failure(self, s3_mocked: S3Storage, mocker: MockerFixture):
         """When upload_part_copy fails mid-way, abort_multipart_upload is called."""
-        s = cos_mocked
+        s = s3_mocked
         src_key = "src.txt"
         dst_key = "dst.txt"
         upload_id = "upload-abc123"
@@ -110,7 +110,7 @@ class TestCopyMultipartRollback:
         ) -> CopyPartResult:
             parts_called.append((part_number, byte_range[0]))
             if part_number == 2:
-                raise CosHttpStatusError("PUT", "/dst.txt", 500, "simulated part failure")
+                raise S3HttpStatusError("PUT", "/dst.txt", 500, "simulated part failure")
             return CopyPartResult(etag=f"etag-{part_number}", last_modified=datetime.now(UTC))
 
         mocker.patch.object(s._client, "upload_part_copy", side_effect=_upload_part_copy)
@@ -125,9 +125,9 @@ class TestCopyMultipartRollback:
 
         mock_abort.assert_awaited_once_with(dst_key, upload_id)
 
-    async def test_create_multipart_upload_failure(self, cos_mocked: CosStorage, mocker: MockerFixture):
+    async def test_create_multipart_upload_failure(self, s3_mocked: S3Storage, mocker: MockerFixture):
         """When create_multipart_upload fails, abort is NOT called."""
-        s = cos_mocked
+        s = s3_mocked
         src_key = "src.txt"
         dst_key = "dst.txt"
         src_size = 10 * 1024 * 1024
@@ -135,7 +135,7 @@ class TestCopyMultipartRollback:
         mocker.patch.object(
             s._client,
             "create_multipart_upload",
-            side_effect=CosHttpStatusError("POST", "/dst.txt", 500, "simulated create failure"),
+            side_effect=S3HttpStatusError("POST", "/dst.txt", 500, "simulated create failure"),
         )
         mock_abort = mocker.patch.object(s._client, "abort_multipart_upload", new=AsyncMock())
 
@@ -144,9 +144,9 @@ class TestCopyMultipartRollback:
 
         mock_abort.assert_not_awaited()
 
-    async def test_single_part_small_source(self, cos_mocked: CosStorage, mocker: MockerFixture):
+    async def test_single_part_small_source(self, s3_mocked: S3Storage, mocker: MockerFixture):
         """When source fits in one part, it succeeds without multipart complexity."""
-        s = cos_mocked
+        s = s3_mocked
         src_key = "src.txt"
         dst_key = "dst.txt"
         src_size = UPLOAD_CHUNK_SIZE

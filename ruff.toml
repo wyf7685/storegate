@@ -108,5 +108,6 @@ keep-runtime-typing = true
   "T201",     # print
   "ASYNC240", # blocking-path-method-in-async-function
   "SLF001",   # private-member-access
+  "S105",     # hardcoded-password-string
   "S106",     # hardcoded-password-func-arg
 ]

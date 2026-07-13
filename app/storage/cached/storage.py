@@ -132,7 +132,7 @@ class CachedStorage(AbstractStorage):
         """Normalise *path* into a cache key.
 
         Strips leading ``/`` and collapses ``"."`` to ``""``,
-        consistent with :meth:`CosStorage._remote_path_to_key`.
+        consistent with :meth:`S3Storage._remote_path_to_key`.
         """
         p = PurePosixPath(path)
         if p.is_absolute():

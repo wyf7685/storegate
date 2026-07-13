@@ -12,7 +12,7 @@ from app.log import escape_tag
 from app.storage.abstract import FileInfo
 from app.utils import logger_wrapper
 
-from .cos_client import AsyncCosClient, MultipartUploadPart
+from .s3_client import AsyncS3Client, CompletedPart
 
 
 def serialize_file_info(info: FileInfo) -> bytes:
@@ -46,23 +46,23 @@ def deserialize_file_info(path: str, data: bytes) -> FileInfo:
 
 
 class MultipartUploadTask:
-    client: AsyncCosClient
+    client: AsyncS3Client
     key: str
     upload_id: str
-    parts: list[MultipartUploadPart]
+    parts: list[CompletedPart]
 
-    def __init__(self, client: AsyncCosClient, key: str) -> None:
+    def __init__(self, client: AsyncS3Client, key: str) -> None:
         self.client = client
         self.key = key
         self.upload_id = ""
         self.parts = []
         self._next_part_number = 1
         self._parts_lock = anyio.Lock()
-        self.log = logger_wrapper(f"cos.multipart <i><c>{escape_tag(self.key)}</></>")
+        self.log = logger_wrapper(f"s3.multipart <i><c>{escape_tag(self.key)}</></>")
 
     @classmethod
     @contextlib.asynccontextmanager
-    async def create(cls, client: AsyncCosClient, key: str) -> AsyncGenerator[Self]:
+    async def create(cls, client: AsyncS3Client, key: str) -> AsyncGenerator[Self]:
         self = cls(client, key)
         self.upload_id = await client.create_multipart_upload(self.key)
         self.log.info(f"Created multipart upload with upload_id=<y>{self.upload_id}</>")
@@ -107,7 +107,7 @@ class MultipartUploadTask:
                 f"Failed to upload part {part_number} for {self.key} after {max_attempts} attempts: {last_exc!r}"
             ) from last_exc
 
-        part: MultipartUploadPart = {
+        part: CompletedPart = {
             "PartNumber": part_number,
             "ETag": etag,
         }
