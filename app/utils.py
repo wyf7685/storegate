@@ -97,8 +97,10 @@ class ObjectSpec(BaseModel):
             raise ValueError(f"Invalid factory string: {self.factory}")
         if modulename.startswith("~"):
             modulename = f"app.storage.{modulename[1:]}"
+            cls = cls or "Storage"
         elif modulename.startswith("@"):
             modulename = f"app.server.{modulename[1:]}"
+            cls = cls or "Server"
 
         try:
             module = importlib.import_module(modulename)
