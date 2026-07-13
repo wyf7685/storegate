@@ -1,19 +1,17 @@
 """FTP server — listens for connections and dispatches to handlers."""
 
-from typing import TYPE_CHECKING, final, override
+from typing import final, override
 
 import anyio
 import anyio.abc
 from anyio.abc import SocketStream
 
+from app.storage.abstract import AbstractStorage
 from app.utils import logger_wrapper
 
 from ..abstract import AbstractServer
 from .handler import FTPHandler
 from .session import FTPSession
-
-if TYPE_CHECKING:
-    from app.storage.abstract import AbstractStorage
 
 logger = logger_wrapper("ftp.server")
 
