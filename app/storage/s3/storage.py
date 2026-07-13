@@ -290,6 +290,7 @@ class S3Storage(AbstractStorage):
             await client.delete_objects(objects_to_delete)
 
     @override
+    @translator.wrap("Failed to move {src} → {dst}")
     async def move(
         self,
         src: PathLike,
@@ -430,6 +431,7 @@ class S3Storage(AbstractStorage):
         )
 
     @override
+    @translator.wrap("Failed to copy tree {src} → {dst} (overwrite={overwrite})")
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         client = self._ensure_client()
 

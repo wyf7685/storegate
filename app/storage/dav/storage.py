@@ -351,6 +351,7 @@ class DavStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
+    @translator.wrap("Failed to move {src} → {dst}")
     async def move(self, src: PathLike, dst: PathLike) -> None:
         src_rel = self._remote_path(src)
         if src_rel == "":
@@ -398,6 +399,7 @@ class DavStorage(AbstractStorage):
         await client.copy(src_rel, dst_rel, overwrite=True)
 
     @override
+    @translator.wrap("Failed to copy tree {src} → {dst} (overwrite={overwrite})")
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         src_np = self.normalize_path(src)
         dst_np = self.normalize_path(dst)
@@ -432,6 +434,7 @@ class DavStorage(AbstractStorage):
         await self._copytree_fallback(src_np, dst_np, overwrite)
 
     @override
+    @translator.wrap("Failed to move tree {src} → {dst} (overwrite={overwrite})")
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         try:
             info = await self.stat(src)
