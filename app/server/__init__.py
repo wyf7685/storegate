@@ -1,10 +1,8 @@
-from .abstract import AbstractStorage
+from .abstract import AbstractServer
 from .factory import resolve_server, resolve_server_from_file
 
 __all__ = [
-    "AbstractStorage",
-    "BytesLike",
-    "FileInfo",
+    "AbstractServer",
     "resolve_server",
     "resolve_server_from_file",
 ]

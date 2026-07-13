@@ -48,7 +48,7 @@ tests/
 ├── test_dav_rollback.py     # DavStorage 错误路径单测（mocked client）
 ├── test_dav_internals.py    # DavStorage 集成测试（本地 wsgidav，标记 @pytest.mark.dav）
 ├── test_ftp_handler.py      # FTP 命令分发单元测试
-└── test_storage_factory.py  # ObjectSpec 序列化/反序列化测试
+└── test_storage_factory.py  # resolve_object / resolve_storage 单测
 ```
 
 **参数化 fixture**：`storage` fixture 将每个测试对 6 个后端各执行一次：`memory` / `local` / `s3` / `cached` / `index` / `dav`。S3 在 credentials 缺失时 `pytest.skip()`。`cached` 和 `index` 均以 `MemoryStorage` 为内部后端，保证可重现。`dav` 通过 session 级 `_dav_server` fixture 在独立线程 + 事件循环中启动本地 wsgidav（以 `MemoryStorage` 为后端），`DavStorage` 客户端连入形成 client→server→MemoryStorage 闭环——因 wsgidav 已是依赖，`dav` 测试**始终运行**（不像 S3 skip）。使用 `pytest-xdist` 并行执行测试（`-n auto`）。
@@ -63,12 +63,12 @@ tests/
 app/
 ├── const.py               # ROOT, DEFAULT_CHUNK_SIZE
 ├── log.py                 # loguru 日志配置 + logging→loguru 桥接
-├── utils.py               # LoggerWrapper (+ LoguruOpts), ExceptionTranslator, coalesce_chunks, flatten_exception_group
+├── utils.py               # LoggerWrapper (+ LoguruOpts), resolve_object, ExceptionTranslator, coalesce_chunks, flatten_exception_group
 ├── storage/               # 存储抽象层
 │   ├── abstract.py        # AbstractStorage ABC + FileInfo dataclass
-│   ├── factory.py         # ObjectSpec: JSON → 运行时对象反序列化（resolve_storage）
+│   ├── factory.py         # resolve_storage / resolve_storage_from_file（基于 resolve_object）
 │   ├── s3/                # S3 兼容实现（AWS SigV4，支持 AWS S3 / MinIO / 腾讯云 COS 等）
-│   │   ├── s3_client/     # 自研 S3 SDK (httpx-based, AWS SigV4 签名)
+│   │   ├── client/        # 自研 S3 SDK (httpx-based, AWS SigV4 签名)
 │   │   │   ├── auth.py     # AWSSigV4Signer: SigV4 签名算法
 │   │   │   ├── client.py   # AsyncS3Client: httpx-based HTTP 客户端
 │   │   │   ├── errors.py   # S3ClientError, S3HttpStatusError, S3ResponseParseError
@@ -86,27 +86,29 @@ app/
 │   ├── local/             # LocalStorage: 本地文件系统
 │   ├── memory/            # MemoryStorage: 内存实现，测试/临时用途
 │   └── dav/               # WebDAV 客户端实现（访问远程 WebDAV 服务器）
-│       ├── dav_client/    # 自研 WebDAV SDK (httpx-based)
+│       ├── client/        # 自研 WebDAV SDK (httpx-based)
 │       │   ├── auth.py     # build_auth: Basic / Bearer / Anonymous
 │       │   ├── client.py   # AsyncDavClient: httpx-based, PROPFIND/MKCOL/COPY/MOVE
 │       │   ├── errors.py   # DavClientError, DavHttpStatusError, DavResponseParseError
 │       │   └── models.py   # DavConfig, DavResource, AuthMode
 │       ├── storage.py     # DavStorage: WebDAV → AbstractStorage 映射
 │       └── utils.py       # multistatus XML 解析、DavResource → FileInfo
-├── protocol/
-│   ├── dav/               # WebDAV 服务（wsgidav + uvicorn）
-│   │   ├── server.py      # DAVServer: 创建 wsgidav app, 包装 ASGI lifespan
-│   │   ├── provider.py    # StorageProvider: 桥接 AbstractStorage → wsgidav DAVProvider
-│   │   ├── collection.py  # StorageCollection: 目录操作（mkdir/rmtree/copytree/movetree）
-│   │   ├── resource.py    # StorageResource + ResourceReader/Writer: 文件读写
-│   │   └── utils.py       # run_async (anyio.from_thread.run), call_with_catch, ContextVar
-│   └── ftp/               # FTP 服务（纯 anyio, 零依赖 FTP 实现）
-│       ├── server.py      # FTPServer: TCP listener, 每客户端 FTPSession + FTPHandler
-│       ├── handler.py     # FTPHandler: 生产者-消费者命令分发, _execute_with_monitor
-│       ├── data.py        # DataConnection: PASV/PORT 数据通道管理
-│       ├── session.py     # FTPSession dataclass: cwd/authenticated/rename_from
-│       ├── response.py    # FTP 响应码枚举 (R)
-│       └── listing.py     # Unix ls -l 格式输出
+├── server/               # 协议服务层
+│   ├── abstract.py       # AbstractServer ABC（storage + serve()）
+│   ├── factory.py        # resolve_server / resolve_server_from_file（基于 resolve_object）
+│   ├── dav/              # WebDAV 服务（wsgidav + uvicorn）
+│   │   ├── server.py     # DAVServer: 创建 wsgidav app, 包装 ASGI lifespan
+│   │   ├── provider.py   # StorageProvider: 桥接 AbstractStorage → wsgidav DAVProvider
+│   │   ├── collection.py # StorageCollection: 目录操作（mkdir/rmtree/copytree/movetree）
+│   │   ├── resource.py   # StorageResource + ResourceReader/Writer: 文件读写
+│   │   └── utils.py      # run_async (anyio.from_thread.run), call_with_catch, ContextVar
+│   └── ftp/              # FTP 服务（纯 anyio, 零依赖 FTP 实现）
+│       ├── server.py     # FTPServer: TCP listener, 每客户端 FTPSession + FTPHandler
+│       ├── handler.py    # FTPHandler: 生产者-消费者命令分发, _execute_with_monitor
+│       ├── data.py       # DataConnection: PASV/PORT 数据通道管理
+│       ├── session.py    # FTPSession dataclass: cwd/authenticated/rename_from
+│       ├── response.py   # FTP 响应码枚举 (R)
+│       └── listing.py    # Unix ls -l 格式输出
 tests/
 ├── conftest.py            # uid(), 参数化 storage fixture（6 后端）, _dav_server
 ├── test_storage_general.py
@@ -125,16 +127,19 @@ tests/
 
 **`AbstractStorage`** 是唯一存储接口，所有后端之间互相对称：
 - **简单后端**: `LocalStorage`, `MemoryStorage` — 直接实现存储
-- **网络后端**: `S3Storage`, `DavStorage` — 自研 async HTTP 客户端 SDK（`s3_client/` / `dav_client/`）+ 存储适配器，对称结构
+- **网络后端**: `S3Storage`, `DavStorage` — 自研 async HTTP 客户端 SDK（`client/`）+ 存储适配器，对称结构
 - **中间件模式**: `CachedStorage` 和 `IndexStorage` 都包装其他 `AbstractStorage` 实例，形成装饰器链。典型堆叠: `IndexStorage(CachedStorage(S3Storage(...), S3Storage(...)))`
 - **文件操作**: `upload/download_stream`、`unlink/rmdir/delete/delete_many`、`move/copy`
 - **目录操作**: `mkdir/rmtree`、`copytree/movetree`（`movetree` 默认实现为 copy + rmtree，后端可覆盖为更高效的实现）
 
-**`ObjectSpec`** (`factory.py`) 是依赖注入机制，允许通过 JSON 配置文件动态构建对象图：
+**`resolve_object`** (`utils.py`) 是基于 dict 的依赖注入函数，使用 `$factory` 键约定动态构建对象图。`app/storage/factory.py` 和 `app/server/factory.py` 分别提供类型守卫的 `resolve_storage` / `resolve_server`：
 ```json
-{"factory": "app.storage.s3:S3Storage", "args": {"config": "data/config.json"}}
-{"factory": "app.storage.cached:CachedStorage", "args": {"storage": {...}, "ttl": 60}}
+{"$factory": "~s3", "config": "data/config.json"}
+{"$factory": "~cached", "storage": {"$factory": "~memory", "root": "cache-root"}, "ttl": 60}
 ```
+- `~name` 简写 → `app.storage.name.Storage`（默认 cls），或 `~name:ClassName`
+- `@name` 简写 → `app.server.name.Server`（默认 cls），或 `@name:ClassName`
+- 嵌套 spec 通过 dict + `$factory` 键递归识别
 
 ### 各后端行为差异
 
@@ -153,8 +158,8 @@ tests/
 
 ### 关键实现细节
 
-- **S3 目录模拟**: 以 `<key>/` 标记对象表示目录，其内容为序列化的 `FileInfo`。`s3_client/` 是手写的 S3 API 封装（基于 httpx，AWS SigV4 签名），支持 AWS S3 及所有 S3 兼容服务（MinIO、腾讯云 COS 等），通过 `S3Config.endpoint_url` + `path_style` 配置端点寻址（virtual-hosted / path-style）。大文件分片上传（`MultipartUploadTask`，支持重试和并发），大文件服务端拷贝自动切换为 multipart copy（>4MiB），`delete`/`delete_many` 内联分支减少请求（`delete_many` 复用已获取的 `dir_key` 而非通过 `is_dir()` 再次 `head_object`），`rmtree` 批量删除（每次 100 个），`copytree` 并发复制。**回滚支持**: `move`、`copytree`、`_copy_multipart` 失败时自动回滚（删除已复制的目标或 abort multipart upload）。
-- **DavStorage**: WebDAV 客户端后端，与 `S3Storage` 对称（自研 `dav_client/` SDK + `storage.py` 适配器，基于 httpx）。支持 Basic / Bearer / 匿名认证与 HTTPS/TLS（含自定义 CA `ca_cert_path`）。`root_prefix` 在 `base_url` 下隔离多实例（类比 S3 bucket）。方法映射：`PROPFIND`（Depth:0/1）→ stat/iterdir，`PUT`（httpx 流式 body）→ upload_stream，`GET`（Range）→ download_stream，`MKCOL` → mkdir，`DELETE` → unlink/rmdir/rmtree，`COPY`/`MOVE`（Overwrite 头）→ copy/move/copytree/movetree。`rmdir` 需 DELETE 前用 `iterdir` 预检空（WebDAV DELETE 天然递归）；`rmtree` 单次 DELETE 递归删集合；`walk` 用递归 Depth:1（避开被 Nextcloud/mod_dav 默认禁用的 infinity）；`copytree`/`movetree` 优先服务端 `COPY`/`MOVE` Depth:infinity，服务器返回 403/405/409/501 时回退 walk+逐文件 copy（回退失败 `rmtree(dst)` 回滚）。`move` 对 412（服务器拒覆盖）先删目标再重试以维持覆盖语义。`ExceptionTranslator` 映射 404→FileNotFoundError、403/423→PermissionError、412→FileExistsError；405 语义重载（MKCOL 已存在 / PUT 到集合）在各方法内联处理。multistatus XML 用 `xml.etree` + `{*}tag` 通配解析（与 S3 client 同法）。
+- **S3 目录模拟**: 以 `<key>/` 标记对象表示目录，其内容为序列化的 `FileInfo`。`client/` 是手写的 S3 API 封装（基于 httpx，AWS SigV4 签名），支持 AWS S3 及所有 S3 兼容服务（MinIO、腾讯云 COS 等），通过 `S3Config.endpoint_url` + `path_style` 配置端点寻址（virtual-hosted / path-style）。大文件分片上传（`MultipartUploadTask`，支持重试和并发），大文件服务端拷贝自动切换为 multipart copy（>4MiB），`delete`/`delete_many` 内联分支减少请求（`delete_many` 复用已获取的 `dir_key` 而非通过 `is_dir()` 再次 `head_object`），`rmtree` 批量删除（每次 100 个），`copytree` 并发复制。**回滚支持**: `move`、`copytree`、`_copy_multipart` 失败时自动回滚（删除已复制的目标或 abort multipart upload）。
+- **DavStorage**: WebDAV 客户端后端，与 `S3Storage` 对称（自研 `client/` SDK + `storage.py` 适配器，基于 httpx）。支持 Basic / Bearer / 匿名认证与 HTTPS/TLS（含自定义 CA `ca_cert_path`）。`root_prefix` 在 `base_url` 下隔离多实例（类比 S3 bucket）。方法映射：`PROPFIND`（Depth:0/1）→ stat/iterdir，`PUT`（httpx 流式 body）→ upload_stream，`GET`（Range）→ download_stream，`MKCOL` → mkdir，`DELETE` → unlink/rmdir/rmtree，`COPY`/`MOVE`（Overwrite 头）→ copy/move/copytree/movetree。`rmdir` 需 DELETE 前用 `iterdir` 预检空（WebDAV DELETE 天然递归）；`rmtree` 单次 DELETE 递归删集合；`walk` 用递归 Depth:1（避开被 Nextcloud/mod_dav 默认禁用的 infinity）；`copytree`/`movetree` 优先服务端 `COPY`/`MOVE` Depth:infinity，服务器返回 403/405/409/501 时回退 walk+逐文件 copy（回退失败 `rmtree(dst)` 回滚）。`move` 对 412（服务器拒覆盖）先删目标再重试以维持覆盖语义。`ExceptionTranslator` 映射 404→FileNotFoundError、403/423→PermissionError、412→FileExistsError；405 语义重载（MKCOL 已存在 / PUT 到集合）在各方法内联处理。multistatus XML 用 `xml.etree` + `{*}tag` 通配解析（与 S3 client 同法）。
 - **IndexStorage**: 大文件按 `BLOCK_SIZE (64MB)` 拆分分块，SHA-256 去重，引用计数管理。使用基于文件锁的乐观并发控制（`_acquire_storage_file_lock`）。分块存储在 `hash[:2]/hash[2:6]/hash[6:].{bin,ref,lock}` 路径下。`upload_stream` 使用 worker pool 并发上传分块，失败时回滚已写入分块的引用计数。覆盖写入时自动 decref 旧文件不再引用的分块。**所有公开入口方法统一调用 `_to_abs_path()` 规范化路径为绝对路径**，确保 `FileMeta` 和 chunk ref 文件中存储的路径一致。`copytree`/`movetree` 批量操作 chunk refs（`incref`/`transref`），`list_()`/`walk()` 并发获取文件元数据。`move` 和 `copy` 使用 `PurePosixPath` 而非 `Path`（跨平台一致性）。
 - **CachedStorage**: 6 个命名空间缓存 (`exists/is_file/is_dir/stat/iterdir/download`)。正结果交叉后填（如 `is_file=True` → 同时缓存 `exists=True, is_dir=False`）。写入操作回填已知状态。`CacheBackend` 抽象接口支持批量操作（`mget`/`mset`/`mdelete`），内置 `MemoryCacheBackend` 和 `RedisCacheBackend`。**`snapshot()` / `dump_cache()`** 内省 API 暴露缓存内部状态供测试验证命中/未命中/回填/失效行为。`list_()` 永远绕过 `iterdir` 缓存直接查询底层存储但回填逐条目元数据缓存。
 - **FTP**: 完全自研的异步实现，非 pyftpdlib。命令分发使用生产者-消费者模式（`cmd_send/cmd_receive` memory stream）。慢操作通过 `_execute_with_monitor` 在 task group 中运行，支持 ABOR 取消。数据通道支持 PASV/PORT。
