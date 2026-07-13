@@ -115,7 +115,7 @@ def _dav_server() -> Generator[str]:
     pytest-asyncio event loop scope. Returns the base URL.
     """
 
-    from app.protocol.dav.server import DAVServer
+    from app.server.dav.server import DAVServer
     from app.storage.memory import MemoryStorage
 
     stop_event = asyncio.Event()

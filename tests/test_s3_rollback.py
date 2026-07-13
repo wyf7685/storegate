@@ -10,11 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pytest_mock import MockerFixture
 
-from app.storage.s3.s3_client.errors import S3HttpStatusError
-from app.storage.s3.s3_client.models import (
-    CopyPartResult,
-    S3Config,
-)
+from app.storage.s3.client import CopyPartResult, S3Config, S3HttpStatusError
 from app.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
 
 

@@ -8,8 +8,7 @@ from urllib.parse import unquote, urlparse
 
 from app.storage.abstract import FileInfo
 
-from .dav_client.errors import DavResponseParseError
-from .dav_client.models import DavResource
+from .client import DavResource, DavResponseParseError
 
 # PROPFIND body requesting the properties mapped to FileInfo fields.
 PROPFIND_BODY = (

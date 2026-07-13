@@ -2,8 +2,8 @@
 
 from unittest.mock import MagicMock
 
-from app.protocol.ftp.handler import FTPHandler
-from app.protocol.ftp.session import FTPSession
+from app.server.ftp.handler import FTPHandler
+from app.server.ftp.session import FTPSession
 from app.storage.memory import MemoryStorage
 
 

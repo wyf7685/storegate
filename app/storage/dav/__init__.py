@@ -1,4 +1,4 @@
-from .dav_client import DavConfig as DavConfig
+from .client import DavConfig as DavConfig
 from .storage import DavStorage as DavStorage
 
 Storage = DavStorage

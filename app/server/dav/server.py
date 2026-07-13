@@ -3,6 +3,7 @@ import sys
 import traceback
 from contextlib import AbstractAsyncContextManager
 from copy import deepcopy
+from typing import final, override
 
 import anyio.lowlevel
 from a2wsgi import WSGIMiddleware
@@ -13,6 +14,7 @@ from wsgidav.wsgidav_app import WsgiDAVApp
 from app.log import LOGGING_CONFIG
 from app.storage import AbstractStorage
 
+from ..abstract import AbstractServer
 from .provider import StorageProvider
 from .utils import current_event_loop_token
 
@@ -81,17 +83,32 @@ class WSGIMiddlewareWithLifespan(WSGIMiddleware):
         await super().__call__(scope, receive, send)
 
 
-class DAVServer:
+@final
+class DAVServer(AbstractServer):
+    """Asynchronous WebDAV server backed by an ``AbstractStorage`` implementation.
+
+    Usage::
+
+        storage = MemoryStorage()
+        server = DAVServer(storage, host="127.0.0.1", port=8080)
+        await server.serve()
+    """
+
+    host: str
+    port: int
+
     def __init__(
         self,
         storage: AbstractStorage,
+        *,
         host: str = "127.0.0.1",
         port: int = 8080,
-    ):
-        self.storage = storage
+    ) -> None:
+        super().__init__(storage)
         self.host = host
         self.port = port
 
+    @override
     async def serve(self) -> None:
         import uvicorn
 

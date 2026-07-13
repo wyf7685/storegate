@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from app.storage import S3Storage
+from app.storage.s3 import S3Storage
 from tests.conftest import uid
 
 pytestmark = pytest.mark.s3

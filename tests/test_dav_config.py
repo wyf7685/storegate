@@ -6,9 +6,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.storage.dav.dav_client import build_auth
-from app.storage.dav.dav_client.auth import _BearerAuth
-from app.storage.dav.dav_client.models import DavConfig
+from app.storage.dav.client import AsyncDavClient, build_auth
+from app.storage.dav.client.auth import _BearerAuth
+from app.storage.dav.client.models import DavConfig
 
 
 class TestDavConfigValidation:
@@ -100,22 +100,16 @@ class TestBuildAuth:
 
 class TestBuildPath:
     def test_no_prefix(self) -> None:
-        from app.storage.dav.dav_client.client import AsyncDavClient
-
         client = AsyncDavClient(DavConfig(base_url="https://host/dav", auth_mode="anonymous"))
         assert client._build_path("foo/bar") == "/foo/bar"
         assert client._build_path("/foo/bar") == "/foo/bar"
         assert client._build_path("") == "/"
 
     def test_with_prefix(self) -> None:
-        from app.storage.dav.dav_client.client import AsyncDavClient
-
         client = AsyncDavClient(DavConfig(base_url="https://host/dav", auth_mode="anonymous", root_prefix="/storegate"))
         assert client._build_path("foo/bar") == "/storegate/foo/bar"
         assert client._build_path("") == "/storegate"
 
     def test_build_url_absolute(self) -> None:
-        from app.storage.dav.dav_client.client import AsyncDavClient
-
         client = AsyncDavClient(DavConfig(base_url="https://host/dav", auth_mode="anonymous", root_prefix="/storegate"))
         assert client._build_url("foo") == "https://host/dav/storegate/foo"

@@ -8,7 +8,7 @@ from pytest_mock import MockerFixture
 
 from app.storage.abstract import FileInfo
 from app.storage.dav import DavStorage
-from app.storage.dav.dav_client.errors import DavHttpStatusError
+from app.storage.dav.client.errors import DavHttpStatusError
 
 
 @pytest.fixture

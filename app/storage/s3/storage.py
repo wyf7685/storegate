@@ -12,7 +12,7 @@ from app.log import escape_tag
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
 from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
-from .s3_client import (
+from .client import (
     AsyncS3Client,
     CompletedPart,
     ListObjectsCommonPrefix,

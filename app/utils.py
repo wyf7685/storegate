@@ -1,4 +1,5 @@
 import functools
+import importlib
 import inspect
 from collections.abc import (
     AsyncGenerator,
@@ -10,7 +11,9 @@ from collections.abc import (
     Generator,
     Iterable,
 )
-from typing import TYPE_CHECKING, Concatenate, Literal, TypedDict, Unpack
+from typing import TYPE_CHECKING, Any, Concatenate, Literal, TypedDict, Unpack
+
+from pydantic import BaseModel, TypeAdapter
 
 from app.const import DEFAULT_CHUNK_SIZE
 
@@ -82,6 +85,52 @@ class LoggerWrapper:
 
 def logger_wrapper(logger_name: str, /) -> LoggerWrapper:
     return LoggerWrapper(logger_name)
+
+
+class ObjectSpec(BaseModel):
+    factory: str
+    args: dict[str, str | int | float | bool | None | ObjectSpec | dict[str, object] | list[object]] | None = None
+
+    def resolve(self) -> Any:
+        modulename, _, cls = self.factory.partition(":")
+        if not modulename:
+            raise ValueError(f"Invalid factory string: {self.factory}")
+        if modulename.startswith("~"):
+            modulename = f"app.storage.{modulename[1:]}"
+        elif modulename.startswith("@"):
+            modulename = f"app.server.{modulename[1:]}"
+
+        try:
+            module = importlib.import_module(modulename)
+        except ImportError as e:
+            raise ImportError(f"Failed to import module '{modulename}' for factory '{self.factory}': {e}") from e
+
+        try:
+            factory = module
+            for attr_str in cls.split("."):
+                factory = getattr(factory, attr_str)
+        except AttributeError as e:
+            raise AttributeError(f"Failed to resolve factory '{self.factory}': {e}") from e
+
+        if inspect.isclass(factory):
+            sig = inspect.signature(factory.__init__)
+        elif inspect.isfunction(factory):
+            sig = inspect.signature(factory)
+        else:
+            raise TypeError(f"Factory is not a class or function: {factory.__class__.__name__!r}")
+
+        if self.args is None:
+            return factory()
+
+        resolved_args: dict[str, Any] = {}
+        for key, value in self.args.items():
+            if isinstance(value, ObjectSpec):
+                resolved_args[key] = value.resolve()
+            else:
+                if (param := sig.parameters.get(key)) and param.annotation is not param.empty:
+                    value = TypeAdapter(param.annotation).validate_python(value)
+                resolved_args[key] = value
+        return factory(**resolved_args)
 
 
 async def coalesce_chunks(

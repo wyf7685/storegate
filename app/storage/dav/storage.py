@@ -10,7 +10,7 @@ from app.log import escape_tag
 from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
 from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
-from .dav_client import AsyncDavClient, DavClientError, DavConfig, DavHttpStatusError
+from .client import AsyncDavClient, DavClientError, DavConfig, DavHttpStatusError
 from .utils import dav_resource_to_file_info, href_to_storage_path
 
 translator = ExceptionTranslator(

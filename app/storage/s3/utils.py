@@ -12,7 +12,7 @@ from app.log import escape_tag
 from app.storage.abstract import FileInfo
 from app.utils import logger_wrapper
 
-from .s3_client import AsyncS3Client, CompletedPart
+from .client import AsyncS3Client, CompletedPart
 
 
 def serialize_file_info(info: FileInfo) -> bytes:
