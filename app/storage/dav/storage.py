@@ -38,7 +38,7 @@ class DavStorage(AbstractStorage):
     Accesses a remote WebDAV server (Nextcloud, ownCloud, Apache mod_dav,
     wsgidav, ...) via HTTP and exposes it as an :class:`AbstractStorage`.
     Symmetric with :class:`S3Storage`: a self-built async HTTP client
-    (``dav_client/``) wrapped by a storage adapter.
+    (``client/``) wrapped by a storage adapter.
     """
 
     _client: AsyncDavClient | None = None
