@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import anyio
 
 from app.log import escape_tag
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
+from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike, make_cache_identity
 from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
 from .client import AsyncDavClient, DavClientError, DavConfig, DavHttpStatusError
@@ -53,6 +53,19 @@ class DavStorage(AbstractStorage):
     def id(self) -> str:
         parsed = urlparse(self._config.base_url)
         return f"dav:{parsed.netloc}{self._config.root_prefix}"
+
+    @property
+    @override
+    def cache_identity(self) -> str:
+        parsed = urlparse(self._config.base_url)
+        return make_cache_identity(
+            "dav",
+            base_path=parsed.path,
+            hostname=parsed.hostname,
+            port=parsed.port,
+            root_prefix=self._config.root_prefix,
+            scheme=parsed.scheme,
+        )
 
     @property
     def _url_prefix(self) -> str:

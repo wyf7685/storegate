@@ -11,7 +11,7 @@ import anyio.lowlevel
 import anyio.to_thread
 import ayafileio
 
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
+from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike, make_cache_identity
 
 
 @final
@@ -36,6 +36,11 @@ class LocalStorage(AbstractStorage):
     @override
     def id(self) -> str:
         return f"local:{self._root.as_posix()}"
+
+    @property
+    @override
+    def cache_identity(self) -> str:
+        return make_cache_identity("local", root=self._root.resolve(strict=False).as_posix())
 
     # ------------------------------------------------------------------
     # Lifecycle

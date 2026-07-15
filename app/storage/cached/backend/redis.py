@@ -1,5 +1,7 @@
 import contextlib
+import hashlib
 import json
+import re
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, final, override
@@ -90,23 +92,40 @@ def _json_to_file_info_from_dict(obj: dict[str, Any]) -> FileInfo:
 class RedisCacheBackend(CacheBackend):
     """Redis-backed cache backend using :mod:`redis.asyncio`.
 
-    Each namespace is stored under the Redis key prefix
-    ``storegate:{namespace}:{key}``.  Per-key TTL is set via
-    ``SET … EX``.
+    Each namespace is stored below a storage-specific prefix.  With the
+    default ``key_prefix="auto"``, :meth:`bind_storage` derives
+    ``storegate:v1:{sha256}:{namespace}:{key}`` from the wrapped storage's
+    stable, non-secret cache identity.  Per-key TTL is set via ``SET … EX``.
 
     Parameters
     ----------
     url:
         Redis connection URL (e.g. ``"redis://localhost:6379/0"``).
+    key_prefix:
+        ``"auto"`` (default) derives an isolated prefix from the bound
+        storage.  A validated explicit prefix is available for storage
+        implementations that cannot provide a stable identity.
     **kw:
         Extra keyword arguments forwarded to :func:`redis.asyncio.from_url`.
     """
 
     _PREFIX = "storegate"
+    _PREFIX_RE = re.compile(r"[A-Za-z0-9:_-]+")
 
-    def __init__(self, url: str = "redis://localhost:6379/0", **kw: Any) -> None:
+    def __init__(
+        self,
+        url: str = "redis://localhost:6379/0",
+        *,
+        key_prefix: str = "auto",
+        **kw: Any,
+    ) -> None:
         super().__init__()
+        if key_prefix != "auto" and self._PREFIX_RE.fullmatch(key_prefix) is None:
+            raise ValueError("key_prefix must contain only letters, digits, ':', '_' or '-'")
         self._url = url
+        self._key_prefix = key_prefix
+        self._instance_prefix: str | None = None if key_prefix == "auto" else key_prefix
+        self._bound_identity: str | None = None
         self._kw = kw
         self._redis: aioredis.Redis | None = None
         self._ttls: dict[str, int] = {}
@@ -147,8 +166,21 @@ class RedisCacheBackend(CacheBackend):
             return False
 
     # ------------------------------------------------------------------
-    # Namespace configuration
+    # Storage binding / namespace configuration
     # ------------------------------------------------------------------
+
+    @override
+    def bind_storage(self, identity: str | None) -> None:
+        if self._key_prefix != "auto":
+            return
+        if identity is None:
+            raise ValueError("RedisCacheBackend requires a stable cache identity when key_prefix='auto'")
+
+        instance_prefix = f"{self._PREFIX}:v1:{hashlib.sha256(identity.encode()).hexdigest()}"
+        if self._bound_identity is not None and self._bound_identity != identity:
+            raise ValueError("RedisCacheBackend cannot be bound to multiple storage identities")
+        self._bound_identity = identity
+        self._instance_prefix = instance_prefix
 
     @override
     def configure_namespace(self, name: str, ttl: int, **opts: Any) -> None:
@@ -159,8 +191,13 @@ class RedisCacheBackend(CacheBackend):
     # Key helpers
     # ------------------------------------------------------------------
 
+    def _scope_prefix(self) -> str:
+        if self._instance_prefix is None:
+            raise RuntimeError("Redis cache backend is not bound to a storage identity")
+        return self._instance_prefix
+
     def _rk(self, namespace: str, key: str) -> str:
-        return f"{self._PREFIX}:{namespace}:{key}"
+        return f"{self._scope_prefix()}:{namespace}:{key}"
 
     # ------------------------------------------------------------------
     # Single-key operations
@@ -202,7 +239,8 @@ class RedisCacheBackend(CacheBackend):
     @override
     async def clear(self, namespace: str | None = None) -> None:
         r = self._ensure_client()
-        pattern = f"{self._PREFIX}:{namespace}:*" if namespace is not None else f"{self._PREFIX}:*"
+        scope_prefix = self._scope_prefix()
+        pattern = f"{scope_prefix}:{namespace}:*" if namespace is not None else f"{scope_prefix}:*"
         cursor = 0
         with contextlib.suppress(Exception):
             while True:

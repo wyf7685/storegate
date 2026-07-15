@@ -1,4 +1,5 @@
 import functools
+import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass
@@ -28,6 +29,15 @@ type BytesLike = bytes | bytearray | memoryview
 type PathLike = str | PurePath
 
 
+def make_cache_identity(kind: str, **fields: object) -> str:
+    """Build a canonical, non-secret identity for a persistent cache scope.
+
+    Callers must whitelist only fields that identify the underlying data
+    location.  Credentials and runtime-only settings must not be included.
+    """
+    return json.dumps({"kind": kind, **fields}, separators=(",", ":"), sort_keys=True)
+
+
 class AbstractStorage(ABC):
     """Abstract storage interface."""
 
@@ -43,6 +53,16 @@ class AbstractStorage(ABC):
     def id(self) -> str:
         """Return a unique identifier for this storage instance."""
         raise NotImplementedError
+
+    @property
+    def cache_identity(self) -> str | None:
+        """Return a stable, non-secret identity for persistent cache scoping.
+
+        ``None`` means this storage cannot safely reuse a persistent cache
+        across process restarts.  Implementations must not include credentials
+        or other secrets in the returned value.
+        """
+        return None
 
     @staticmethod
     def normalize_path(path: PathLike) -> PurePosixPath:

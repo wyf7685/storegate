@@ -15,7 +15,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.log import escape_tag
 
-from ..abstract import AbstractStorage, BytesLike, FileInfo, PathLike
+from ..abstract import AbstractStorage, BytesLike, FileInfo, PathLike, make_cache_identity
 
 BLOCK_SIZE = 64 * 1024 * 1024  # 64 MB
 MAX_CONCURRENT_UPLOADS = 2
@@ -62,6 +62,20 @@ class IndexStorage(AbstractStorage):
     @override
     def id(self) -> str:
         return f"index:{self._index.id}#{self._chunks.id}"
+
+    @property
+    @override
+    def cache_identity(self) -> str | None:
+        index_identity = self._index.cache_identity
+        chunks_identity = self._chunks.cache_identity
+        if index_identity is None or chunks_identity is None:
+            return None
+        return make_cache_identity(
+            "index",
+            block_size=self._block_size,
+            chunks=chunks_identity,
+            index=index_identity,
+        )
 
     @override
     async def connect(self) -> None:

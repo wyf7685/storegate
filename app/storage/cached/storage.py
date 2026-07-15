@@ -83,6 +83,7 @@ class CachedStorage(AbstractStorage):
         else:
             self._cache = cache
 
+        self._cache.bind_storage(self._storage.cache_identity)
         self._cache.configure_namespace("exists", ttl)
         self._cache.configure_namespace("is_file", ttl)
         self._cache.configure_namespace("is_dir", ttl)
@@ -99,6 +100,11 @@ class CachedStorage(AbstractStorage):
     def id(self) -> str:
         return self._storage.id
 
+    @property
+    @override
+    def cache_identity(self) -> str | None:
+        return self._storage.cache_identity
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -114,7 +120,6 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def close(self) -> None:
-        await self._clear_all_caches()
         await self._storage.close()
         await self._cache.close()
         self.log.debug("Disconnected")
@@ -315,9 +320,11 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def delete_many(self, *paths: PathLike) -> None:
-        await self._storage.delete_many(*paths)
-        for path in paths:
-            await self._invalidate_path(path)
+        try:
+            await self._storage.delete_many(*paths)
+        finally:
+            for path in paths:
+                await self._invalidate_path(path)
 
     @override
     async def move(self, src: PathLike, dst: PathLike) -> None:

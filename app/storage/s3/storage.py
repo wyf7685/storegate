@@ -9,7 +9,7 @@ import anyio
 import anyio.lowlevel
 
 from app.log import escape_tag
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
+from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike, make_cache_identity
 from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
 from .client import (
@@ -56,6 +56,19 @@ class S3Storage(AbstractStorage):
     @override
     def id(self) -> str:
         return f"s3:{self._config.bucket}:{self._config.region}"
+
+    @property
+    @override
+    def cache_identity(self) -> str:
+        config = self._config
+        return make_cache_identity(
+            "s3",
+            bucket=config.bucket,
+            endpoint_url=config.endpoint_url,
+            path_style=config.path_style,
+            region=config.region,
+            scheme=config.scheme,
+        )
 
     @override
     async def connect(self) -> None:
