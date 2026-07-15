@@ -491,13 +491,11 @@ class CachedStorage(AbstractStorage):
                 yield info
             return
         entries: list[FileInfo] = []
-        cache_entries: list[tuple[str, str, object]] = []
         async for info in self._storage.iterdir(path):
             entries.append(info)
-            cache_entries.extend(self._info_to_cache_entries(self._normalize(info.path), info))
+            await self._cache.mset(*self._info_to_cache_entries(self._normalize(info.path), info))
             yield info
-        cache_entries.append(("iterdir", np, entries.copy()))
-        await self._cache.mset(*cache_entries)
+        await self._cache.set("iterdir", np, entries.copy())
         self.log.debug(f"Cache miss: <le>iterdir</>(<y>{escape_tag(np)}</y>) → <g>{len(entries)}</g> entries")
 
     @override
