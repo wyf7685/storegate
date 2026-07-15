@@ -1,5 +1,5 @@
 import itertools
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable
 from pathlib import PurePosixPath
 from typing import Literal, final, override
 
@@ -265,7 +265,7 @@ class CachedStorage(AbstractStorage):
         remote_path: PathLike,
         *,
         offset: int = 0,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes]:
         np = self._normalize(remote_path)
 
         # 缓存中存储的是一定是完整文件内容 → 切片后即可服务 Range 请求
@@ -489,7 +489,7 @@ class CachedStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
         np = self._normalize(path)
         cached: list[FileInfo] | None = await self._cache.get("iterdir", np)
         if cached is not None:
@@ -506,7 +506,7 @@ class CachedStorage(AbstractStorage):
         self.log.debug(f"Cache miss: <le>iterdir</>(<y>{escape_tag(np)}</y>) → <g>{len(entries)}</g> entries")
 
     @override
-    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
         dirs: list[FileInfo] = []
         files: list[FileInfo] = []
         async for entry in self.iterdir(path):

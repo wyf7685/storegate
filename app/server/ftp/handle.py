@@ -39,10 +39,6 @@ class ReadHandle(FileHandle):
         self.buffer = bytearray()
         self.closed = False
 
-    async def _generate(self) -> AsyncGenerator[bytes]:
-        async for chunk in self.storage.download_stream(self.path, offset=self.offset):
-            yield chunk
-
     @override
     async def seek(self, offset: int) -> int:
         if self.closed:
@@ -59,7 +55,7 @@ class ReadHandle(FileHandle):
         if self.closed:
             raise ValueError("I/O operation on closed file.")
         if self.agen is None:
-            self.agen = self._generate()
+            self.agen = self.storage.download_stream(self.path, offset=self.offset)
 
         while len(self.buffer) < size:
             try:

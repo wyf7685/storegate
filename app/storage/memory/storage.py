@@ -1,5 +1,5 @@
 import itertools
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import final, override
@@ -121,7 +121,7 @@ class MemoryStorage(AbstractStorage):
         remote_path: PathLike,
         *,
         offset: int = 0,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes]:
         target = self._resolve(remote_path)
 
         try:
@@ -411,7 +411,7 @@ class MemoryStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
         target = self._resolve(path)
 
         # Allow listing root that has files but hasn't been explicitly mkdir'd.
@@ -460,7 +460,7 @@ class MemoryStorage(AbstractStorage):
             )
 
     @override
-    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
         target = self._resolve(path)
 
         if target not in self._dirs and target != "" and not self._is_dir(target):

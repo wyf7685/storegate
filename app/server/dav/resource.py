@@ -36,13 +36,9 @@ class ResourceReader:
             raise ValueError("Cannot seek after reading has started")
         self._offset = offset
 
-    async def _download_stream(self) -> AsyncGenerator[bytes]:
-        async for chunk in self._storage.download_stream(self._path, offset=self._offset):
-            yield chunk
-
     async def _read_impl(self, size: int) -> bytes:
         if self._agen is None:
-            self._agen = self._download_stream()
+            self._agen = self._storage.download_stream(self._path, offset=self._offset)
 
         while len(self._buffer) < size:
             try:

@@ -4,7 +4,7 @@ import functools
 import hashlib
 import uuid
 from collections import defaultdict
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import final, override
@@ -483,7 +483,7 @@ class IndexStorage(AbstractStorage):
         remote_path: PathLike,
         *,
         offset: int = 0,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes]:
         remote_path = self.normalize_path(remote_path)
         _colored_path = f"<y>{escape_tag(remote_path)}</y>"
         self.log.debug(f"Download starting: {_colored_path}{f" (offset=<g>{offset}</g>)" if offset else ""}")
@@ -969,7 +969,7 @@ class IndexStorage(AbstractStorage):
         return meta.info
 
     @override
-    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
         path = self.normalize_path(path)
         if not await self._index.is_dir(path):
             raise NotADirectoryError(f"Not a directory: {path}")
@@ -989,7 +989,7 @@ class IndexStorage(AbstractStorage):
                     yield meta.info
 
     @override
-    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
         path = self.normalize_path(path)
         if not await self._index.is_dir(path):
             raise NotADirectoryError(f"Not a directory: {path}")

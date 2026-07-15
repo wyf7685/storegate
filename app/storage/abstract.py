@@ -1,7 +1,7 @@
 import functools
 import json
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
@@ -156,7 +156,7 @@ class AbstractStorage(ABC):
         remote_path: PathLike,
         *,
         offset: int = 0,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes]:
         """Download as an async byte stream.
 
         Args:
@@ -353,13 +353,13 @@ class AbstractStorage(ABC):
         return [item async for item in self.iterdir(path)]
 
     @abstractmethod
-    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
         """Iterate directory entries."""
         raise NotImplementedError
         yield
 
     @abstractmethod
-    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
         """Recursively walk a directory tree."""
         raise NotImplementedError
         yield

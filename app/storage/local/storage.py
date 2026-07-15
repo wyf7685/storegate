@@ -1,7 +1,7 @@
 import functools
 import os
 import shutil
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import final, override
@@ -118,7 +118,7 @@ class LocalStorage(AbstractStorage):
         remote_path: PathLike,
         *,
         offset: int = 0,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes]:
         target = self._resolve(remote_path)
 
         if not await anyio.Path(target).is_file():
@@ -249,7 +249,7 @@ class LocalStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
-    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
+    async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
         target = self._resolve(path)
         p = anyio.Path(target)
 
@@ -271,7 +271,7 @@ class LocalStorage(AbstractStorage):
             )
 
     @override
-    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
         target = self._resolve(path)
         p = anyio.Path(target)
 
