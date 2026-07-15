@@ -23,6 +23,31 @@ uv run ty check                  # 静态类型检查
 
 本项目使用 Python 3.14，包管理器为 `uv`。pytest 配置在 `pyproject.toml` 的 `[tool.pytest.ini_options]`，含 `asyncio_mode = "auto"`。已配置 `prek` pre-commit hooks（ruff 检查 + 格式化 + ty 检查）。
 
+## 开发要求
+
+### 类型检查（ty）
+
+项目使用 **ty**（而非 pyright）进行静态类型检查。所有代码必须：
+
+- **完整类型注解**：所有公开函数、方法、变量必须有类型注解
+- **通过 `uv run ty check`**：提交前必须确保 ty 检查零错误
+- **`# ty: ignore` 仅限测试**：仅允许在单元测试中 mock 场景下使用 `# ty: ignore` 注释，业务代码不允许
+
+### Lint（ruff）
+
+项目使用 **ruff** 执行 lint 和格式化。所有代码必须：
+
+- **完全遵循 `ruff.toml`**：代码风格必须与 `ruff.toml` 中指定的所有规则一致
+- **通过 `uv run ruff check --fix`**：lint 检查必须零错误
+- **通过 `uv run ruff format`**：格式化检查必须零变更
+
+Agent 编写代码时须遵守以下纪律：
+
+- **禁止擅自修改 `ruff.toml`**：不得未经用户许可更改任何 lint 配置
+- **禁止文件级 `noqa`**：不得添加作用于整个文件的 `# noqa` 或 `per-file-ignores` 等豁免
+- **允许针对性 `noqa`**：仅在必要且合理的少数位置，针对具体行添加 `# noqa: <rule>` 注释
+- **测试文件豁免**：对于单元测试代码（`tests/*.py`），必要时可在获得用户许可后，向 `ruff.toml` 的 `lint.extend-per-file-ignores` 追加排除规则
+
 ## 代码风格
 
 **Ruff 配置** (`ruff.toml`)：
