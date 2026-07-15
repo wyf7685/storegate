@@ -72,7 +72,7 @@ tests/
 ├── test_dav_xml.py          # multistatus XML 解析单测（无需网络）
 ├── test_dav_rollback.py     # DavStorage 错误路径单测（mocked client）
 ├── test_dav_internals.py    # DavStorage 集成测试（本地 wsgidav，标记 @pytest.mark.dav）
-├── test_ftp_handler.py      # FTP 命令分发单元测试
+├── test_ftp_handler.py      # aioftp 协议集成测试
 └── test_storage_factory.py  # resolve_object / resolve_storage 单测
 ```
 
@@ -127,13 +127,10 @@ app/
 │   │   ├── collection.py # StorageCollection: 目录操作（mkdir/rmtree/copytree/movetree）
 │   │   ├── resource.py   # StorageResource + ResourceReader/Writer: 文件读写
 │   │   └── utils.py      # run_async (anyio.from_thread.run), call_with_catch, ContextVar
-│   └── ftp/              # FTP 服务（纯 anyio, 零依赖 FTP 实现）
-│       ├── server.py     # FTPServer: TCP listener, 每客户端 FTPSession + FTPHandler
-│       ├── handler.py    # FTPHandler: 生产者-消费者命令分发, _execute_with_monitor
-│       ├── data.py       # DataConnection: PASV/PORT 数据通道管理
-│       ├── session.py    # FTPSession dataclass: cwd/authenticated/rename_from
-│       ├── response.py   # FTP 响应码枚举 (R)
-│       └── listing.py    # Unix ls -l 格式输出
+│   └── ftp/              # FTP 服务（aioftp + AbstractStorage 适配层）
+│       ├── server.py     # FTPServer: 配置 aioftp 服务与支持的命令
+│       ├── pathio.py     # StoragePathIO: 适配 AbstractStorage 到 aioftp PathIO
+│       └── handle.py     # 流式 ReadHandle / WriteHandle
 tests/
 ├── conftest.py            # uid(), 参数化 storage fixture（6 后端）, _dav_server
 ├── test_storage_general.py
@@ -187,7 +184,7 @@ tests/
 - **DavStorage**: WebDAV 客户端后端，与 `S3Storage` 对称（自研 `client/` SDK + `storage.py` 适配器，基于 httpx）。支持 Basic / Bearer / 匿名认证与 HTTPS/TLS（含自定义 CA `ca_cert_path`）。`root_prefix` 在 `base_url` 下隔离多实例（类比 S3 bucket）。方法映射：`PROPFIND`（Depth:0/1）→ stat/iterdir，`PUT`（httpx 流式 body）→ upload_stream，`GET`（Range）→ download_stream，`MKCOL` → mkdir，`DELETE` → unlink/rmdir/rmtree，`COPY`/`MOVE`（Overwrite 头）→ copy/move/copytree/movetree。`rmdir` 需 DELETE 前用 `iterdir` 预检空（WebDAV DELETE 天然递归）；`rmtree` 单次 DELETE 递归删集合；`walk` 用递归 Depth:1（避开被 Nextcloud/mod_dav 默认禁用的 infinity）；`copytree`/`movetree` 优先服务端 `COPY`/`MOVE` Depth:infinity，服务器返回 403/405/409/501 时回退 walk+逐文件 copy（回退失败 `rmtree(dst)` 回滚）。`move` 对 412（服务器拒覆盖）先删目标再重试以维持覆盖语义。`ExceptionTranslator` 映射 404→FileNotFoundError、403/423→PermissionError、412→FileExistsError；405 语义重载（MKCOL 已存在 / PUT 到集合）在各方法内联处理。multistatus XML 用 `xml.etree` + `{*}tag` 通配解析（与 S3 client 同法）。
 - **IndexStorage**: 大文件按 `BLOCK_SIZE (64MB)` 拆分分块，SHA-256 去重，引用计数管理。使用基于文件锁的乐观并发控制（`_acquire_storage_file_lock`）。分块存储在 `hash[:2]/hash[2:6]/hash[6:].{bin,ref,lock}` 路径下。`upload_stream` 使用 worker pool 并发上传分块，失败时回滚已写入分块的引用计数。覆盖写入时自动 decref 旧文件不再引用的分块。**所有公开入口方法统一调用 `_to_abs_path()` 规范化路径为绝对路径**，确保 `FileMeta` 和 chunk ref 文件中存储的路径一致。`copytree`/`movetree` 批量操作 chunk refs（`incref`/`transref`），`list_()`/`walk()` 并发获取文件元数据。`move` 和 `copy` 使用 `PurePosixPath` 而非 `Path`（跨平台一致性）。
 - **CachedStorage**: 6 个命名空间缓存 (`exists/is_file/is_dir/stat/iterdir/download`)。正结果交叉后填（如 `is_file=True` → 同时缓存 `exists=True, is_dir=False`）。写入操作回填已知状态。`CacheBackend` 抽象接口支持批量操作（`mget`/`mset`/`mdelete`），内置 `MemoryCacheBackend` 和 `RedisCacheBackend`。**`snapshot()` / `dump_cache()`** 内省 API 暴露缓存内部状态供测试验证命中/未命中/回填/失效行为。`list_()` 永远绕过 `iterdir` 缓存直接查询底层存储但回填逐条目元数据缓存。
-- **FTP**: 完全自研的异步实现，非 pyftpdlib。命令分发使用生产者-消费者模式（`cmd_send/cmd_receive` memory stream）。慢操作通过 `_execute_with_monitor` 在 task group 中运行，支持 ABOR 取消。数据通道支持 PASV/PORT。
+- **FTP**: 基于 `aioftp`，`StoragePathIO` 将协议文件操作映射到 `AbstractStorage`，`ReadHandle` / `WriteHandle` 保持下载和上传流式传输。仅支持 `rb` / `wb`，并显式禁用 APPE 与 REST。
 - **WebDAV**: 基于 wsgidav，通过 `run_async()` 桥接同步 wsgidav 到异步 `AbstractStorage`。`ResourceWriter` 使用独立线程 + memory object stream 处理异步上传。
 - **日志**: 使用 loguru，`LoggerWrapper` 为每个类提供带色彩标签的实例日志器。支持 `LoguruOpts` 灵活配置日志选项（exception/record/lazy/colors/raw/capture/depth/ansi）。`LoguruHandler` 将标准库 logging 桥接到 loguru。
 - **异常处理**: `ExceptionTranslator` 提供统一的异常翻译装饰器，支持 `bypass`、`catch`、`default` 异常分类和自定义异常映射。同时支持 `wrap`（普通异步函数）和 `wrap_agen`（异步生成器）。

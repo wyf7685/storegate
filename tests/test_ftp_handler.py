@@ -1,44 +1,99 @@
-"""Unit tests for FTP handler command dispatch and FEAT consistency."""
+"""Protocol integration tests for the aioftp-backed FTP server."""
 
-from unittest.mock import MagicMock
+from collections.abc import AsyncIterator
 
-from app.server.ftp.handler import FTPHandler
-from app.server.ftp.session import FTPSession
+import aioftp
+import pytest
+
+from app.server.ftp import FTPServer
 from app.storage.memory import MemoryStorage
 
 
-def _make_handler() -> FTPHandler:
-    """Build a minimal FTPHandler for unit testing."""
+@pytest.fixture
+async def ftp_endpoint() -> AsyncIterator[tuple[str, int, MemoryStorage]]:
     storage = MemoryStorage("/")
-    session = FTPSession()
-    stream = MagicMock()  # _handle_feat / _dispatch 不碰 stream
-    return FTPHandler(storage, session, stream, "127.0.0.1")
+    server = FTPServer(storage, host="127.0.0.1", port=0)
+
+    async with storage:
+        await server.server.start(server.host, server.port)
+        try:
+            yield server.host, server.server.server_port, storage
+        finally:
+            await server.server.close()
 
 
-async def test_feat_does_not_declare_eprt():
-    """FEAT must not advertise EPRT — no handler exists for it."""
-    handler = _make_handler()
-    resp = await handler._handle_feat("")
-    assert "PASV" in resp
-    assert "EPRT" not in resp
+async def _upload(client: aioftp.Client, path: str, content: bytes) -> None:
+    async with client.upload_stream(path) as stream:
+        await stream.write(content)
 
 
-async def test_feat_does_not_declare_epsv():
-    """FEAT must not advertise EPSV — no handler exists for it."""
-    handler = _make_handler()
-    resp = await handler._handle_feat("")
-    assert "EPSV" not in resp
+async def _download(client: aioftp.Client, path: str) -> bytes:
+    content = bytearray()
+    async with client.download_stream(path) as stream:
+        async for chunk in stream.iter_by_block():
+            content.extend(chunk)
+    return bytes(content)
 
 
-async def test_dispatch_eprt_returns_not_implemented():
-    """Dispatching EPRT must return 502 — the command has no handler."""
-    handler = _make_handler()
-    resp = await handler._dispatch("EPRT", "|1|127.0.0.1|4321|")
-    assert resp.startswith("502")
+async def test_upload_and_download_round_trip(ftp_endpoint: tuple[str, int, MemoryStorage]) -> None:
+    host, port, _ = ftp_endpoint
+
+    async with aioftp.Client.context(host, port) as client:
+        await _upload(client, "/hello.txt", b"hello, FTP")
+        assert await _download(client, "/hello.txt") == b"hello, FTP"
 
 
-async def test_dispatch_epsv_returns_not_implemented():
-    """Dispatching EPSV must return 502 — the command has no handler."""
-    handler = _make_handler()
-    resp = await handler._dispatch("EPSV", "")
-    assert resp.startswith("502")
+async def test_rmd_removes_empty_directory(ftp_endpoint: tuple[str, int, MemoryStorage]) -> None:
+    host, port, storage = ftp_endpoint
+
+    async with aioftp.Client.context(host, port) as client:
+        await client.make_directory("/empty")
+        await client.remove_directory("/empty")
+
+    assert not await storage.exists("/empty")
+
+
+async def test_rmd_rejects_nonempty_directory_without_deleting_contents(
+    ftp_endpoint: tuple[str, int, MemoryStorage],
+) -> None:
+    host, port, storage = ftp_endpoint
+
+    async with aioftp.Client.context(host, port) as client:
+        await client.make_directory("/nonempty")
+        await _upload(client, "/nonempty/sentinel.txt", b"keep me")
+        code, _ = await client.command("RMD /nonempty", expected_codes="4xx")
+
+        assert code.matches("4xx")
+        assert await _download(client, "/nonempty/sentinel.txt") == b"keep me"
+
+    assert await storage.exists("/nonempty/sentinel.txt")
+
+
+@pytest.mark.parametrize("path", ["/", "."])
+async def test_rmd_rejects_root_directory_without_deleting_contents(
+    ftp_endpoint: tuple[str, int, MemoryStorage], path: str
+) -> None:
+    host, port, storage = ftp_endpoint
+
+    async with aioftp.Client.context(host, port) as client:
+        await _upload(client, "/sentinel.txt", b"keep me")
+        code, _ = await client.command(f"RMD {path}", expected_codes="4xx")
+
+        assert code.matches("4xx")
+        assert await _download(client, "/sentinel.txt") == b"keep me"
+
+    assert await storage.exists("/sentinel.txt")
+
+
+async def test_appe_and_rest_are_not_implemented(ftp_endpoint: tuple[str, int, MemoryStorage]) -> None:
+    host, port, _ = ftp_endpoint
+
+    async with aioftp.Client.context(host, port) as client:
+        appe_code, _ = await client.command("APPE /append.txt", expected_codes="502")
+        rest_code, _ = await client.command("REST 1", expected_codes="502")
+
+        assert str(appe_code) == "502"
+        assert str(rest_code) == "502"
+
+        await _upload(client, "/after-rest.txt", b"written normally")
+        assert await _download(client, "/after-rest.txt") == b"written normally"

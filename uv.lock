@@ -12,6 +12,15 @@ wheels = [
 ]
 
 [[package]]
+name = "aioftp"
+version = "0.27.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/cc/a3/d1af4b69c09dc9955fdb329de5a9ea73f6a3ba50ac4861882453254ffa99/aioftp-0.27.2.tar.gz", hash = "sha256:7c048c3220081796c59832a6fd9fd8fad97e3cec12a50be3abccf2dcbbeb261a", size = 70248, upload-time = "2025-09-24T21:51:31.297Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7c/6c/d56c290696f91c4f0fa4be7cfdb38e710d9735c10c57e481cd4bd6066506/aioftp-0.27.2-py3-none-any.whl", hash = "sha256:83befd4091be0e26eeba44dadebb7e7bea653f7b6bda3ba9b6785d4372a93e10", size = 44292, upload-time = "2025-09-24T21:51:29.448Z" },
+]
+
+[[package]]
 name = "annotated-types"
 version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
@@ -658,6 +667,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "a2wsgi" },
+    { name = "aioftp" },
     { name = "anyio" },
     { name = "ayafileio" },
     { name = "expiringdictx" },
@@ -698,6 +708,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "a2wsgi", specifier = ">=1.10.10" },
+    { name = "aioftp", specifier = ">=0.27.2" },
     { name = "anyio", specifier = ">=4.14.1" },
     { name = "ayafileio", specifier = ">=1.4.7" },
     { name = "expiringdictx", specifier = ">=1.1.0" },
