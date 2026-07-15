@@ -23,11 +23,11 @@ from .client import (
 )
 from .utils import MultipartUploadTask, deserialize_file_info, serialize_file_info
 
-UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
+UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 # Files larger than this are copied via multipart upload to stay within
 # the CopyObject 5 GiB limit and to allow parallel part copies.
-COPY_MULTIPART_THRESHOLD = 4 * 1024 * 1024  # 4 MiB
+COPY_MULTIPART_THRESHOLD = 4 * 1024 * 1024  # 4MB
 
 
 translator = ExceptionTranslator(
