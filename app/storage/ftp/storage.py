@@ -14,6 +14,7 @@ from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike,
 from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
 from .config import FTPConfig
+from .pool import FTPClientLease, FTPClientPool
 
 type FTPFacts = BasicListInfo | UnixListInfo | dict[str, str]
 
@@ -51,13 +52,17 @@ def _status_matches(exc: aioftp.StatusCodeError, pattern: str) -> bool:
 class FTPStorage(AbstractStorage):
     """Plain FTP client storage backend."""
 
-    _client: aioftp.Client | None = None
-
     def __init__(self, config: str | Path | FTPConfig) -> None:
         super().__init__()
         self._config = config if isinstance(config, FTPConfig) else FTPConfig.from_file(config)
-        self._lock = anyio.Lock()
         self._root_prefix = PurePosixPath(self._config.root_prefix)
+        self._pool = FTPClientPool(
+            max_connections=self._config.max_connections,
+            close_timeout=self._config.timeout,
+            factory=self._connect_client,
+            closer=self._close_client,
+            logger=self.log,
+        )
 
     @property
     @override
@@ -101,11 +106,6 @@ class FTPStorage(AbstractStorage):
             raise OSError(f"FTP server returned a path outside root_prefix: {path}") from None
         return PurePosixPath("/") if relative == PurePosixPath(".") else PurePosixPath("/", relative)
 
-    def _ensure_client(self) -> aioftp.Client:
-        if self._client is None:
-            raise RuntimeError("FTP client is not connected")
-        return self._client
-
     def _new_client(self) -> aioftp.Client:
         return aioftp.Client(
             connection_timeout=self._config.timeout,
@@ -114,7 +114,7 @@ class FTPStorage(AbstractStorage):
             socket_timeout=self._config.timeout,
         )
 
-    async def _connect_client(self, *, validate_root: bool) -> aioftp.Client:
+    async def _connect_client(self) -> aioftp.Client:
         client = self._new_client()
         try:
             await client.connect(self._config.host, self._config.port)
@@ -122,10 +122,9 @@ class FTPStorage(AbstractStorage):
                 self._config.username,
                 self._config.password.get_secret_value(),
             )
-            if validate_root:
-                facts = await client.stat(self._root_prefix)
-                if facts.get("type") != "dir":
-                    raise NotADirectoryError(f"FTP root_prefix is not a directory: {self._config.root_prefix}")
+            facts = await client.stat(self._root_prefix)
+            if facts.get("type") != "dir":
+                raise NotADirectoryError(f"FTP root_prefix is not a directory: {self._config.root_prefix}")
         except Exception:
             client.close()
             raise
@@ -139,39 +138,62 @@ class FTPStorage(AbstractStorage):
             client.close()
 
     @asynccontextmanager
-    async def _aux_client(self) -> AsyncIterator[aioftp.Client]:
-        client = await self._connect_client(validate_root=False)
+    async def _temporary_client(self) -> AsyncIterator[aioftp.Client]:
+        client = await self._connect_client()
         try:
             yield client
         finally:
             with anyio.CancelScope(shield=True):
                 await self._close_client(client)
 
+    @staticmethod
+    def _invalidates_client(exc: BaseException) -> bool:
+        if isinstance(
+            exc,
+            (
+                GeneratorExit,
+                FileNotFoundError,
+                FileExistsError,
+                IsADirectoryError,
+                NotADirectoryError,
+                PermissionError,
+                ValueError,
+                aioftp.StatusCodeError,
+            ),
+        ):
+            return False
+        if isinstance(exc, anyio.get_cancelled_exc_class()):
+            return True
+        return True
+
+    @asynccontextmanager
+    async def _client_lease(self) -> AsyncIterator[FTPClientLease]:
+        async with self._pool.acquire() as lease:
+            try:
+                yield lease
+            except BaseException as exc:
+                if self._invalidates_client(exc):
+                    lease.invalidate()
+                raise
+
     @override
     @translator.wrap("Failed to connect to FTP server")
     async def connect(self) -> None:
-        if self._client is not None:
-            return
-        client = await self._connect_client(validate_root=True)
-        self._client = client
+        await self._pool.start()
         self.log.info(f"Connected to <c>{escape_tag(self._config.host)}</c>:<c>{self._config.port}</c>")
 
     @override
     async def close(self) -> None:
-        async with self._lock:
-            client = self._client
-            self._client = None
-            if client is not None:
-                await self._close_client(client)
+        await self._pool.close()
         self.log.debug("Disconnected")
 
     @override
     async def ping(self) -> bool:
-        if self._client is None:
+        if not self._pool.is_open:
             return False
         try:
-            async with self._lock:
-                facts = await self._ensure_client().stat(self._root_prefix)
+            async with self._client_lease() as lease:
+                facts = await lease.client.stat(self._root_prefix)
                 return facts.get("type") == "dir"
         except Exception:
             return False
@@ -195,26 +217,26 @@ class FTPStorage(AbstractStorage):
             created=_parse_mlsx_datetime(facts.get("create")),
         )
 
-    async def _stat_with_facts_unlocked(self, path: PathLike) -> tuple[FileInfo, FTPFacts]:
+    async def _stat_with_facts(self, client: aioftp.Client, path: PathLike) -> tuple[FileInfo, FTPFacts]:
         logical = self._logical_path(path)
         if logical == PurePosixPath("/"):
             return FileInfo(path="/", name="", is_dir=True), {"type": "dir"}
 
         try:
-            facts = await self._ensure_client().stat(self._remote_path(logical))
+            facts = await client.stat(self._remote_path(logical))
         except aioftp.StatusCodeError as exc:
             if _status_matches(exc, "550"):
                 raise FileNotFoundError(f"FTP path not found: {logical.as_posix()}") from exc
             raise
         return self._file_info_from_facts(logical, facts), facts
 
-    async def _stat_unlocked(self, path: PathLike) -> FileInfo:
-        info, _ = await self._stat_with_facts_unlocked(path)
+    async def _stat(self, client: aioftp.Client, path: PathLike) -> FileInfo:
+        info, _ = await self._stat_with_facts(client, path)
         return info
 
-    async def _exists_unlocked(self, path: PathLike) -> bool:
+    async def _exists(self, client: aioftp.Client, path: PathLike) -> bool:
         try:
-            await self._stat_unlocked(path)
+            await self._stat(client, path)
         except FileNotFoundError:
             return False
         return True
@@ -222,21 +244,21 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to stat {path}")
     async def stat(self, path: PathLike) -> FileInfo:
-        async with self._lock:
-            return await self._stat_unlocked(path)
+        async with self._client_lease() as lease:
+            return await self._stat(lease.client, path)
 
     @override
     @translator.wrap("Failed to check existence of {path}")
     async def exists(self, path: PathLike) -> bool:
-        async with self._lock:
-            return await self._exists_unlocked(path)
+        async with self._client_lease() as lease:
+            return await self._exists(lease.client, path)
 
     @override
     @translator.wrap("Failed to check whether {path} is a file")
     async def is_file(self, path: PathLike) -> bool:
-        async with self._lock:
+        async with self._client_lease() as lease:
             try:
-                info = await self._stat_unlocked(path)
+                info = await self._stat(lease.client, path)
             except FileNotFoundError:
                 return False
             return not info.is_dir
@@ -244,22 +266,22 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to check whether {path} is a directory")
     async def is_dir(self, path: PathLike) -> bool:
-        async with self._lock:
+        async with self._client_lease() as lease:
             try:
-                info = await self._stat_unlocked(path)
+                info = await self._stat(lease.client, path)
             except FileNotFoundError:
                 return False
             return info.is_dir
 
-    async def _list_unlocked(self, path: PathLike, *, validate: bool = True) -> list[FileInfo]:
+    async def _list(self, client: aioftp.Client, path: PathLike, *, validate: bool = True) -> list[FileInfo]:
         logical = self._logical_path(path)
         if validate:
-            info = await self._stat_unlocked(logical)
+            info = await self._stat(client, logical)
             if not info.is_dir:
                 raise NotADirectoryError(f"Not a directory: {logical.as_posix()}")
 
         try:
-            entries = await self._ensure_client().list(self._remote_path(logical))
+            entries = await client.list(self._remote_path(logical))
         except aioftp.StatusCodeError as exc:
             if _status_matches(exc, "550"):
                 raise FileNotFoundError(f"FTP directory not found: {logical.as_posix()}") from exc
@@ -274,17 +296,18 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap_agen("Failed to iterate directory {path}")
     async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
-        async with self._lock:
-            entries = await self._list_unlocked(path)
+        async with self._client_lease() as lease:
+            entries = await self._list(lease.client, path)
         for entry in entries:
             yield entry
 
-    async def _walk_snapshot_unlocked(
+    async def _walk_snapshot(
         self,
+        client: aioftp.Client,
         path: PathLike,
     ) -> list[tuple[PurePosixPath, list[FileInfo], list[FileInfo]]]:
         root = self._logical_path(path)
-        info = await self._stat_unlocked(root)
+        info = await self._stat(client, root)
         if not info.is_dir:
             raise NotADirectoryError(f"Not a directory: {root.as_posix()}")
 
@@ -292,7 +315,7 @@ class FTPStorage(AbstractStorage):
         pending = [root]
         while pending:
             current = pending.pop()
-            entries = await self._list_unlocked(current, validate=False)
+            entries = await self._list(client, current, validate=False)
             dirs = [entry for entry in entries if entry.is_dir]
             files = [entry for entry in entries if not entry.is_dir]
             result.append((current, dirs, files))
@@ -302,13 +325,14 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap_agen("Failed to walk directory {path}")
     async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
-        async with self._lock:
-            snapshot = await self._walk_snapshot_unlocked(path)
+        async with self._client_lease() as lease:
+            snapshot = await self._walk_snapshot(lease.client, path)
         for current, dirs, files in snapshot:
             yield current.as_posix(), dirs, files
 
-    async def _mkdir_unlocked(
+    async def _mkdir(
         self,
+        client: aioftp.Client,
         path: PathLike,
         *,
         parents: bool,
@@ -321,7 +345,7 @@ class FTPStorage(AbstractStorage):
             raise FileExistsError("Root directory already exists")
 
         try:
-            existing = await self._stat_unlocked(logical)
+            existing = await self._stat(client, logical)
         except FileNotFoundError:
             pass
         else:
@@ -332,10 +356,10 @@ class FTPStorage(AbstractStorage):
             raise FileExistsError(f"Directory already exists: {logical.as_posix()}")
 
         if not parents:
-            parent_info = await self._stat_unlocked(logical.parent)
+            parent_info = await self._stat(client, logical.parent)
             if not parent_info.is_dir:
                 raise NotADirectoryError(f"Parent is not a directory: {logical.parent.as_posix()}")
-            await self._ensure_client().make_directory(self._remote_path(logical), parents=False)
+            await client.make_directory(self._remote_path(logical), parents=False)
             return [logical]
 
         ancestors = [parent for parent in reversed(logical.parents) if parent != PurePosixPath("/")]
@@ -343,9 +367,9 @@ class FTPStorage(AbstractStorage):
         created: list[PurePosixPath] = []
         for directory in ancestors:
             try:
-                info = await self._stat_unlocked(directory)
+                info = await self._stat(client, directory)
             except FileNotFoundError:
-                await self._ensure_client().make_directory(self._remote_path(directory), parents=False)
+                await client.make_directory(self._remote_path(directory), parents=False)
                 created.append(directory)
             else:
                 if not info.is_dir:
@@ -355,8 +379,14 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to create directory {path} (parents={parents}, exist_ok={exist_ok})")
     async def mkdir(self, path: PathLike, *, parents: bool = False, exist_ok: bool = False) -> None:
-        async with self._lock:
-            await self._mkdir_unlocked(path, parents=parents, exist_ok=exist_ok)
+        async with self._client_lease() as lease:
+            await self._mkdir(lease.client, path, parents=parents, exist_ok=exist_ok)
+
+    async def _cleanup_partial_file(self, logical: PurePosixPath) -> None:
+        with anyio.move_on_after(self._config.timeout, shield=True):
+            with contextlib.suppress(Exception):
+                async with self._temporary_client() as client:
+                    await client.remove_file(self._remote_path(logical))
 
     @override
     @translator.wrap("Failed to upload stream to {remote_path} (overwrite={overwrite})")
@@ -368,10 +398,11 @@ class FTPStorage(AbstractStorage):
         overwrite: bool = True,
     ) -> None:
         logical = self._logical_path(remote_path)
-        async with self._lock:
+        async with self._client_lease() as lease:
+            client = lease.client
             existed = False
             try:
-                info = await self._stat_unlocked(logical)
+                info = await self._stat(client, logical)
             except FileNotFoundError:
                 pass
             else:
@@ -381,15 +412,15 @@ class FTPStorage(AbstractStorage):
                 if not overwrite:
                     raise FileExistsError(f"File already exists: {logical.as_posix()}")
 
-            await self._mkdir_unlocked(logical.parent, parents=True, exist_ok=True)
+            await self._mkdir(client, logical.parent, parents=True, exist_ok=True)
             try:
-                async with self._ensure_client().upload_stream(self._remote_path(logical)) as writer:
+                async with client.upload_stream(self._remote_path(logical)) as writer:
                     async for chunk in coalesce_chunks(stream, self._config.chunk_size):
                         await writer.write(chunk)
-            except Exception:
+            except BaseException:
+                lease.invalidate()
                 if not existed:
-                    with contextlib.suppress(Exception):
-                        await self._ensure_client().remove_file(self._remote_path(logical))
+                    await self._cleanup_partial_file(logical)
                 raise
 
     @override
@@ -404,20 +435,29 @@ class FTPStorage(AbstractStorage):
                 raise ValueError("offset must be non-negative")
 
             logical = self._logical_path(remote_path)
-            async with self._lock:
-                info, facts = await self._stat_with_facts_unlocked(logical)
-                if info.is_dir:
-                    raise IsADirectoryError(f"Is a directory: {logical.as_posix()}")
-                if "size" in facts and offset >= info.size:
-                    return
-
-                reader = await self._ensure_client().download_stream(self._remote_path(logical), offset=offset)
+            async with self._pool.acquire() as lease:
                 try:
-                    async for chunk in reader.iter_by_block(self._config.chunk_size):
-                        yield chunk
-                finally:
-                    with anyio.CancelScope(shield=True):
-                        await reader.finish()
+                    info, facts = await self._stat_with_facts(lease.client, logical)
+                    if info.is_dir:
+                        raise IsADirectoryError(f"Is a directory: {logical.as_posix()}")
+                    if "size" in facts and offset >= info.size:
+                        return
+
+                    reader = await lease.client.download_stream(self._remote_path(logical), offset=offset)
+                    try:
+                        async for chunk in reader.iter_by_block(self._config.chunk_size):
+                            yield chunk
+                    finally:
+                        try:
+                            with anyio.CancelScope(shield=True):
+                                await reader.finish()
+                        except BaseException:
+                            lease.invalidate()
+                            raise
+                except BaseException as exc:
+                    if self._invalidates_client(exc):
+                        lease.invalidate()
+                    raise
         except OSError:
             raise
         except aioftp.StatusCodeError as exc:
@@ -434,16 +474,16 @@ class FTPStorage(AbstractStorage):
         if logical == PurePosixPath("/"):
             raise IsADirectoryError("Cannot unlink root directory")
 
-        async with self._lock:
+        async with self._client_lease() as lease:
             try:
-                info = await self._stat_unlocked(logical)
+                info = await self._stat(lease.client, logical)
             except FileNotFoundError:
                 if missing_ok:
                     return
                 raise
             if info.is_dir:
                 raise IsADirectoryError(f"Is a directory: {logical.as_posix()}")
-            await self._ensure_client().remove_file(self._remote_path(logical))
+            await lease.client.remove_file(self._remote_path(logical))
 
     @override
     @translator.wrap("Failed to remove directory {path}")
@@ -452,25 +492,24 @@ class FTPStorage(AbstractStorage):
         if logical == PurePosixPath("/"):
             raise OSError("Cannot remove root directory")
 
-        async with self._lock:
-            info = await self._stat_unlocked(logical)
+        async with self._client_lease() as lease:
+            info = await self._stat(lease.client, logical)
             if not info.is_dir:
                 raise NotADirectoryError(f"Not a directory: {logical.as_posix()}")
-            if await self._list_unlocked(logical, validate=False):
+            if await self._list(lease.client, logical, validate=False):
                 raise OSError(f"Directory not empty: {logical.as_posix()}")
-            await self._ensure_client().remove_directory(self._remote_path(logical))
+            await lease.client.remove_directory(self._remote_path(logical))
 
-    async def _rmtree_unlocked(self, path: PathLike) -> None:
+    async def _rmtree(self, client: aioftp.Client, path: PathLike) -> None:
         logical = self._logical_path(path)
         if logical == PurePosixPath("/"):
             raise OSError("Cannot remove root directory")
 
-        info = await self._stat_unlocked(logical)
+        info = await self._stat(client, logical)
         if not info.is_dir:
             raise NotADirectoryError(f"Not a directory: {logical.as_posix()}")
 
-        snapshot = await self._walk_snapshot_unlocked(logical)
-        client = self._ensure_client()
+        snapshot = await self._walk_snapshot(client, logical)
         for _, _, files in snapshot:
             for file in files:
                 await client.remove_file(self._remote_path(file.path))
@@ -480,35 +519,39 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to remove directory tree {path}")
     async def rmtree(self, path: PathLike) -> None:
-        async with self._lock:
-            await self._rmtree_unlocked(path)
+        async with self._client_lease() as lease:
+            await self._rmtree(lease.client, path)
 
-    async def _copy_stream_unlocked(
+    async def _copy_stream(
         self,
+        source_client: aioftp.Client,
+        destination_client: aioftp.Client,
         source: PurePosixPath,
         destination: PurePosixPath,
-        destination_client: aioftp.Client,
     ) -> None:
-        async with (
-            self._ensure_client().download_stream(self._remote_path(source)) as reader,
-            destination_client.upload_stream(self._remote_path(destination)) as writer,
-        ):
-            async for chunk in reader.iter_by_block(self._config.chunk_size):
-                await writer.write(chunk)
+        reader = await source_client.download_stream(self._remote_path(source))
+        try:
+            async with destination_client.upload_stream(self._remote_path(destination)) as writer:
+                async for chunk in reader.iter_by_block(self._config.chunk_size):
+                    await writer.write(chunk)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await reader.finish()
 
-    async def _copy_file_unlocked(
+    async def _copy_file(
         self,
+        source_client: aioftp.Client,
+        destination_client: aioftp.Client,
         source: PurePosixPath,
         destination: PurePosixPath,
-        destination_client: aioftp.Client,
     ) -> bool:
-        source_info = await self._stat_unlocked(source)
+        source_info = await self._stat(source_client, source)
         if source_info.is_dir:
             raise IsADirectoryError(f"Is a directory: {source.as_posix()}")
 
         destination_existed = False
         try:
-            destination_info = await self._stat_unlocked(destination)
+            destination_info = await self._stat(source_client, destination)
         except FileNotFoundError:
             pass
         else:
@@ -516,8 +559,8 @@ class FTPStorage(AbstractStorage):
             if destination_info.is_dir:
                 raise IsADirectoryError(f"Is a directory: {destination.as_posix()}")
 
-        await self._mkdir_unlocked(destination.parent, parents=True, exist_ok=True)
-        await self._copy_stream_unlocked(source, destination, destination_client)
+        await self._mkdir(source_client, destination.parent, parents=True, exist_ok=True)
+        await self._copy_stream(source_client, destination_client, source, destination)
         return not destination_existed
 
     @override
@@ -528,14 +571,14 @@ class FTPStorage(AbstractStorage):
         if source == PurePosixPath("/"):
             raise OSError("Cannot move root directory")
 
-        async with self._lock:
-            source_info = await self._stat_unlocked(source)
+        async with self._client_lease() as lease:
+            source_info = await self._stat(lease.client, source)
             if source_info.is_dir:
                 raise IsADirectoryError(f"Is a directory: {source.as_posix()}")
-            if await self._exists_unlocked(destination):
+            if await self._exists(lease.client, destination):
                 raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
-            await self._mkdir_unlocked(destination.parent, parents=True, exist_ok=True)
-            await self._ensure_client().rename(self._remote_path(source), self._remote_path(destination))
+            await self._mkdir(lease.client, destination.parent, parents=True, exist_ok=True)
+            await lease.client.rename(self._remote_path(source), self._remote_path(destination))
 
     @override
     @translator.wrap("Failed to copy {src} → {dst}")
@@ -547,15 +590,14 @@ class FTPStorage(AbstractStorage):
         if source == destination:
             raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
 
-        async with self._lock:
-            destination_existed = await self._exists_unlocked(destination)
+        async with self._client_lease() as lease:
+            destination_existed = await self._exists(lease.client, destination)
             try:
-                async with self._aux_client() as destination_client:
-                    await self._copy_file_unlocked(source, destination, destination_client)
-            except Exception:
+                async with self._temporary_client() as destination_client:
+                    await self._copy_file(lease.client, destination_client, source, destination)
+            except BaseException:
                 if not destination_existed:
-                    with contextlib.suppress(Exception):
-                        await self._ensure_client().remove_file(self._remote_path(destination))
+                    await self._cleanup_partial_file(destination)
                 raise
 
     @staticmethod
@@ -568,12 +610,12 @@ class FTPStorage(AbstractStorage):
             return False
         return True
 
-    async def _rollback_copytree_unlocked(
+    async def _rollback_copytree(
         self,
+        client: aioftp.Client,
         created_files: set[PurePosixPath],
         created_dirs: set[PurePosixPath],
     ) -> None:
-        client = self._ensure_client()
         for file in sorted(created_files, key=lambda path: len(path.parts), reverse=True):
             with contextlib.suppress(Exception):
                 await client.remove_file(self._remote_path(file))
@@ -581,15 +623,30 @@ class FTPStorage(AbstractStorage):
             with contextlib.suppress(Exception):
                 await client.remove_directory(self._remote_path(directory))
 
-    async def _copytree_unlocked(
+    async def _rollback_copytree_with_fallback(
         self,
+        source_client: aioftp.Client,
+        created_files: set[PurePosixPath],
+        created_dirs: set[PurePosixPath],
+    ) -> None:
+        try:
+            await self._rollback_copytree(source_client, created_files, created_dirs)
+        except Exception:
+            with contextlib.suppress(Exception):
+                async with self._temporary_client() as cleanup_client:
+                    await self._rollback_copytree(cleanup_client, created_files, created_dirs)
+
+    async def _copytree(
+        self,
+        source_client: aioftp.Client,
+        destination_client: aioftp.Client,
         source: PurePosixPath,
         destination: PurePosixPath,
         *,
         overwrite: bool,
     ) -> None:
         try:
-            source_info = await self._stat_unlocked(source)
+            source_info = await self._stat(source_client, source)
         except FileNotFoundError:
             raise NotADirectoryError(f"Not a directory: {source.as_posix()}") from None
         if not source_info.is_dir:
@@ -599,9 +656,9 @@ class FTPStorage(AbstractStorage):
         if self._is_descendant(destination, source):
             raise ValueError("Destination must not be inside the source tree")
 
-        snapshot = await self._walk_snapshot_unlocked(source)
+        snapshot = await self._walk_snapshot(source_client, source)
         try:
-            destination_info = await self._stat_unlocked(destination)
+            destination_info = await self._stat(source_client, destination)
         except FileNotFoundError:
             destination_info = None
         if destination_info is not None:
@@ -613,27 +670,27 @@ class FTPStorage(AbstractStorage):
         created_files: set[PurePosixPath] = set()
         created_dirs: set[PurePosixPath] = set()
         try:
-            async with self._aux_client() as destination_client:
-                created_dirs.update(await self._mkdir_unlocked(destination, parents=True, exist_ok=True))
-                for current, dirs, files in snapshot:
-                    relative = current.relative_to(source)
-                    target_dir = destination if relative == PurePosixPath(".") else destination / relative
-                    for directory in dirs:
-                        target = target_dir / directory.name
-                        created_dirs.update(await self._mkdir_unlocked(target, parents=False, exist_ok=True))
-                    for file in files:
-                        target = target_dir / file.name
-                        existed = await self._exists_unlocked(target)
-                        if not existed:
-                            created_files.add(target)
-                        await self._copy_file_unlocked(
-                            PurePosixPath(file.path),
-                            target,
-                            destination_client,
-                        )
+            created_dirs.update(await self._mkdir(source_client, destination, parents=True, exist_ok=True))
+            for current, dirs, files in snapshot:
+                relative = current.relative_to(source)
+                target_dir = destination if relative == PurePosixPath(".") else destination / relative
+                for directory in dirs:
+                    target = target_dir / directory.name
+                    created_dirs.update(await self._mkdir(source_client, target, parents=False, exist_ok=True))
+                for file in files:
+                    target = target_dir / file.name
+                    existed = await self._exists(source_client, target)
+                    if not existed:
+                        created_files.add(target)
+                    await self._copy_file(
+                        source_client,
+                        destination_client,
+                        PurePosixPath(file.path),
+                        target,
+                    )
         except Exception:
             with anyio.CancelScope(shield=True):
-                await self._rollback_copytree_unlocked(created_files, created_dirs)
+                await self._rollback_copytree_with_fallback(source_client, created_files, created_dirs)
             raise
 
     @override
@@ -641,8 +698,8 @@ class FTPStorage(AbstractStorage):
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
-        async with self._lock:
-            await self._copytree_unlocked(source, destination, overwrite=overwrite)
+        async with self._client_lease() as lease, self._temporary_client() as destination_client:
+            await self._copytree(lease.client, destination_client, source, destination, overwrite=overwrite)
 
     @override
     @translator.wrap("Failed to move tree {src} → {dst} (overwrite={overwrite})")
@@ -656,27 +713,28 @@ class FTPStorage(AbstractStorage):
         if self._is_descendant(destination, source):
             raise ValueError("Destination must not be inside the source tree")
 
-        async with self._lock:
+        async with self._client_lease() as lease:
             try:
-                source_info = await self._stat_unlocked(source)
+                source_info = await self._stat(lease.client, source)
             except FileNotFoundError:
                 raise NotADirectoryError(f"Not a directory: {source.as_posix()}") from None
             if not source_info.is_dir:
                 raise NotADirectoryError(f"Not a directory: {source.as_posix()}")
 
             try:
-                destination_info = await self._stat_unlocked(destination)
+                destination_info = await self._stat(lease.client, destination)
             except FileNotFoundError:
                 destination_info = None
 
             if destination_info is None:
-                await self._mkdir_unlocked(destination.parent, parents=True, exist_ok=True)
-                await self._ensure_client().rename(self._remote_path(source), self._remote_path(destination))
+                await self._mkdir(lease.client, destination.parent, parents=True, exist_ok=True)
+                await lease.client.rename(self._remote_path(source), self._remote_path(destination))
                 return
             if not overwrite:
                 raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
             if not destination_info.is_dir:
                 raise FileExistsError(f"Destination is a file: {destination.as_posix()}")
 
-            await self._copytree_unlocked(source, destination, overwrite=True)
-            await self._rmtree_unlocked(source)
+            async with self._temporary_client() as destination_client:
+                await self._copytree(lease.client, destination_client, source, destination, overwrite=True)
+            await self._rmtree(lease.client, source)

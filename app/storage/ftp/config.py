@@ -16,6 +16,7 @@ class FTPConfig(BaseModel):
     chunk_size: int = Field(default=1024 * 1024, gt=0)
     encoding: str = "utf-8"
     timeout: float = Field(default=30.0, gt=0)
+    max_connections: int = Field(default=1, gt=0)
 
     @model_validator(mode="after")
     def _validate(self) -> Self:

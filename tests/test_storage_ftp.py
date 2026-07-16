@@ -34,6 +34,7 @@ class TestFTPConfig:
         assert config.chunk_size == 1024 * 1024
         assert config.encoding == "utf-8"
         assert config.timeout == 30.0
+        assert config.max_connections == 1
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -43,6 +44,7 @@ class TestFTPConfig:
             ("port", 65536),
             ("chunk_size", 0),
             ("timeout", 0),
+            ("max_connections", 0),
             ("encoding", "not-an-encoding"),
             ("root_prefix", "relative"),
             ("root_prefix", "//double-root"),
@@ -105,6 +107,18 @@ class TestIdentityAndPaths:
         assert first.id != other_user.id
         assert "first" not in first.id
         assert "first" not in first.cache_identity
+
+        wider_pool = FTPStorage(
+            FTPConfig(
+                host="ftp.example.test",
+                username="alice",
+                password="first",
+                root_prefix="/files",
+                max_connections=4,
+            )
+        )
+        assert first.id == wider_pool.id
+        assert first.cache_identity == wider_pool.cache_identity
 
     async def test_rejects_traversal_and_nul(self, ftp_storage: FTPStorage) -> None:
         with pytest.raises(ValueError, match="segments"):
@@ -212,7 +226,7 @@ class TestMetadataAndStreaming:
         finally:
             await ftp_storage.rmtree(base)
 
-    async def test_upload_holds_main_client_lock(self, ftp_storage: FTPStorage) -> None:
+    async def test_pool_size_one_serializes_upload_and_stat(self, ftp_storage: FTPStorage) -> None:
         path = f"/ftp-lock-{uid()}.bin"
         producer_started = anyio.Event()
         release_producer = anyio.Event()
@@ -238,6 +252,93 @@ class TestMetadataAndStreaming:
         finally:
             release_producer.set()
             await ftp_storage.unlink(path, missing_ok=True)
+
+    async def test_pool_size_two_allows_concurrent_uploads(self, ftp_endpoint: tuple[str, int]) -> None:
+        host, port = ftp_endpoint
+        storage = FTPStorage(FTPConfig(host=host, port=port, chunk_size=4, max_connections=2))
+        release_producers = anyio.Event()
+        first_started = anyio.Event()
+        second_started = anyio.Event()
+        first_path = f"/ftp-pool-first-{uid()}.bin"
+        second_path = f"/ftp-pool-second-{uid()}.bin"
+
+        async def producer(started: anyio.Event) -> AsyncIterator[bytes]:
+            yield b"first"
+            started.set()
+            await release_producers.wait()
+            yield b"second"
+
+        async def upload(path: str, started: anyio.Event) -> None:
+            await storage.upload_stream(producer(started), path)
+
+        async with storage:
+            try:
+                async with anyio.create_task_group() as task_group:
+                    task_group.start_soon(upload, first_path, first_started)
+                    task_group.start_soon(upload, second_path, second_started)
+                    with anyio.fail_after(1):
+                        await first_started.wait()
+                        await second_started.wait()
+                    assert len(storage._pool._borrowed) == 2
+                    release_producers.set()
+                assert await storage.download_bytes(first_path) == b"firstsecond"
+                assert await storage.download_bytes(second_path) == b"firstsecond"
+            finally:
+                release_producers.set()
+                await storage.unlink(first_path, missing_ok=True)
+                await storage.unlink(second_path, missing_ok=True)
+
+    async def test_pool_size_two_allows_stat_during_upload(self, ftp_endpoint: tuple[str, int]) -> None:
+        host, port = ftp_endpoint
+        storage = FTPStorage(FTPConfig(host=host, port=port, chunk_size=4, max_connections=2))
+        producer_started = anyio.Event()
+        release_producer = anyio.Event()
+        path = f"/ftp-pool-stat-{uid()}.bin"
+
+        async def producer() -> AsyncIterator[bytes]:
+            yield b"first"
+            producer_started.set()
+            await release_producer.wait()
+            yield b"second"
+
+        async with storage:
+            try:
+                async with anyio.create_task_group() as task_group:
+                    task_group.start_soon(storage.upload_stream, producer(), path)
+                    await producer_started.wait()
+                    with anyio.fail_after(1):
+                        assert (await storage.stat("/")).is_dir
+                    release_producer.set()
+            finally:
+                release_producer.set()
+                await storage.unlink(path, missing_ok=True)
+
+    async def test_failed_transfer_invalidates_pooled_client(self, ftp_endpoint: tuple[str, int]) -> None:
+        host, port = ftp_endpoint
+        storage = FTPStorage(FTPConfig(host=host, port=port, chunk_size=4))
+        path = f"/ftp-pool-failure-{uid()}.bin"
+
+        async def failing_producer() -> AsyncIterator[bytes]:
+            yield b"first"
+            raise RuntimeError("injected producer failure")
+
+        async with storage:
+            with pytest.raises(RuntimeError, match="injected producer failure"):
+                await storage.upload_stream(failing_producer(), path)
+            assert storage._pool._total == 0
+            assert (await storage.stat("/")).is_dir
+            assert storage._pool._total == 1
+            await storage.unlink(path, missing_ok=True)
+
+    async def test_business_error_reuses_pooled_client(self, ftp_endpoint: tuple[str, int]) -> None:
+        host, port = ftp_endpoint
+        storage = FTPStorage(FTPConfig(host=host, port=port))
+        async with storage:
+            client = storage._pool._idle[-1]
+            with pytest.raises(FileNotFoundError):
+                await storage.stat(f"/missing-{uid()}")
+            assert storage._pool._idle[-1] is client
+            assert storage._pool._total == 1
 
 
 class TestCopyAndTrees:
@@ -279,19 +380,20 @@ class TestCopyAndTrees:
         await ftp_storage.upload_bytes(b"b", source / "b.txt")
         await ftp_storage.upload_bytes(b"keep", destination / "keep.txt")
 
-        original = FTPStorage._copy_stream_unlocked
+        original = FTPStorage._copy_stream
 
         async def fail_second_copy(
             self: FTPStorage,
+            source_client: aioftp.Client,
+            destination_client: aioftp.Client,
             source_path: PurePosixPath,
             destination_path: PurePosixPath,
-            destination_client: aioftp.Client,
         ) -> None:
             if source_path.name == "b.txt":
                 raise OSError("injected copy failure")
-            await original(self, source_path, destination_path, destination_client)
+            await original(self, source_client, destination_client, source_path, destination_path)
 
-        monkeypatch.setattr(FTPStorage, "_copy_stream_unlocked", fail_second_copy)
+        monkeypatch.setattr(FTPStorage, "_copy_stream", fail_second_copy)
         try:
             with pytest.raises(OSError, match="injected copy failure"):
                 await ftp_storage.copytree(source, destination, overwrite=True)
@@ -300,7 +402,7 @@ class TestCopyAndTrees:
             assert await ftp_storage.exists(source / "a.txt")
             assert await ftp_storage.exists(source / "b.txt")
         finally:
-            monkeypatch.setattr(FTPStorage, "_copy_stream_unlocked", original)
+            monkeypatch.setattr(FTPStorage, "_copy_stream", original)
             await ftp_storage.rmtree(base)
 
     async def test_movetree_failure_keeps_source(
@@ -316,15 +418,17 @@ class TestCopyAndTrees:
 
         async def fail_copytree(
             self: FTPStorage,
+            source_client: aioftp.Client,
+            destination_client: aioftp.Client,
             source_path: PurePosixPath,
             destination_path: PurePosixPath,
             *,
             overwrite: bool,
         ) -> None:
-            _ = self, source_path, destination_path, overwrite
+            _ = self, source_client, destination_client, source_path, destination_path, overwrite
             raise OSError("injected tree failure")
 
-        monkeypatch.setattr(FTPStorage, "_copytree_unlocked", fail_copytree)
+        monkeypatch.setattr(FTPStorage, "_copytree", fail_copytree)
         try:
             with pytest.raises(OSError, match="injected tree failure"):
                 await ftp_storage.movetree(source, destination, overwrite=True)
@@ -339,19 +443,22 @@ class TestLifecycleAndErrors:
         host, port = ftp_endpoint
         storage = FTPStorage(FTPConfig(host=host, port=port))
         await storage.connect()
-        first_client = storage._client
+        first_client = storage._pool._idle[-1]
         await storage.connect()
-        assert storage._client is first_client
+        assert storage._pool._idle[-1] is first_client
+        assert storage._pool._total == 1
         await storage.close()
         await storage.close()
-        assert storage._client is None
+        assert storage._pool._total == 0
+        assert not storage._pool.is_open
 
     async def test_missing_root_prefix_fails_connect(self, ftp_endpoint: tuple[str, int]) -> None:
         host, port = ftp_endpoint
         storage = FTPStorage(FTPConfig(host=host, port=port, root_prefix=f"/missing-{uid()}"))
         with pytest.raises(OSError, match="Failed to connect"):
             await storage.connect()
-        assert storage._client is None
+        assert storage._pool._total == 0
+        assert not storage._pool.is_open
 
     async def test_authentication_error_becomes_permission_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         closed = False
@@ -377,4 +484,5 @@ class TestLifecycleAndErrors:
         with pytest.raises(PermissionError):
             await storage.connect()
         assert closed
-        assert storage._client is None
+        assert storage._pool._total == 0
+        assert not storage._pool.is_open
