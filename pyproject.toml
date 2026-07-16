@@ -22,7 +22,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [{ include-group = "lint" }, { include-group = "test" }]
-lint = ["prek>=0.4.9", "ruff>=0.15.21", "ty>=0.0.58"]
+lint = ["prek>=0.4.9", "ruff>=0.15.21", "ty>=0.0.60"]
 test = [
   "moto[server]>=5.2.2,<6",
   "pytest>=9.1.1",
