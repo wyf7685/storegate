@@ -81,9 +81,12 @@ tests/
 │   ├── dav/                       # 配置、认证、multistatus、错误映射
 │   │   └── integration/           # 本地 wsgidav 上的 DavStorage 集成测试
 │   ├── ftp/                       # FTPStorage 配置、连接池、流式与树操作
-│   └── s3/                        # SigV4 与 mocked rollback
+│   └── s3/                        # SigV4、client 协议、multipart 与 mocked rollback
 │       └── integration/           # 需要 credentials 的目录标记测试
-└── server/ftp/                    # FTPServer 命令与协议行为集成测试
+└── server/
+    ├── dav/                       # ResourceReader / ResourceWriter 状态与线程桥接
+    ├── ftp/                       # FTPServer 命令与协议行为集成测试
+    └── test_factory.py            # resolve_server / resolve_server_from_file
 ```
 
 **参数化契约**：`tests/fixtures/storage.py` 的 `storage` fixture 将 `tests/contract/storage/` 对 7 个后端执行：`memory` / `local` / `s3` / `cached` / `index` / `ftp` / `dav`。S3 缺少配置时 `pytest.skip()`；`cached` 和 `index` 使用 `MemoryStorage` 保证可重现；DAV 和 FTP 通过 `tests/fixtures/protocol_servers.py` 启动独立线程、事件循环和随机端口的本地服务。
@@ -92,7 +95,7 @@ tests/
 
 **测试辅助代码**：可导入辅助函数放在 `tests/support/`。`conftest.py` 只用于 fixture 和 pytest 配置，不作为普通 Python 模块导入。后端专属 fixture 放在对应目录的 `conftest.py`。
 
-**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出覆盖报告。当前测试源码收集为 629 个参数化用例；无外部 S3 时执行 562 个用例。
+**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出语句覆盖报告；使用 `--cov-branch` 可同时检查分支覆盖。当前测试源码收集为 665 个参数化用例；无外部 S3 时执行 598 个用例。
 
 ## 架构
 
@@ -157,7 +160,7 @@ tests/
 ├── storage/                # factory / cached / index / dav / ftp / s3 专属测试
 │   ├── dav/integration/    # 本地 wsgidav 集成测试
 │   └── s3/integration/     # 外部 S3 credentials 测试
-└── server/ftp/             # FTPServer 协议集成测试
+└── server/                 # DAV Resource、FTPServer 协议与 server factory 测试
 ```
 
 ### 核心抽象与设计模式
@@ -201,7 +204,7 @@ tests/
 - **CachedStorage**: 6 个命名空间缓存 (`exists/is_file/is_dir/stat/iterdir/download`)。正结果交叉后填（如 `is_file=True` → 同时缓存 `exists=True, is_dir=False`）。写入操作回填已知状态。`CacheBackend` 抽象接口支持批量操作（`mget`/`mset`/`mdelete`），内置 `MemoryCacheBackend` 和 `RedisCacheBackend`。**`snapshot()` / `dump_cache()`** 内省 API 暴露缓存内部状态供测试验证命中/未命中/回填/失效行为。`list_()` 永远绕过 `iterdir` 缓存直接查询底层存储但回填逐条目元数据缓存。
 - **FTPStorage**: plain FTP 客户端后端，`root_prefix` 将逻辑根隔离到远端绝对 POSIX 子目录；路径拒绝 NUL/`..` 越界。`FTPClientPool` 通过 `max_connections`（默认 1）按需创建 client，每个 lease 独占控制通道，transfer 在 EOF/`aclose()` 前持续持有 lease；取消、timeout 或控制通道失步会 invalidate 并淘汰连接。listing/walk 在 lease 内完整物化并排序，释放后才 yield。FTP 无服务端 COPY，`copy`/`copytree` 使用一个 pool source client + 一个操作级临时 destination client 流式中继；copytree 失败仅回滚本次创建内容。当前仅支持 plain FTP，不支持 FTPS/FTPES。
 - **FTP 服务端**: 基于 `aioftp`，`StoragePathIO` 将协议文件操作映射到 `AbstractStorage`，`ReadHandle` / `WriteHandle` 保持下载和上传流式传输。仅支持 `rb` / `wb`，禁用 APPE；REST 仅用于 RETR 下载 offset，非零 REST + STOR 返回 504 且不修改目标文件。
-- **WebDAV**: 基于 wsgidav，通过 `run_async()` 桥接同步 wsgidav 到异步 `AbstractStorage`。`ResourceWriter` 使用独立线程 + memory object stream 处理异步上传。
+- **WebDAV**: 基于 wsgidav，通过 `run_async()` 桥接同步 wsgidav 到异步 `AbstractStorage`。`ResourceWriter` 使用独立线程 + memory object stream 处理异步上传；close/abort 通过事件循环执行 stream 关闭和 CancelScope 取消，避免从 wsgidav 工作线程直接操作 AnyIO 对象。
 - **日志**: 使用 loguru，`LoggerWrapper` 为每个类提供带色彩标签的实例日志器。支持 `LoguruOpts` 灵活配置日志选项（exception/record/lazy/colors/raw/capture/depth/ansi）。`LoguruHandler` 将标准库 logging 桥接到 loguru。
 - **异常处理**: `ExceptionTranslator` 提供统一的异常翻译装饰器，支持 `bypass`、`catch`、`default` 异常分类和自定义异常映射。同时支持 `wrap`（普通异步函数）和 `wrap_agen`（异步生成器）。
 

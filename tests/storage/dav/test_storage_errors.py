@@ -1,6 +1,7 @@
 """DavStorage error-path unit tests with a mocked client (no network)."""
 
 from collections.abc import AsyncIterator
+from pathlib import PurePosixPath
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -70,6 +71,15 @@ class TestUploadStatGateway:
         with pytest.raises(FileExistsError):
             await dav_mocked.upload_stream(_stream(b"data"), "f", overwrite=False)
         put_mock.assert_not_called()
+
+    async def test_empty_upload_uses_empty_bytes_body(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
+        mocker.patch.object(dav_mocked, "stat", new=AsyncMock(side_effect=FileNotFoundError))
+        mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        put_mock = mocker.patch.object(dav_mocked._client, "put", AsyncMock())
+
+        await dav_mocked.upload_stream(_stream(), "empty.bin")
+
+        put_mock.assert_awaited_once_with("empty.bin", b"")
 
 
 class TestRmdir:
@@ -142,6 +152,49 @@ class TestMoveOverwrite:
         with pytest.raises(FileNotFoundError):
             await dav_mocked.move("src", "dst")
 
+    async def test_move_412_retries_when_destination_delete_is_404(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+    ) -> None:
+        mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        move_mock = mocker.patch.object(
+            dav_mocked._client,
+            "move",
+            AsyncMock(side_effect=[DavHttpStatusError("MOVE", "http://u/dst", 412, "overwrite"), None]),
+        )
+        mocker.patch.object(
+            dav_mocked._client,
+            "delete",
+            AsyncMock(side_effect=DavHttpStatusError("DELETE", "http://u/dst", 404, "missing")),
+        )
+
+        await dav_mocked.move("src", "dst")
+
+        assert move_mock.await_count == 2
+
+    async def test_move_412_delete_failure_stops_retry(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+    ) -> None:
+        mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        move_mock = mocker.patch.object(
+            dav_mocked._client,
+            "move",
+            AsyncMock(side_effect=DavHttpStatusError("MOVE", "http://u/dst", 412, "overwrite")),
+        )
+        mocker.patch.object(
+            dav_mocked._client,
+            "delete",
+            AsyncMock(side_effect=DavHttpStatusError("DELETE", "http://u/dst", 500, "failed")),
+        )
+
+        with pytest.raises(OSError, match="Failed to move"):
+            await dav_mocked.move("src", "dst")
+
+        assert move_mock.await_count == 1
+
 
 class TestCopytreeFallback:
     async def test_server_copy_501_triggers_fallback(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
@@ -166,3 +219,66 @@ class TestCopytreeFallback:
         fallback_mock = mocker.patch.object(dav_mocked, "_copytree_fallback", AsyncMock())
         await dav_mocked.copytree("src", "dst")
         fallback_mock.assert_not_awaited()
+
+
+class TestMovetreeFallback:
+    @pytest.mark.parametrize("status_code", [403, 405, 501])
+    async def test_unsupported_recursive_move_falls_back(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        status_code: int,
+    ) -> None:
+        mocker.patch.object(
+            dav_mocked,
+            "stat",
+            new=AsyncMock(return_value=FileInfo(path="/src", name="src", is_dir=True)),
+        )
+        mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        mocker.patch.object(
+            dav_mocked._client,
+            "move",
+            AsyncMock(side_effect=DavHttpStatusError("MOVE", "http://u/dst", status_code, "unsupported")),
+        )
+        copytree_mock = mocker.patch.object(dav_mocked, "copytree", new=AsyncMock())
+        rmtree_mock = mocker.patch.object(dav_mocked, "rmtree", new=AsyncMock())
+
+        await dav_mocked.movetree("src", "dst")
+
+        copytree_mock.assert_awaited_once_with("src", "dst", overwrite=True)
+        rmtree_mock.assert_awaited_once_with("src")
+
+    async def test_move_tree_404_maps_to_filenotfound(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
+        mocker.patch.object(
+            dav_mocked,
+            "stat",
+            new=AsyncMock(return_value=FileInfo(path="/src", name="src", is_dir=True)),
+        )
+        mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        mocker.patch.object(
+            dav_mocked._client,
+            "move",
+            AsyncMock(side_effect=DavHttpStatusError("MOVE", "http://u/src", 404, "missing")),
+        )
+
+        with pytest.raises(FileNotFoundError):
+            await dav_mocked.movetree("src", "dst")
+
+
+class TestCopytreeFallbackRollback:
+    async def test_failure_rolls_back_destination(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
+        async def walk(_path: PurePosixPath) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+            yield "/src", [FileInfo(path="/src/sub", name="sub", is_dir=True)], []
+
+        mocker.patch.object(dav_mocked, "walk", new=walk)
+        mocker.patch.object(
+            dav_mocked,
+            "mkdir",
+            new=AsyncMock(side_effect=[None, OSError("injected mkdir failure")]),
+        )
+        rmtree_mock = mocker.patch.object(dav_mocked, "rmtree", new=AsyncMock())
+
+        with pytest.raises(OSError, match="Failed to copy tree"):
+            await dav_mocked._copytree_fallback(PurePosixPath("/src"), PurePosixPath("/dst"), overwrite=True)
+
+        rmtree_mock.assert_awaited_once_with(PurePosixPath("/dst"))

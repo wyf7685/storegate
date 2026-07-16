@@ -177,6 +177,24 @@ class TestMetadataAndStreaming:
             assert storage._pool._total == 1
             await storage.unlink(path, missing_ok=True)
 
+    async def test_failed_overwrite_keeps_destination_entry(self, ftp_endpoint: tuple[str, int]) -> None:
+        host, port = ftp_endpoint
+        storage = FTPStorage(FTPConfig(host=host, port=port, chunk_size=4))
+        path = f"/ftp-overwrite-failure-{uid()}.bin"
+
+        async def failing_producer() -> AsyncIterator[bytes]:
+            yield b"partial"
+            raise RuntimeError("injected overwrite failure")
+
+        async with storage:
+            await storage.upload_bytes(b"original", path)
+            try:
+                with pytest.raises(RuntimeError, match="injected overwrite failure"):
+                    await storage.upload_stream(failing_producer(), path, overwrite=True)
+                assert await storage.exists(path)
+            finally:
+                await storage.unlink(path, missing_ok=True)
+
     async def test_business_error_reuses_pooled_client(self, ftp_endpoint: tuple[str, int]) -> None:
         host, port = ftp_endpoint
         storage = FTPStorage(FTPConfig(host=host, port=port))

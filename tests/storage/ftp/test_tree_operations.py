@@ -23,6 +23,64 @@ class TestCopyAndTrees:
         finally:
             await ftp_storage.rmtree(base)
 
+    async def test_copy_failure_removes_new_partial_destination(
+        self,
+        ftp_storage: FTPStorage,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        base = f"/ftp-copy-cleanup-{uid()}"
+        source = PurePosixPath(base, "source.bin")
+        destination = PurePosixPath(base, "destination.bin")
+        await ftp_storage.upload_bytes(b"source", source)
+
+        async def write_partial_then_fail(
+            self: FTPStorage,
+            source_client: aioftp.Client,
+            destination_client: aioftp.Client,
+            source_path: PurePosixPath,
+            destination_path: PurePosixPath,
+        ) -> None:
+            _ = source_client, source_path
+            async with destination_client.upload_stream(self._remote_path(destination_path)) as writer:
+                await writer.write(b"partial")
+            raise OSError("injected copy failure")
+
+        monkeypatch.setattr(FTPStorage, "_copy_stream", write_partial_then_fail)
+        try:
+            with pytest.raises(OSError, match="injected copy failure"):
+                await ftp_storage.copy(source, destination)
+            assert not await ftp_storage.exists(destination)
+        finally:
+            await ftp_storage.rmtree(base)
+
+    async def test_copy_failure_preserves_existing_destination(
+        self,
+        ftp_storage: FTPStorage,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        base = f"/ftp-copy-preserve-{uid()}"
+        source = PurePosixPath(base, "source.bin")
+        destination = PurePosixPath(base, "destination.bin")
+        await ftp_storage.upload_bytes(b"source", source)
+        await ftp_storage.upload_bytes(b"existing", destination)
+
+        async def fail_before_write(
+            _self: FTPStorage,
+            _source_client: aioftp.Client,
+            _destination_client: aioftp.Client,
+            _source_path: PurePosixPath,
+            _destination_path: PurePosixPath,
+        ) -> None:
+            raise OSError("injected copy failure")
+
+        monkeypatch.setattr(FTPStorage, "_copy_stream", fail_before_write)
+        try:
+            with pytest.raises(OSError, match="injected copy failure"):
+                await ftp_storage.copy(source, destination)
+            assert await ftp_storage.download_bytes(destination) == b"existing"
+        finally:
+            await ftp_storage.rmtree(base)
+
     async def test_copytree_merges_existing_destination(self, ftp_storage: FTPStorage) -> None:
         base = f"/ftp-tree-{uid()}"
         source = f"{base}/source"

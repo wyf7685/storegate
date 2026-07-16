@@ -11,13 +11,13 @@ from app.storage import AbstractStorage, FileInfo
 from .utils import NativeHandlerResult, call_with_catch, current_event_loop_token, run_async
 
 
-class DAVReader(Protocol):
+class DAVReader(Protocol):  # pragma: no cover
     def read(self, size: int) -> bytes: ...
     def seek(self, offset: int) -> None: ...
     def close(self) -> None: ...
 
 
-class DAVWriter(Protocol):
+class DAVWriter(Protocol):  # pragma: no cover
     def write(self, data: bytes) -> None: ...
     def close(self) -> None: ...
 
@@ -90,10 +90,8 @@ class ResourceWriter:
     def close(self) -> None:
         if self._closed:
             return
-        self._send.close()
         self._closed = True
-        with self._scope_lock:
-            self._scope = None
+        run_async(self._send.aclose)
         self._worker_thread.join()
 
     def _run(self) -> None:
@@ -115,11 +113,14 @@ class ResourceWriter:
         self._worker_thread.start()
         self._worker_ready.wait()
 
-    def abort(self) -> None:
+    async def _abort(self) -> None:
         with self._scope_lock:
-            if self._scope is not None:
-                self._scope.cancel()
-                self._scope = None
+            scope = self._scope
+        if scope is not None:
+            scope.cancel()
+
+    def abort(self) -> None:
+        run_async(self._abort)
 
 
 @final
