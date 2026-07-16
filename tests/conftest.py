@@ -50,6 +50,7 @@ def _param_of(impl: str):  # noqa: ANN202
         _param_of("s3"),
         _param_of("cached"),
         _param_of("index"),
+        _param_of("ftp"),
         _param_of("dav"),
     ]
 )
@@ -105,6 +106,14 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
             base_url = request.getfixturevalue("_dav_server")
             config = DavConfig(base_url=base_url, auth_mode="anonymous")
             async with DavStorage(config) as s:
+                yield s
+
+        case "ftp":
+            from app.storage.ftp import FTPConfig, FTPStorage
+
+            host, port = request.getfixturevalue("_ftp_server")
+            config = FTPConfig(host=host, port=port, root_prefix="/")
+            async with FTPStorage(config) as s:
                 yield s
 
 

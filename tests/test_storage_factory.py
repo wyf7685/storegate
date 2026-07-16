@@ -66,6 +66,22 @@ class TestResolveObject:
         assert isinstance(obj, MemoryStorage)
         assert obj.id.endswith(":/explicit")
 
+    def test_ftp_storage_shorthand_with_config_dict(self):
+        """~ftp coerces a nested config dict into FTPConfig."""
+        from app.storage.ftp import FTPStorage
+
+        spec = {
+            "$factory": "~ftp",
+            "config": {
+                "host": "ftp.example.test",
+                "password": "secret",
+                "root_prefix": "/tenant",
+            },
+        }
+        obj = resolve_object(spec)
+        assert isinstance(obj, FTPStorage)
+        assert obj.id == "ftp:anonymous@ftp.example.test:21/tenant"
+
     def test_server_shorthand_default_cls(self):
         """@ftp  →  app.server.ftp.Server (= FTPServer), with nested storage."""
         from app.server.ftp import FTPServer
