@@ -94,7 +94,7 @@ def resolve_object(spec: dict[str, Any]) -> Any:
     if _FACTORY_KEY not in spec:
         raise ValueError(f"Missing {_FACTORY_KEY!r} key in object specification")
 
-    factory_str = str(spec.pop(_FACTORY_KEY))
+    factory_str = str(spec[_FACTORY_KEY])
 
     modulename, _, cls = factory_str.partition(":")
     if not modulename:
@@ -125,11 +125,13 @@ def resolve_object(spec: dict[str, Any]) -> Any:
     else:
         raise TypeError(f"Factory is not a class or function: {factory.__class__.__name__!r}")
 
-    if not spec:
+    if len(spec) == 1:
         return factory()
 
     resolved_args: dict[str, Any] = {}
     for key, value in spec.items():
+        if key == _FACTORY_KEY:
+            continue
         if isinstance(value, dict) and _FACTORY_KEY in value:
             resolved_args[key] = resolve_object(value)
         else:

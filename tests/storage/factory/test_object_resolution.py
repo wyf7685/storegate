@@ -1,5 +1,7 @@
 """Tests for dict-driven object resolution."""
 
+from copy import deepcopy
+
 import pytest
 
 from app.storage.memory import MemoryStorage
@@ -84,6 +86,31 @@ class TestResolveObject:
         assert payload == {"group": [1, 2, 3], "empty": []}
         assert all(isinstance(n, int) for n in payload["group"])
         assert records == [{"name": "alpha", "value": "1"}, {"name": "beta", "value": "2"}]
+
+    def test_does_not_mutate_nested_spec(self) -> None:
+        spec = {
+            "$factory": "tests.support.factory_targets:pick_storage",
+            "storage": {"$factory": "~memory", "root": "reusable"},
+        }
+        original = deepcopy(spec)
+
+        first = resolve_object(spec)
+        second = resolve_object(spec)
+
+        assert spec == original
+        assert isinstance(first, MemoryStorage)
+        assert isinstance(second, MemoryStorage)
+        assert first.id.endswith(":/reusable")
+        assert second.id.endswith(":/reusable")
+
+    def test_does_not_mutate_spec_when_resolution_fails(self) -> None:
+        spec = {"$factory": "nonexistent.module.xyz:Foo", "value": {"nested": True}}
+        original = deepcopy(spec)
+
+        with pytest.raises(ImportError, match=r"Failed to import module"):
+            resolve_object(spec)
+
+        assert spec == original
 
     # -- error paths -------------------------------------------------------
 
