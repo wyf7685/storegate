@@ -1,9 +1,10 @@
 import functools
 from copy import deepcopy
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import final, override
 
 import aioftp
+from aioftp.common import Connection
 
 from app.log import LOGGING_CONFIG
 from app.storage import AbstractStorage
@@ -23,6 +24,26 @@ def configure_logging() -> None:
     logging.config.dictConfig(config)
 
 
+class StorageFTPProtocolServer(aioftp.Server):
+    @override
+    async def stor(
+        self,
+        connection: Connection,
+        rest: str | PurePosixPath,
+        mode: str = "wb",
+    ) -> bool:
+        if connection.restart_offset == 0:
+            return await super().stor(connection, rest, mode)
+
+        connection.restart_offset = 0
+        if connection.future.data_connection.done():
+            connection.data_connection.close()
+            del connection.data_connection
+
+        connection.response("504", "REST is supported for RETR only")
+        return True
+
+
 @final
 class FTPServer(AbstractServer):
     def __init__(
@@ -35,7 +56,7 @@ class FTPServer(AbstractServer):
         super().__init__(storage)
         self.host = host
         self.port = port
-        self.server = aioftp.Server(
+        self.server = StorageFTPProtocolServer(
             users=[aioftp.User(login=None, password=None, base_path=str(Path()), home_path="/")],
             path_io_factory=functools.partial(
                 StoragePathIO,
@@ -43,7 +64,6 @@ class FTPServer(AbstractServer):
             ),
         )
         self.server.commands_mapping.pop("appe")
-        self.server.commands_mapping.pop("rest")
 
     @override
     async def serve(self) -> None:
