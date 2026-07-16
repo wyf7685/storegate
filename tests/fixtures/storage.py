@@ -12,7 +12,7 @@ from app.storage.abstract import AbstractStorage
     params=[
         pytest.param("memory", id="memory"),
         pytest.param("local", id="local"),
-        pytest.param("s3", marks=pytest.mark.s3, id="s3"),
+        pytest.param("s3", marks=pytest.mark.integration, id="s3"),
         pytest.param("cached", id="cached"),
         pytest.param("index", id="index"),
         pytest.param("ftp", marks=pytest.mark.integration, id="ftp"),
@@ -39,12 +39,19 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
                 shutil.rmtree(root, ignore_errors=True)
 
         case "s3":
-            from app.storage.s3 import S3Storage
+            from app.storage.s3 import S3Config, S3Storage
 
-            config_path = Path("data/s3/mock.json")
-            if not config_path.exists():
-                pytest.skip("S3 config file not found")
-            async with S3Storage(config_path) as instance:
+            endpoint, bucket = request.getfixturevalue("_s3_server")
+            config = S3Config(
+                access_key_id="test",
+                secret_access_key="test",
+                region="us-east-1",
+                bucket=bucket,
+                endpoint_url=endpoint.removeprefix("http://"),
+                path_style=True,
+                scheme="http",
+            )
+            async with S3Storage(config) as instance:
                 yield instance
 
         case "cached":

@@ -11,35 +11,35 @@ pytestmark = pytest.mark.s3
 class TestMarkerDirectories:
     """Verify that uploading a nested file automatically creates parent directories."""
 
-    async def test_upload_creates_parent_dirs(self, s3_storage: S3Storage):
+    async def test_upload_creates_parent_dirs(self, real_s3_storage: S3Storage):
         base = f"test-upload-pdir-{uid()}"
         try:
-            await s3_storage.upload_bytes(b"hello", f"{base}/sub/file.txt")
-            assert await s3_storage.is_dir(base)
-            assert await s3_storage.is_dir(f"{base}/sub")
-            assert await s3_storage.exists(base)
+            await real_s3_storage.upload_bytes(b"hello", f"{base}/sub/file.txt")
+            assert await real_s3_storage.is_dir(base)
+            assert await real_s3_storage.is_dir(f"{base}/sub")
+            assert await real_s3_storage.exists(base)
         finally:
-            await s3_storage.rmtree(base)
+            await real_s3_storage.rmtree(base)
 
-    async def test_uploaded_subdir_appears_in_iterdir(self, s3_storage: S3Storage):
+    async def test_uploaded_subdir_appears_in_iterdir(self, real_s3_storage: S3Storage):
         base = f"test-upload-itd-{uid()}"
         try:
-            await s3_storage.upload_bytes(b"hello", f"{base}/sub/file.txt")
-            entries = [e async for e in s3_storage.iterdir(base)]
+            await real_s3_storage.upload_bytes(b"hello", f"{base}/sub/file.txt")
+            entries = [e async for e in real_s3_storage.iterdir(base)]
             names = {e.name for e in entries}
             assert "sub" in names, f"sub not found in {names}"
             sub_info = next(e for e in entries if e.name == "sub")
             assert sub_info.is_dir
         finally:
-            await s3_storage.rmtree(base)
+            await real_s3_storage.rmtree(base)
 
-    async def test_uploaded_subdir_appears_in_walk(self, s3_storage: S3Storage):
+    async def test_uploaded_subdir_appears_in_walk(self, real_s3_storage: S3Storage):
         base = f"test-upload-walk-{uid()}"
         try:
-            await s3_storage.upload_bytes(b"hello", f"{base}/sub/file.txt")
+            await real_s3_storage.upload_bytes(b"hello", f"{base}/sub/file.txt")
             walked_dirs: list[str] = []
-            async for sp, _sd, _sf in s3_storage.walk(base):
+            async for sp, _sd, _sf in real_s3_storage.walk(base):
                 walked_dirs.append(sp)
             assert len(walked_dirs) >= 2  # base + sub
         finally:
-            await s3_storage.rmtree(base)
+            await real_s3_storage.rmtree(base)

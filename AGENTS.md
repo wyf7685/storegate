@@ -10,9 +10,9 @@ This file provides guidance to AI coding agents when working with code in this r
 
 ```bash
 # 测试
-uv run pytest                                # 全部测试（含 S3，需要 credentials）
-uv run pytest -m "not s3"                    # 跳过外部 S3 测试（CI / 本地无 credentials）
-uv run pytest -m integration                 # 本地 DAV / FTP 协议集成测试
+uv run pytest                                # 全部测试（本地 Moto S3；外部 S3 有配置时运行）
+uv run pytest -m "not s3"                    # 跳过需要外部 credentials 的真实 S3 测试
+uv run pytest -m integration                 # 本地 Moto S3 / DAV / FTP 协议集成测试
 uv run pytest tests/contract/storage -k memory  # 仅 MemoryStorage 公共契约
 
 # 静态检查
@@ -64,7 +64,7 @@ tests/
 ├── conftest.py                    # 全局日志配置 + fixture plugin 注册
 ├── fixtures/
 │   ├── storage.py                 # 7 后端参数化 storage fixture
-│   └── protocol_servers.py        # session 级 DAV / FTP 本地协议服务
+│   └── protocol_servers.py        # session 级 Moto S3 / DAV / FTP 本地协议服务
 ├── support/
 │   ├── ids.py                     # uid() 隔离标识；测试禁止从 conftest.py 直接导入
 │   └── factory_targets.py         # resolve_object 动态导入测试目标
@@ -89,13 +89,13 @@ tests/
     └── test_factory.py            # resolve_server / resolve_server_from_file
 ```
 
-**参数化契约**：`tests/fixtures/storage.py` 的 `storage` fixture 将 `tests/contract/storage/` 对 7 个后端执行：`memory` / `local` / `s3` / `cached` / `index` / `ftp` / `dav`。S3 缺少配置时 `pytest.skip()`；`cached` 和 `index` 使用 `MemoryStorage` 保证可重现；DAV 和 FTP 通过 `tests/fixtures/protocol_servers.py` 启动独立线程、事件循环和随机端口的本地服务。
+**参数化契约**：`tests/fixtures/storage.py` 的 `storage` fixture 将 `tests/contract/storage/` 对 7 个后端执行：`memory` / `local` / `s3` / `cached` / `index` / `ftp` / `dav`。S3 契约通过 `tests/fixtures/protocol_servers.py` 启动 session 级 Moto Server，使用随机端口、预创建 bucket 和 path-style `http://127.0.0.1:<port>` endpoint，无需外部 credentials；必须使用 IPv4 地址而非 `localhost`，避免 Windows 上 IPv6 连接回退造成逐请求延迟。`cached` 和 `index` 使用 `MemoryStorage` 保证可重现；DAV 和 FTP 同样通过本地随机端口服务执行。
 
-**测试分层**：目录路径表达被测组件，marker 只表达运行性质。`integration` 表示启动本地 DAV / FTP 协议服务，`s3` 表示需要外部 S3 credentials，`slow` 表示异常耗时测试。纯单元测试不得仅因属于某个后端而标记为 integration。
+**测试分层**：目录路径表达被测组件，marker 只表达运行性质。`integration` 表示启动本地 Moto S3 / DAV / FTP 协议服务，`s3` 仅表示需要外部 S3 credentials，`slow` 表示异常耗时测试。纯单元测试不得仅因属于某个后端而标记为 integration。
 
 **测试辅助代码**：可导入辅助函数放在 `tests/support/`。`conftest.py` 只用于 fixture 和 pytest 配置，不作为普通 Python 模块导入。后端专属 fixture 放在对应目录的 `conftest.py`。
 
-**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出语句覆盖报告；使用 `--cov-branch` 可同时检查分支覆盖。当前测试源码收集为 665 个参数化用例；无外部 S3 时执行 598 个用例。
+**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出语句覆盖报告；使用 `--cov-branch` 可同时检查分支覆盖。当前测试源码收集为 665 个参数化用例；无外部 S3 配置时执行 662 个用例。
 
 ## 架构
 
@@ -210,7 +210,7 @@ tests/
 
 ### 配置与数据目录
 
-- S3 测试使用 `data/s3/mock.json`（复用腾讯云 COS 的 S3 兼容端点验证，不进 git）
+- S3 公共契约使用本地 Moto Server；`tests/storage/s3/integration/` 的真实 S3 测试使用 `data/s3/mock.json`（不进 git），缺少配置时跳过
 - DavStorage 配置示例 `data/dav/config.json`（`base_url`/`auth_mode`/`username`/`password`/`token`/`root_prefix`/`verify_ssl`/`ca_cert_path`，不进 git）；`dav` 测试用本地 wsgidav，无需配置文件
 - 日志输出到 `logs/` 目录，按日轮转
 - 根目录的 `test*.py` 和 `run*.py` 模式已加入 `.gitignore`（真实测试在 `tests/` 目录）

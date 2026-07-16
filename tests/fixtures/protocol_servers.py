@@ -51,6 +51,32 @@ def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> None:
 
 
 @pytest.fixture(scope="session")
+def _s3_server() -> Generator[tuple[str, str]]:
+    """Start a local Moto S3 server and create the shared test bucket."""
+    import boto3
+    from moto.server import ThreadedMotoServer
+
+    bucket = "storegate-test"
+    server = ThreadedMotoServer(port=0, verbose=False)
+    server.start()
+    _host, port = server.get_host_and_port()
+    endpoint = f"http://127.0.0.1:{port}"
+
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        client.create_bucket(Bucket=bucket)
+        yield endpoint, bucket
+    finally:
+        server.stop()
+
+
+@pytest.fixture(scope="session")
 def _ftp_server() -> Generator[tuple[str, int]]:
     """Start a local aioftp server in a dedicated thread and event loop."""
     from app.server.ftp import FTPServer
