@@ -1,25 +1,14 @@
-"""S3-specific tests — marker-object semantics and upload behavior."""
-
-from pathlib import Path
+"""S3 marker-directory integration tests."""
 
 import pytest
 
 from app.storage.s3 import S3Storage
-from tests.conftest import uid
+from tests.support.ids import uid
 
 pytestmark = pytest.mark.s3
 
 
-@pytest.fixture
-async def s3_storage():
-    config_path = Path("data/s3/mock.json")
-    if not config_path.exists():
-        pytest.skip("S3 config file not found")
-    async with S3Storage(config_path) as s:
-        yield s
-
-
-class TestUploadCreatesParentDirs:
+class TestMarkerDirectories:
     """Verify that uploading a nested file automatically creates parent directories."""
 
     async def test_upload_creates_parent_dirs(self, s3_storage: S3Storage):

@@ -3,6 +3,8 @@
 import aioftp
 import pytest
 
+pytestmark = pytest.mark.integration
+
 
 async def _upload(client: aioftp.Client, path: str, content: bytes) -> None:
     async with client.upload_stream(path) as stream:

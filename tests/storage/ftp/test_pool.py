@@ -7,8 +7,6 @@ import pytest
 
 from app.storage.ftp.pool import FTPClientPool, PoolState
 
-pytestmark = pytest.mark.ftp
-
 
 class FakeClient:
     def __init__(self, identifier: int) -> None:

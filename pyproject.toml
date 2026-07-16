@@ -22,11 +22,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [{ include-group = "lint" }, { include-group = "test" }]
-lint = [
-    "prek>=0.4.9",
-    "ruff>=0.15.21",
-    "ty>=0.0.58",
-]
+lint = ["prek>=0.4.9", "ruff>=0.15.21", "ty>=0.0.58"]
 test = [
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",
@@ -40,9 +36,8 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--cov=app --cov-report=term-missing -n auto"
 markers = [
-  "s3: tests requiring S3Storage credentials (skipped when config unavailable)",
-  "dav: tests exercising DavStorage (local wsgidav server or mocked client)",
-  "ftp: tests exercising FTPStorage against the local aioftp server or mocked client",
+  "integration: tests starting local protocol servers",
+  "s3: tests requiring external S3 credentials",
   "slow: tests that are unusually slow",
 ]
 

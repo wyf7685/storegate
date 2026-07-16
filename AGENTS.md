@@ -10,10 +10,10 @@ This file provides guidance to AI coding agents when working with code in this r
 
 ```bash
 # 测试
-uv run pytest                    # 全部测试（含 S3，需要 credentials）
-uv run pytest -m "not s3"        # 跳过 S3（CI / 本地无 credentials）
-uv run pytest -k "memory"        # 仅 MemoryStorage 参数化
-uv run pytest -k "index"         # 仅 IndexStorage 参数化
+uv run pytest                                # 全部测试（含 S3，需要 credentials）
+uv run pytest -m "not s3"                    # 跳过外部 S3 测试（CI / 本地无 credentials）
+uv run pytest -m integration                 # 本地 DAV / FTP 协议集成测试
+uv run pytest tests/contract/storage -k memory  # 仅 MemoryStorage 公共契约
 
 # 静态检查
 uv run ruff check --fix          # lint 检查 + 自动修复
@@ -61,26 +61,38 @@ Agent 编写代码时须遵守以下纪律：
 
 ```
 tests/
-├── conftest.py              # 核心 fixture：uid() + 参数化 storage（7 后端）+ _dav_server / _ftp_server
-├── test_storage_general.py  # 通用接口测试（对所有后端执行）
-├── test_s3_internals.py     # S3 特有测试（标记 @pytest.mark.s3）
-├── test_s3_rollback.py      # S3 回滚路径测试（mocked client）
-├── test_s3_signer.py        # SigV4 签名向量单测（AWS 官方测试向量，无需 credentials）
-├── test_cached_storage.py   # CachedStorage 缓存状态验证
-├── test_index_storage.py    # IndexStorage 分块/引用计数验证
-├── test_dav_config.py       # DavConfig 校验 + auth builder 单测（无需网络）
-├── test_dav_xml.py          # multistatus XML 解析单测（无需网络）
-├── test_dav_rollback.py     # DavStorage 错误路径单测（mocked client）
-├── test_dav_internals.py    # DavStorage 集成测试（本地 wsgidav，标记 @pytest.mark.dav）
-├── test_ftp_handler.py      # aioftp 服务端协议集成测试
-├── test_ftp_pool.py         # FTPClientPool 容量、租借、淘汰、关闭单测
-├── test_storage_ftp.py      # FTPStorage 配置、并发、回滚及真实协议集成测试
-└── test_storage_factory.py  # resolve_object / resolve_storage 单测
+├── conftest.py                    # 全局日志配置 + fixture plugin 注册
+├── fixtures/
+│   ├── storage.py                 # 7 后端参数化 storage fixture
+│   └── protocol_servers.py        # session 级 DAV / FTP 本地协议服务
+├── support/
+│   ├── ids.py                     # uid() 隔离标识；测试禁止从 conftest.py 直接导入
+│   └── factory_targets.py         # resolve_object 动态导入测试目标
+├── contract/storage/              # AbstractStorage 公共契约
+│   ├── test_metadata.py
+│   ├── test_files.py
+│   ├── test_directories.py
+│   ├── test_trees.py
+│   └── test_paths.py
+├── storage/
+│   ├── factory/                   # resolve_object / resolve_storage
+│   ├── cached/                    # 缓存填充、失效、下载缓存、Redis backend
+│   ├── index/                     # 分块、引用计数、目录操作、回滚
+│   ├── dav/                       # 配置、认证、multistatus、错误映射
+│   │   └── integration/           # 本地 wsgidav 上的 DavStorage 集成测试
+│   ├── ftp/                       # FTPStorage 配置、连接池、流式与树操作
+│   └── s3/                        # SigV4 与 mocked rollback
+│       └── integration/           # 需要 credentials 的目录标记测试
+└── server/ftp/                    # FTPServer 命令与协议行为集成测试
 ```
 
-**参数化 fixture**：`storage` fixture 将每个测试对 7 个后端各执行一次：`memory` / `local` / `s3` / `cached` / `index` / `dav` / `ftp`。S3 在 credentials 缺失时 `pytest.skip()`。`cached` 和 `index` 均以 `MemoryStorage` 为内部后端，保证可重现。`dav` 和 `ftp` 分别通过 session 级 `_dav_server` / `_ftp_server` fixture 在独立线程 + 事件循环中启动本地协议服务（均以 `MemoryStorage` 为后端），客户端连入形成真实协议闭环；两者始终运行。使用 `pytest-xdist` 并行执行测试（`-n auto`），每个 worker 使用独立随机端口服务实例。
+**参数化契约**：`tests/fixtures/storage.py` 的 `storage` fixture 将 `tests/contract/storage/` 对 7 个后端执行：`memory` / `local` / `s3` / `cached` / `index` / `ftp` / `dav`。S3 缺少配置时 `pytest.skip()`；`cached` 和 `index` 使用 `MemoryStorage` 保证可重现；DAV 和 FTP 通过 `tests/fixtures/protocol_servers.py` 启动独立线程、事件循环和随机端口的本地服务。
 
-**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出覆盖报告。
+**测试分层**：目录路径表达被测组件，marker 只表达运行性质。`integration` 表示启动本地 DAV / FTP 协议服务，`s3` 表示需要外部 S3 credentials，`slow` 表示异常耗时测试。纯单元测试不得仅因属于某个后端而标记为 integration。
+
+**测试辅助代码**：可导入辅助函数放在 `tests/support/`。`conftest.py` 只用于 fixture 和 pytest 配置，不作为普通 Python 模块导入。后端专属 fixture 放在对应目录的 `conftest.py`。
+
+**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出覆盖报告。当前测试源码收集为 629 个参数化用例；无外部 S3 时执行 562 个用例。
 
 ## 架构
 
@@ -138,21 +150,14 @@ app/
 │       ├── pathio.py     # StoragePathIO: 适配 AbstractStorage 到 aioftp PathIO
 │       └── handle.py     # 流式 ReadHandle / WriteHandle
 tests/
-├── conftest.py            # uid(), 参数化 storage fixture（7 后端）, _dav_server / _ftp_server
-├── test_storage_general.py
-├── test_s3_internals.py
-├── test_s3_rollback.py
-├── test_s3_signer.py
-├── test_cached_storage.py
-├── test_index_storage.py
-├── test_dav_config.py
-├── test_dav_xml.py
-├── test_dav_rollback.py
-├── test_dav_internals.py
-├── test_ftp_handler.py
-├── test_ftp_pool.py
-├── test_storage_ftp.py
-└── test_storage_factory.py
+├── conftest.py             # 全局 pytest 配置与 fixture plugin 注册
+├── fixtures/               # 参数化 storage、DAV / FTP 本地服务
+├── support/                # uid、动态 factory 测试目标
+├── contract/storage/       # 7 后端共享 AbstractStorage 契约
+├── storage/                # factory / cached / index / dav / ftp / s3 专属测试
+│   ├── dav/integration/    # 本地 wsgidav 集成测试
+│   └── s3/integration/     # 外部 S3 credentials 测试
+└── server/ftp/             # FTPServer 协议集成测试
 ```
 
 ### 核心抽象与设计模式

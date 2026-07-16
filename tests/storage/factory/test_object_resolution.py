@@ -1,41 +1,9 @@
-"""Unit tests for resolve_object / resolve_storage / resolve_storage_from_file."""
-
-import json
-from pathlib import Path
+"""Tests for dict-driven object resolution."""
 
 import pytest
 
-from app.storage.abstract import AbstractStorage
-from app.storage.factory import resolve_storage, resolve_storage_from_file
 from app.storage.memory import MemoryStorage
 from app.utils import resolve_object
-
-# ---------------------------------------------------------------------------
-# Helpers — referenced by $factory strings in tests
-# ---------------------------------------------------------------------------
-
-
-def bundle(storage: AbstractStorage, payload: dict[str, list[int]], records: list[dict[str, str]]) -> tuple:
-    """Return args unchanged; used to verify nested $factory specs + TypeAdapter coercion."""
-    return storage, payload, records
-
-
-def pick_storage(storage: AbstractStorage) -> AbstractStorage:
-    """Pass-through helper for resolve_storage_from_file tests."""
-    return storage
-
-
-def return_number() -> int:
-    """Return a non-storage value — used to test resolve_storage rejection."""
-    return 42
-
-
-NOT_CALLABLE = 123
-
-
-# ---------------------------------------------------------------------------
-# resolve_object
-# ---------------------------------------------------------------------------
 
 
 class TestResolveObject:
@@ -104,7 +72,7 @@ class TestResolveObject:
     def test_nested_factory_and_type_coercion(self):
         """Nested $factory specs + TypeAdapter coercion of list/dict values."""
         spec = {
-            "$factory": "tests.test_storage_factory:bundle",
+            "$factory": "tests.support.factory_targets:bundle",
             "storage": {"$factory": "~memory", "root": "nested"},
             "payload": {"group": [1, "2", 3], "empty": []},
             "records": [{"name": "alpha", "value": "1"}, {"name": "beta", "value": "2"}],
@@ -137,48 +105,4 @@ class TestResolveObject:
 
     def test_non_callable_factory(self):
         with pytest.raises(TypeError, match=r"Factory is not a class or function"):
-            resolve_object({"$factory": "tests.test_storage_factory:NOT_CALLABLE"})
-
-
-# ---------------------------------------------------------------------------
-# resolve_storage
-# ---------------------------------------------------------------------------
-
-
-class TestResolveStorage:
-    """Tests for app.storage.factory.resolve_storage — type-guarding the result."""
-
-    def test_accepts_storage_instance(self):
-        spec = {"$factory": "~memory", "root": "direct"}
-        obj = resolve_storage(spec)
-        assert isinstance(obj, MemoryStorage)
-        assert obj.id.endswith(":/direct")
-
-    def test_rejects_non_storage_result(self):
-        spec = {"$factory": "tests.test_storage_factory:return_number"}
-        with pytest.raises(TypeError, match=r"Resolved object is not an AbstractStorage"):
-            resolve_storage(spec)
-
-
-# ---------------------------------------------------------------------------
-# resolve_storage_from_file
-# ---------------------------------------------------------------------------
-
-
-class TestResolveStorageFromFile:
-    """Tests for app.storage.factory.resolve_storage_from_file — JSON file input."""
-
-    def test_reads_json_and_resolves_nested_spec(self, tmp_path: Path):
-        data = {
-            "$factory": "tests.test_storage_factory:pick_storage",
-            "storage": {
-                "$factory": "~memory",
-                "root": "json-root",
-            },
-        }
-        json_path = tmp_path / "spec.json"
-        json_path.write_text(json.dumps(data))
-
-        obj = resolve_storage_from_file(json_path)
-        assert isinstance(obj, MemoryStorage)
-        assert obj.id.endswith(":/json-root")
+            resolve_object({"$factory": "tests.support.factory_targets:NOT_CALLABLE"})

@@ -1,46 +1,8 @@
-"""Tests for CachedStorage cache behavior — with verified cache state.
-
-Every test uses :meth:`CachedStorage.dump_cache` to *prove* whether a
-result came from cache or from the underlying storage, rather than just
-assuming the cache behaved as documented.
-"""
-
-import contextlib
-
-import pytest
+"""CachedStorage behavior tests."""
 
 from app.storage.cached import CachedStorage
-from app.storage.memory import MemoryStorage
-from tests.conftest import uid
-
-
-@pytest.fixture
-async def cached():
-    """A CachedStorage wrapping MemoryStorage for fast, deterministic tests."""
-    async with MemoryStorage("/") as inner, CachedStorage(inner) as s:
-        yield s
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-
-
-async def _clear_path(cached: CachedStorage, path: str) -> None:
-    """Remove all cache entries for *path* (simulates a completely cold cache)."""
-    await cached._cache.mdelete(
-        ("exists", path),
-        ("is_file", path),
-        ("is_dir", path),
-        ("stat", path),
-        ("download", path),
-        ("iterdir", path),
-    )
-
-
-# ---------------------------------------------------------------------------
-# TestCacheHit
-# ---------------------------------------------------------------------------
+from tests.storage.cached.helpers import _clear_path
+from tests.support.ids import uid
 
 
 class TestCacheHit:
@@ -88,91 +50,6 @@ class TestCacheHit:
             assert path in snap.get("stat", {}), "stat should be backfilled after miss"
         finally:
             await cached.delete(path)
-
-
-# ---------------------------------------------------------------------------
-# TestCacheInvalidation
-# ---------------------------------------------------------------------------
-
-
-class TestCacheInvalidation:
-    """Verify write operations backfill ``False`` into relevant caches."""
-
-    async def test_unlink_backfills_false(self, cached: CachedStorage):
-        path = f"test-inv-unlink-{uid()}"
-        await cached.upload_bytes(b"hello", path)
-
-        snap = cached.dump_cache()
-        assert snap.get("exists", {}).get(path) is True
-
-        await cached.unlink(path)
-
-        snap = cached.dump_cache()
-        assert snap.get("exists", {}).get(path) is False, "exists should be backfilled False after unlink"
-        assert snap.get("is_file", {}).get(path) is False, "is_file should be backfilled False after unlink"
-        assert snap.get("is_dir", {}).get(path) is False, "is_dir should be backfilled False after unlink"
-
-    async def test_rmdir_backfills_false(self, cached: CachedStorage):
-        path = f"test-inv-rmdir-{uid()}"
-        await cached.mkdir(path)
-
-        await cached.rmdir(path)
-
-        snap = cached.dump_cache()
-        assert snap.get("exists", {}).get(path) is False, "exists should be backfilled False after rmdir"
-        assert snap.get("is_dir", {}).get(path) is False, "is_dir should be backfilled False after rmdir"
-
-    async def test_delete_many_invalidates_after_partial_failure(self, cached: CachedStorage):
-        root = f"test-inv-delete-many-{uid()}"
-        deleted = f"{root}/deleted.txt"
-        nonempty = f"{root}/nonempty"
-        child = f"{nonempty}/child.txt"
-        try:
-            await cached.mkdir(root)
-            await cached.mkdir(nonempty)
-            await cached.upload_bytes(b"deleted", deleted)
-            await cached.upload_bytes(b"child", child)
-
-            await cached.stat(deleted)
-            await cached.stat(nonempty)
-            await cached.download_bytes(deleted)
-            entries = [entry async for entry in cached.iterdir(root)]
-            assert len(entries) == 2
-
-            with pytest.raises(OSError, match="Directory not empty"):
-                await cached.delete_many(deleted, nonempty)
-
-            snap = cached.dump_cache()
-            for namespace in ("exists", "is_file", "is_dir", "stat", "download"):
-                assert deleted not in snap.get(namespace, {})
-            for namespace in ("exists", "is_file", "is_dir", "stat"):
-                assert nonempty not in snap.get(namespace, {})
-            assert root not in snap.get("iterdir", {})
-            assert not await cached.exists(deleted)
-            assert await cached.exists(nonempty)
-        finally:
-            await cached.rmtree(root)
-
-    async def test_move_backfills_src_false_dst_true(self, cached: CachedStorage):
-        src = f"test-inv-move-src-{uid()}"
-        dst = f"test-inv-move-dst-{uid()}"
-        try:
-            await cached.upload_bytes(b"hello", src)
-
-            await cached.move(src, dst)
-
-            snap = cached.dump_cache()
-            assert snap.get("exists", {}).get(src) is False, "src exists should be False after move"
-            assert snap.get("exists", {}).get(dst) is True, "dst exists should be True after move"
-        finally:
-            await cached.delete(dst)
-            with contextlib.suppress(Exception):
-                await cached.delete(src)
-
-
-# ---------------------------------------------------------------------------
-# TestCrossBackfill
-# ---------------------------------------------------------------------------
 
 
 class TestCrossBackfill:
@@ -255,11 +132,6 @@ class TestCrossBackfill:
             await cached.delete(path)
 
 
-# ---------------------------------------------------------------------------
-# TestIsFileCacheMiss
-# ---------------------------------------------------------------------------
-
-
 class TestIsFileCacheMiss:
     """Verify is_file cache is populated even when download cache is skipped."""
 
@@ -277,11 +149,6 @@ class TestIsFileCacheMiss:
             assert path not in snap.get("download", {}), "download must NOT be cached (above threshold)"
         finally:
             await cached.delete(path)
-
-
-# ---------------------------------------------------------------------------
-# TestIterdirCacheHit
-# ---------------------------------------------------------------------------
 
 
 class TestIterdirCacheHit:
@@ -308,11 +175,6 @@ class TestIterdirCacheHit:
             assert entries2[0].name == "a.txt"
         finally:
             await cached.rmtree(dirpath)
-
-
-# ---------------------------------------------------------------------------
-# TestListBackfill
-# ---------------------------------------------------------------------------
 
 
 class TestListBackfill:
@@ -345,60 +207,3 @@ class TestListBackfill:
             assert dirpath not in snap.get("iterdir", {}), "list_ should not populate iterdir cache"
         finally:
             await cached.rmtree(dirpath)
-
-
-# ---------------------------------------------------------------------------
-# TestDownloadCacheThreshold
-# ---------------------------------------------------------------------------
-
-
-class TestDownloadCacheThreshold:
-    """Verify download cache is NOT populated above threshold."""
-
-    async def test_large_file_download_not_cached(self, cached: CachedStorage):
-        data = b"L" * 20000  # > 16 KB
-        path = f"test-dl-thresh-{uid()}"
-        try:
-            await cached.upload_bytes(data, path)
-
-            # Upload skipped download due to threshold
-            snap = cached.dump_cache()
-            assert path not in snap.get("download", {}), "download not cached after large upload"
-
-            # Download still works (miss path)
-            result = await cached.download_bytes(path)
-            assert result == data
-
-            # Still not cached after download (miss path also checks threshold)
-            snap = cached.dump_cache()
-            assert path not in snap.get("download", {}), "download not cached even after download"
-        finally:
-            await cached.delete(path)
-
-
-# ---------------------------------------------------------------------------
-# TestDownloadCache
-# ---------------------------------------------------------------------------
-
-
-class TestDownloadCache:
-    """Verify download cache IS populated for small files."""
-
-    async def test_small_file_download_is_cached(self, cached: CachedStorage):
-        path = f"test-dlcache-{uid()}"
-        data = b"hello download cache test"  # < 16 KB
-        try:
-            await cached.upload_bytes(data, path)
-
-            snap = cached.dump_cache()
-            assert path in snap.get("download", {}), "download should be cached after small upload"
-            assert snap["download"][path] == data
-
-            result1 = await cached.download_bytes(path)
-            assert result1 == data
-
-            # Cache persists
-            snap = cached.dump_cache()
-            assert path in snap.get("download", {})
-        finally:
-            await cached.delete(path)

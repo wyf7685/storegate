@@ -1,13 +1,10 @@
-"""Unit tests for DavConfig validation and auth builder (no network)."""
+"""WebDAV client configuration tests."""
 
 import json
 from pathlib import Path
 
-import httpx
 import pytest
 
-from app.storage.dav.client import AsyncDavClient, build_auth
-from app.storage.dav.client.auth import _BearerAuth
 from app.storage.dav.client.models import DavConfig
 
 
@@ -72,44 +69,3 @@ class TestDavConfigValidation:
         assert cfg.token is not None
         assert cfg.token.get_secret_value() == "abc123"
         assert cfg.root_prefix == "/storegate"
-
-
-class TestBuildAuth:
-    def test_basic_auth(self) -> None:
-        cfg = DavConfig(
-            base_url="https://host/dav",
-            auth_mode="basic",
-            username="user",
-            password="secret",
-        )
-        auth = build_auth(cfg)
-        assert isinstance(auth, httpx.BasicAuth)
-
-    def test_bearer_auth(self) -> None:
-        cfg = DavConfig(base_url="https://host/dav", auth_mode="bearer", token="abc123")
-        auth = build_auth(cfg)
-        assert isinstance(auth, _BearerAuth)
-        request = httpx.Request("GET", "https://host/dav/")
-        next(auth.auth_flow(request))
-        assert request.headers["Authorization"] == "Bearer abc123"
-
-    def test_anonymous_auth(self) -> None:
-        cfg = DavConfig(base_url="https://host/dav", auth_mode="anonymous")
-        assert build_auth(cfg) is None
-
-
-class TestBuildPath:
-    def test_no_prefix(self) -> None:
-        client = AsyncDavClient(DavConfig(base_url="https://host/dav", auth_mode="anonymous"))
-        assert client._build_path("foo/bar") == "/foo/bar"
-        assert client._build_path("/foo/bar") == "/foo/bar"
-        assert client._build_path("") == "/"
-
-    def test_with_prefix(self) -> None:
-        client = AsyncDavClient(DavConfig(base_url="https://host/dav", auth_mode="anonymous", root_prefix="/storegate"))
-        assert client._build_path("foo/bar") == "/storegate/foo/bar"
-        assert client._build_path("") == "/storegate"
-
-    def test_build_url_absolute(self) -> None:
-        client = AsyncDavClient(DavConfig(base_url="https://host/dav", auth_mode="anonymous", root_prefix="/storegate"))
-        assert client._build_url("foo") == "https://host/dav/storegate/foo"

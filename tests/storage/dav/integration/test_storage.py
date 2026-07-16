@@ -4,19 +4,13 @@ import contextlib
 
 import pytest
 
-from app.storage.dav import DavConfig, DavStorage
-from tests.conftest import uid
+from app.storage.dav import DavStorage
+from tests.support.ids import uid
+
+pytestmark = pytest.mark.integration
 
 
-@pytest.fixture
-async def dav_storage(_dav_server: str):
-    config = DavConfig(base_url=_dav_server, auth_mode="anonymous")
-    async with DavStorage(config) as s:
-        yield s
-
-
-@pytest.mark.dav
-class TestDavInternals:
+class TestDavStorageIntegration:
     async def test_root_stat(self, dav_storage: DavStorage) -> None:
         info = await dav_storage.stat("/")
         assert info.is_dir
