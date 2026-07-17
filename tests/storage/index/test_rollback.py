@@ -1,5 +1,7 @@
 """IndexStorage behavior tests."""
 
+import contextlib
+
 import anyio
 import pytest
 from pytest_mock import MockerFixture
@@ -396,3 +398,78 @@ class TestRollback:
                 await s.rmtree(src)
             with suppress_exc():
                 await s.rmtree(dst)
+
+
+class TestTreeTransactionRollback:
+    async def test_copytree_failure_restores_overwritten_files_and_refs(
+        self, index_storage: IndexStorage, mocker: MockerFixture
+    ) -> None:
+        storage = index_storage
+        src = f"test-tree-copy-src-{uid()}"
+        dst = f"test-tree-copy-dst-{uid()}"
+        try:
+            await storage.upload_bytes(b"new-one", f"{src}/one.txt")
+            await storage.upload_bytes(b"new-two", f"{src}/two.txt")
+            await storage.upload_bytes(b"old-one", f"{dst}/one.txt")
+            await storage.upload_bytes(b"old-two", f"{dst}/two.txt")
+            old_one = await storage._get_file_meta(f"{dst}/one.txt")
+            old_two = await storage._get_file_meta(f"{dst}/two.txt")
+            assert old_one is not None
+            assert old_two is not None
+
+            original_copy = storage.copy
+
+            async def fail_second(source: str, destination: str, *, overwrite: bool = True) -> None:
+                if str(destination).endswith("/two.txt"):
+                    raise OSError("injected tree copy failure")
+                await original_copy(source, destination, overwrite=overwrite)
+
+            mocker.patch.object(storage, "copy", fail_second)
+            with pytest.raises(OSError, match="injected tree copy failure"):
+                await storage.copytree(src, dst, overwrite=True)
+
+            assert await storage.download_bytes(f"{dst}/one.txt") == b"old-one"
+            assert await storage.download_bytes(f"{dst}/two.txt") == b"old-two"
+            for meta, path in ((old_one, f"/{dst}/one.txt"), (old_two, f"/{dst}/two.txt")):
+                for chunk_hash in meta.chunks:
+                    refs = await storage._chunk_load_refs(chunk_hash)
+                    assert refs is not None
+                    assert path in refs
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.rmtree(src)
+            with contextlib.suppress(Exception):
+                await storage.rmtree(dst)
+
+    async def test_movetree_failure_restores_source_and_destination(
+        self, index_storage: IndexStorage, mocker: MockerFixture
+    ) -> None:
+        storage = index_storage
+        src = f"test-tree-move-src-{uid()}"
+        dst = f"test-tree-move-dst-{uid()}"
+        try:
+            await storage.upload_bytes(b"new-one", f"{src}/one.txt")
+            await storage.upload_bytes(b"new-two", f"{src}/two.txt")
+            await storage.upload_bytes(b"old-one", f"{dst}/one.txt")
+            await storage.upload_bytes(b"old-two", f"{dst}/two.txt")
+
+            original_move = storage.move
+
+            async def fail_second(source: str, destination: str, *, overwrite: bool = True) -> None:
+                if str(destination).endswith("/two.txt"):
+                    raise OSError("injected tree move failure")
+                await original_move(source, destination, overwrite=overwrite)
+
+            mocker.patch.object(storage, "move", fail_second)
+            with pytest.raises(OSError, match="injected tree move failure"):
+                await storage.movetree(src, dst, overwrite=True)
+
+            assert await storage.download_bytes(f"{src}/one.txt") == b"new-one"
+            assert await storage.download_bytes(f"{src}/two.txt") == b"new-two"
+            assert await storage.download_bytes(f"{dst}/one.txt") == b"old-one"
+            assert await storage.download_bytes(f"{dst}/two.txt") == b"old-two"
+        finally:
+            with contextlib.suppress(Exception):
+                await storage.rmtree(src)
+            with contextlib.suppress(Exception):
+                await storage.rmtree(dst)

@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 import uuid
-from collections import defaultdict
 from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
@@ -1123,162 +1122,197 @@ class IndexStorage(AbstractStorage):
         await self._index.rmdir(path)
         self.log.info(f"RmTree complete: {_colored_path} (<g>{count}</g> entries removed)")
 
+    async def _collect_tree(self, root: PurePosixPath) -> tuple[dict[PurePosixPath, FileMeta], list[PurePosixPath]]:
+        metas: dict[PurePosixPath, FileMeta] = {}
+        relatives: list[PurePosixPath] = []
+        async for _, directories, files in self._index.walk(root):
+            relatives.extend(self.normalize_path(directory.path).relative_to(root) for directory in directories)
+            for file in files:
+                path = self.normalize_path(file.path)
+                meta = await self._get_file_meta(path)
+                if meta is None:
+                    raise FileNotFoundError(f"File not found: {path}")
+                metas[path] = meta
+        return metas, relatives
+
+    @staticmethod
+    def _raise_tree_failure(primary: BaseException, rollback_error: BaseException | None) -> None:
+        if rollback_error is None:
+            raise primary
+        if isinstance(primary, Exception) and isinstance(rollback_error, Exception):
+            raise BaseExceptionGroup("Tree transaction and rollback failed", [primary, rollback_error]) from None
+        if isinstance(rollback_error, anyio.get_cancelled_exc_class()):
+            raise rollback_error
+        raise primary
+
+    async def _ensure_tree_directory(self, directory: PurePosixPath, created: set[PurePosixPath]) -> None:
+        if directory == PurePosixPath("/"):
+            return
+        if await self._index.exists(directory):
+            if not await self._index.is_dir(directory):
+                raise FileExistsError(f"Path is a file: {directory}")
+            return
+        await self._ensure_tree_directory(directory.parent, created)
+        await self._index.mkdir(directory, parents=False, exist_ok=False)
+        created.add(directory)
+
+    async def _add_tree_rollback_guards(self, chunk_hashes: Iterable[str]) -> dict[str, str]:
+        guards: dict[str, str] = {}
+        try:
+            for chunk_hash in sorted(set(chunk_hashes)):
+                temp_ref = f"$tree-rollback-{uuid.uuid4().hex}"
+                async with self._lock_chunk(chunk_hash):
+                    await self._chunk_add_temp_ref_unlocked(chunk_hash, temp_ref)
+                guards[chunk_hash] = temp_ref
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await self._release_tree_rollback_guards(guards)
+            raise
+        return guards
+
+    async def _release_tree_rollback_guards(self, guards: dict[str, str]) -> None:
+        for chunk_hash, temp_ref in guards.items():
+            async with self._lock_chunk(chunk_hash):
+                await self._chunk_remove_temp_ref_unlocked(chunk_hash, temp_ref)
+
+    async def _restore_tree_file(self, path: PurePosixPath, meta: FileMeta) -> None:
+        current = await self._get_file_meta(path)
+        if current is not None:
+            current_hashes = set(current.chunks)
+            expected_hashes = set(meta.chunks)
+            for chunk_hash in current_hashes - expected_hashes:
+                async with self._lock_chunk(chunk_hash):
+                    await self._chunk_decref(chunk_hash, path)
+        await self._index.mkdir(path.parent, parents=True, exist_ok=True)
+        await self._index.upload_bytes(meta.model_dump_json().encode(), path, overwrite=True)
+        for chunk_hash in meta.chunks:
+            async with self._lock_chunk(chunk_hash):
+                refs = await self._chunk_load_refs(chunk_hash) or set()
+                if self.normalize_path(path).as_posix() not in refs:
+                    await self._chunk_incref(chunk_hash, path)
+
+    async def _restore_tree_transaction(
+        self,
+        source_root: PurePosixPath,
+        source_metas: dict[PurePosixPath, FileMeta],
+        source_dirs: list[PurePosixPath],
+        destination_metas: dict[PurePosixPath, FileMeta],
+        destination_paths: set[PurePosixPath],
+        created_destination_dirs: set[PurePosixPath],
+        *,
+        move: bool,
+    ) -> None:
+        if move:
+            recreated_source_dirs: set[PurePosixPath] = set()
+            for directory in sorted(
+                [source_root, *(source_root / relative for relative in source_dirs)],
+                key=lambda path: len(path.parts),
+            ):
+                await self._ensure_tree_directory(directory, recreated_source_dirs)
+            for path, meta in source_metas.items():
+                await self._restore_tree_file(path, meta)
+
+        for path in destination_paths:
+            meta = destination_metas.get(path)
+            if meta is None:
+                await self.unlink(path, missing_ok=True)
+            else:
+                await self._restore_tree_file(path, meta)
+        for directory in sorted(created_destination_dirs, key=lambda path: len(path.parts), reverse=True):
+            with contextlib.suppress(OSError, FileNotFoundError):
+                await self._index.rmdir(directory)
+
+    async def _apply_tree_transaction(
+        self,
+        src: PurePosixPath,
+        dst: PurePosixPath,
+        *,
+        move: bool,
+    ) -> tuple[int, int]:
+        source_metas, source_dirs = await self._collect_tree(src)
+        destination_paths = {dst.joinpath(path.relative_to(src)) for path in source_metas}
+        destination_metas: dict[PurePosixPath, FileMeta] = {}
+        for path in destination_paths:
+            if await self._index.is_dir(path):
+                raise IsADirectoryError(f"Destination is a directory: {path}")
+            if meta := await self._get_file_meta(path):
+                destination_metas[path] = meta
+
+        old_destination_chunks = {chunk_hash for meta in destination_metas.values() for chunk_hash in meta.chunks}
+        guards = await self._add_tree_rollback_guards(old_destination_chunks)
+        created_destination_dirs: set[PurePosixPath] = set()
+        try:
+            for directory in sorted(
+                [dst, *(dst / relative for relative in source_dirs)], key=lambda path: len(path.parts)
+            ):
+                await self._ensure_tree_directory(directory, created_destination_dirs)
+            for source_path in sorted(source_metas, key=lambda path: path.as_posix()):
+                destination_path = dst.joinpath(source_path.relative_to(src))
+                if move:
+                    await self.move(source_path, destination_path, overwrite=True)
+                else:
+                    await self.copy(source_path, destination_path, overwrite=True)
+            if move:
+                for relative in sorted(source_dirs, key=lambda path: len(path.parts), reverse=True):
+                    await self._index.rmdir(src / relative)
+                await self._index.rmdir(src)
+        except BaseException as primary:
+            rollback_error: BaseException | None = None
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self._restore_tree_transaction(
+                        src,
+                        source_metas,
+                        source_dirs,
+                        destination_metas,
+                        destination_paths,
+                        created_destination_dirs,
+                        move=move,
+                    )
+                except BaseException as error:
+                    rollback_error = error
+                try:
+                    await self._release_tree_rollback_guards(guards)
+                except BaseException as error:
+                    if rollback_error is None:
+                        rollback_error = error
+            self._raise_tree_failure(primary, rollback_error)
+        else:
+            await self._release_tree_rollback_guards(guards)
+        return len(source_metas), len(source_dirs)
+
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
-        _colored_src = f"<y>{escape_tag(src)}</y>"
-        _colored_dst = f"<y>{escape_tag(dst)}</y>"
-        self.log.info(f"CopyTree: {_colored_src} → {_colored_dst}")
-
-        # 类型和策略校验
         if not await self._index.is_dir(src):
             raise NotADirectoryError(f"Not a directory: {src}")
-        if not overwrite and await self._index.is_dir(dst):
+        if not overwrite and await self._index.exists(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
-
-        # walk 收集源树所有文件
-        async def collect_chunk_updates(info: FileInfo) -> None:
-            meta = await self._get_file_meta(info.path)
-            if meta is None:
-                raise FileNotFoundError(f"File not found: {info.path}")
-            files.append(meta)
-            file_rel = self.normalize_path(meta.info.path).relative_to(src)
-            for chunk_hash in meta.chunks:
-                chunk_updates[chunk_hash].add(dst.joinpath(file_rel))
-
-        files: list[FileMeta] = []
-        dir_rels: list[PurePosixPath] = []
-        chunk_updates: dict[str, set[PathLike]] = defaultdict(set)
-        async with anyio.create_task_group() as tg:
-            async for _, sd, sf in self._index.walk(src):
-                for info in sf:
-                    tg.start_soon(collect_chunk_updates, info)
-                dir_rels.extend(self.normalize_path(d.path).relative_to(src) for d in sd)
-
-        # 创建目标目录结构
-        await self._index.mkdir(dst, parents=True, exist_ok=True)
-        for rel in sorted(dir_rels, key=lambda r: len(r.parts)):
-            await self._index.mkdir(dst.joinpath(rel), parents=True, exist_ok=True)
-
-        # 并发更新 chunk refs
-        async def batch_incref(chunk_hash: str, dst_paths: set[PathLike]) -> None:
-            async with self._lock_chunk(chunk_hash):
-                await self._chunk_incref(chunk_hash, *dst_paths)
-
-        async with anyio.create_task_group() as tg:
-            for chunk_hash, dst_paths in chunk_updates.items():
-                tg.start_soon(batch_incref, chunk_hash, dst_paths)
-
-        # 并发创建目标文件元数据
-        async def create_dst_meta(src_meta: FileMeta) -> None:
-            dst_file = dst.joinpath(self.normalize_path(src_meta.info.path).relative_to(src))
-            async with self._lock_index(dst_file):
-                if old_meta := await self._get_file_meta(dst_file):
-                    async with self._lock_chunks(old_meta.chunks), anyio.create_task_group() as inner_tg:
-                        for chunk_hash in old_meta.chunks:
-                            inner_tg.start_soon(self._chunk_decref, chunk_hash, dst_file)
-                dst_meta = FileMeta(
-                    info=dataclasses.replace(
-                        src_meta.info,
-                        path=dst_file.as_posix(),
-                        name=dst_file.name,
-                    ),
-                    chunks=src_meta.chunks.copy(),
-                )
-                dst_meta_bytes = dst_meta.model_dump_json().encode()
-                await self._index.upload_bytes(dst_meta_bytes, dst_meta.info.path, overwrite=True)
-
-        async with anyio.create_task_group() as tg:
-            for src_meta in files:
-                tg.start_soon(create_dst_meta, src_meta)
-
+        if dst == src or dst.is_relative_to(src):
+            raise ValueError("Destination must not be inside the source tree")
+        async with self._lock_indexes(f"{src}.tree", f"{dst}.tree"):
+            files, directories = await self._apply_tree_transaction(src, dst, move=False)
         self.log.info(
-            f"CopyTree complete: {_colored_src} → {_colored_dst} "
-            f"(<g>{len(files)}</g> files, <g>{len(dir_rels)}</g> dirs)"
+            f"CopyTree complete: <y>{escape_tag(src)}</y> → <y>{escape_tag(dst)}</y> "
+            f"(<g>{files}</g> files, <g>{directories}</g> dirs)"
         )
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
-        _colored_src = f"<y>{escape_tag(src)}</y>"
-        _colored_dst = f"<y>{escape_tag(dst)}</y>"
-        self.log.info(f"MoveTree: {_colored_src} → {_colored_dst}")
-
-        # 类型和策略校验
         if not await self._index.is_dir(src):
             raise NotADirectoryError(f"Not a directory: {src}")
-        if not overwrite and await self._index.is_dir(dst):
+        if not overwrite and await self._index.exists(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
-
-        # walk 收集源树所有文件
-        async def collect_chunks(info: FileInfo) -> None:
-            meta = await self._get_file_meta(info.path)
-            if meta is None:
-                raise FileNotFoundError(f"File not found: {info.path}")
-            files.append(meta)
-            src_file = self.normalize_path(meta.info.path)
-            dst_file = dst.joinpath(src_file.relative_to(src))
-            for chunk_hash in meta.chunks:
-                chunk_transrefs[chunk_hash].add((src_file, dst_file))
-
-        files: list[FileMeta] = []
-        dir_rels: list[PurePosixPath] = []
-        chunk_transrefs: dict[str, set[tuple[PathLike, PathLike]]] = defaultdict(set)
-        async with anyio.create_task_group() as tg:
-            async for _, sd, sf in self._index.walk(src):
-                for info in sf:
-                    tg.start_soon(collect_chunks, info)
-                dir_rels.extend(self.normalize_path(d.path).relative_to(src) for d in sd)
-
-        # 创建目标目录结构
-        await self.mkdir(dst, parents=True, exist_ok=True)
-        for rel in sorted(dir_rels, key=lambda r: len(r.parts)):
-            await self.mkdir(dst.joinpath(rel).as_posix(), parents=True, exist_ok=True)
-
-        # 批量 transref: 每个 chunk 一把锁，一次处理全部 (src,dst) 对
-        async def batch_transref(chunk_hash: str, pairs: set[tuple[PathLike, PathLike]]) -> None:
-            async with self._lock_chunk(chunk_hash):
-                await self._chunk_transref(chunk_hash, *pairs)
-
-        async with anyio.create_task_group() as tg:
-            for chunk_hash, pairs in chunk_transrefs.items():
-                tg.start_soon(batch_transref, chunk_hash, pairs)
-
-        # 移动文件 meta (锁 src+dst, 写 dst, 删 src)
-        async def move_meta(src_meta: FileMeta) -> None:
-            src_file = self.normalize_path(src_meta.info.path)
-            dst_file = dst.joinpath(src_file.relative_to(src))
-            async with self._lock_indexes(src_file, dst_file):
-                # overwrite: 清理目标端旧 chunks
-                if old_meta := await self._get_file_meta(dst_file):
-                    async with self._lock_chunks(old_meta.chunks), anyio.create_task_group() as inner_tg:
-                        for chunk_hash in old_meta.chunks:
-                            inner_tg.start_soon(self._chunk_decref, chunk_hash, dst_file)
-                dst_meta = FileMeta(
-                    info=dataclasses.replace(
-                        src_meta.info,
-                        path=dst_file.as_posix(),
-                        name=dst_file.name,
-                    ),
-                    chunks=src_meta.chunks.copy(),
-                )
-                await self._index.upload_bytes(dst_meta.model_dump_json().encode(), dst_file, overwrite=True)
-                await self._index.unlink(src_file)
-
-        async with anyio.create_task_group() as tg:
-            for src_meta in files:
-                tg.start_soon(move_meta, src_meta)
-
-        # 清理源目录结构 (自底向上)
-        for rel in sorted(dir_rels, key=lambda r: len(r.parts), reverse=True):
-            await self._index.rmdir(src.joinpath(rel))
-        await self._index.rmdir(src)
-
+        if dst == src or dst.is_relative_to(src):
+            raise ValueError("Destination must not be inside the source tree")
+        async with self._lock_indexes(f"{src}.tree", f"{dst}.tree"):
+            files, directories = await self._apply_tree_transaction(src, dst, move=True)
         self.log.info(
-            f"MoveTree complete: {_colored_src} → {_colored_dst} "
-            f"(<g>{len(files)}</g> files, <g>{len(dir_rels)}</g> dirs)"
+            f"MoveTree complete: <y>{escape_tag(src)}</y> → <y>{escape_tag(dst)}</y> "
+            f"(<g>{files}</g> files, <g>{directories}</g> dirs)"
         )
 
     @override

@@ -719,26 +719,52 @@ class FTPStorage(AbstractStorage):
         client: aioftp.Client,
         created_files: set[PurePosixPath],
         created_dirs: set[PurePosixPath],
+        backups: dict[PurePosixPath, PurePosixPath],
     ) -> None:
+        failures: list[BaseException] = []
         for file in sorted(created_files, key=lambda path: len(path.parts), reverse=True):
-            with contextlib.suppress(Exception):
-                await client.remove_file(self._remote_path(file))
+            try:
+                if await self._exists(client, file):
+                    await client.remove_file(self._remote_path(file))
+            except BaseException as error:
+                failures.append(error)
+        for target, backup in backups.items():
+            try:
+                if await self._exists(client, target):
+                    await client.remove_file(self._remote_path(target))
+                if await self._exists(client, backup):
+                    await client.rename(self._remote_path(backup), self._remote_path(target))
+            except BaseException as error:
+                failures.append(error)
         for directory in sorted(created_dirs, key=lambda path: len(path.parts), reverse=True):
-            with contextlib.suppress(Exception):
-                await client.remove_directory(self._remote_path(directory))
+            try:
+                if await self._exists(client, directory):
+                    await client.remove_directory(self._remote_path(directory))
+            except BaseException as error:
+                failures.append(error)
+        if not failures:
+            return
+        if len(failures) == 1:
+            raise failures[0]
+        raise BaseExceptionGroup("Failed to roll back FTP copytree", failures)
 
     async def _rollback_copytree_with_fallback(
         self,
         source_client: aioftp.Client,
         created_files: set[PurePosixPath],
         created_dirs: set[PurePosixPath],
+        backups: dict[PurePosixPath, PurePosixPath],
     ) -> None:
         try:
-            await self._rollback_copytree(source_client, created_files, created_dirs)
-        except Exception:
-            with contextlib.suppress(Exception):
+            await self._rollback_copytree(source_client, created_files, created_dirs, backups)
+        except BaseException as first_error:
+            try:
                 async with self._temporary_client() as cleanup_client:
-                    await self._rollback_copytree(cleanup_client, created_files, created_dirs)
+                    await self._rollback_copytree(cleanup_client, created_files, created_dirs, backups)
+            except BaseException as second_error:
+                if isinstance(first_error, Exception) and isinstance(second_error, Exception):
+                    raise BaseExceptionGroup("FTP copytree rollback failed", [first_error, second_error]) from None
+                raise first_error from None
 
     async def _copytree(
         self,
@@ -773,29 +799,47 @@ class FTPStorage(AbstractStorage):
 
         created_files: set[PurePosixPath] = set()
         created_dirs: set[PurePosixPath] = set()
+        backups: dict[PurePosixPath, PurePosixPath] = {}
         try:
             created_dirs.update(await self._mkdir(source_client, destination, parents=True, exist_ok=True))
-            for current, dirs, files in snapshot:
+            for current, directories, files in snapshot:
                 relative = current.relative_to(source)
                 target_dir = destination if relative == PurePosixPath(".") else destination / relative
-                for directory in dirs:
+                for directory in directories:
                     target = target_dir / directory.name
                     created_dirs.update(await self._mkdir(source_client, target, parents=False, exist_ok=True))
                 for file in files:
                     target = target_dir / file.name
-                    existed = await self._exists(source_client, target)
-                    if not existed:
+                    if await self._exists(source_client, target):
+                        backup = target.with_name(f".storegate-copytree-{uuid.uuid4().hex}-{target.name}")
+                        await source_client.rename(self._remote_path(target), self._remote_path(backup))
+                        backups[target] = backup
+                    else:
                         created_files.add(target)
-                    await self._copy_file(
-                        source_client,
-                        destination_client,
-                        PurePosixPath(file.path),
-                        target,
-                    )
-        except Exception:
+                    await self._copy_file(source_client, destination_client, PurePosixPath(file.path), target)
+        except BaseException as primary:
+            rollback_error: BaseException | None = None
             with anyio.CancelScope(shield=True):
-                await self._rollback_copytree_with_fallback(source_client, created_files, created_dirs)
+                try:
+                    await self._rollback_copytree_with_fallback(source_client, created_files, created_dirs, backups)
+                except BaseException as error:
+                    rollback_error = error
+            if rollback_error is not None and isinstance(primary, Exception) and isinstance(rollback_error, Exception):
+                raise BaseExceptionGroup("FTP copytree and rollback failed", [primary, rollback_error]) from None
+            if rollback_error is not None and isinstance(rollback_error, anyio.get_cancelled_exc_class()):
+                raise rollback_error from None
             raise
+        cleanup_errors: list[BaseException] = []
+        with anyio.CancelScope(shield=True):
+            for backup in backups.values():
+                try:
+                    await source_client.remove_file(self._remote_path(backup))
+                except BaseException as error:
+                    cleanup_errors.append(error)
+        if cleanup_errors:
+            if len(cleanup_errors) == 1:
+                raise cleanup_errors[0]
+            raise BaseExceptionGroup("Failed to clean FTP copytree backups", cleanup_errors)
 
     @override
     @translator.wrap("Failed to copy tree {src} → {dst} (overwrite={overwrite})")

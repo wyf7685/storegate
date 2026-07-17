@@ -81,3 +81,33 @@ class TestCacheInvalidation:
             await cached.delete(dst)
             with contextlib.suppress(Exception):
                 await cached.delete(src)
+
+    @pytest.mark.parametrize("operation", ["copytree", "movetree"])
+    async def test_tree_failure_invalidates_partial_mutation_cache(
+        self, cached: CachedStorage, monkeypatch: pytest.MonkeyPatch, operation: str
+    ) -> None:
+        src = f"test-inv-tree-src-{uid()}"
+        dst = f"test-inv-tree-dst-{uid()}"
+        try:
+            await cached.upload_bytes(b"source", f"{src}/file.txt")
+            await cached.upload_bytes(b"old", f"{dst}/file.txt")
+            await cached.stat(f"{src}/file.txt")
+            await cached.stat(f"{dst}/file.txt")
+            await cached.download_bytes(f"{dst}/file.txt")
+
+            async def partial_failure(_src: str, _dst: str, *, overwrite: bool = True) -> None:
+                _ = overwrite
+                await cached._storage.upload_bytes(b"partial", f"{dst}/file.txt", overwrite=True)
+                raise OSError("injected tree failure")
+
+            monkeypatch.setattr(cached._storage, operation, partial_failure)
+            with pytest.raises(OSError, match="injected tree failure"):
+                await getattr(cached, operation)(src, dst)
+
+            snapshot = cached.dump_cache()
+            for namespace in ("exists", "is_file", "is_dir", "stat", "download", "iterdir"):
+                assert not snapshot.get(namespace, {})
+            assert await cached.download_bytes(f"{dst}/file.txt") == b"partial"
+        finally:
+            await cached.rmtree(src)
+            await cached.rmtree(dst)

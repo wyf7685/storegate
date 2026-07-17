@@ -1,4 +1,3 @@
-import contextlib
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from pathlib import Path, PurePosixPath
@@ -610,25 +609,77 @@ class DavStorage(AbstractStorage):
             await self.rmtree(src)
 
     async def _copytree_fallback(self, src_np: PurePosixPath, dst_np: PurePosixPath, overwrite: bool) -> None:
-        """Walk-and-copy fallback for servers without recursive COPY."""
-        try:
-            await self.mkdir(dst_np.as_posix(), parents=True, exist_ok=overwrite)
-            async for sp, sd, sf in self.walk(src_np):
-                rel = PurePosixPath(sp).relative_to(src_np)
-                dst_dir = dst_np if rel == PurePosixPath(".") else dst_np / rel
-                for d in sd:
-                    await self.mkdir((dst_dir / d.name).as_posix(), exist_ok=True)
-                for f in sf:
-                    await self.copy(PurePosixPath(f.path).as_posix(), (dst_dir / f.name).as_posix())
-        except Exception as exc:
-            self.log.error(  # noqa: TRY400
-                f"Failed to copy tree: <y>{escape_tag(src_np.as_posix())}</y>"
-                f" → <y>{escape_tag(dst_np.as_posix())}</y> — <r>{escape_tag(repr(exc))}</r>"
-            )
+        """Walk-and-copy fallback with per-target destination backups."""
+        client = self._ensure_client()
+        _ = overwrite
+        backups: dict[PurePosixPath, PurePosixPath] = {}
+        created: set[PurePosixPath] = set()
+        created_dirs: set[PurePosixPath] = set()
+
+        async def stage_target(path: PurePosixPath) -> None:
+            if path in backups or path in created:
+                return
             try:
-                with anyio.CancelScope(shield=True):
-                    with contextlib.suppress(Exception):
-                        await self.rmtree(dst_np)
-            except Exception:
-                self.log.exception(f"Failed to rollback destination: <y>{escape_tag(dst_np.as_posix())}</y>")
-            raise OSError(f"Failed to copy tree: {src_np} → {dst_np}") from exc
+                info = await self.stat(path)
+            except FileNotFoundError:
+                created.add(path)
+                return
+            if info.is_dir:
+                return
+            backup = PurePosixPath(f"{path.as_posix()}.storegate-copytree-backup-{uuid.uuid4().hex}")
+            await client.move(self._remote_path(path), self._remote_path(backup), overwrite=False)
+            backups[path] = backup
+
+        try:
+            if not await self.exists(dst_np):
+                await self.mkdir(dst_np.as_posix(), parents=True, exist_ok=False)
+                created_dirs.add(dst_np)
+            async for current, directories, files in self.walk(src_np):
+                relative = PurePosixPath(current).relative_to(src_np)
+                target_dir = dst_np if relative == PurePosixPath(".") else dst_np / relative
+                for directory in directories:
+                    target = target_dir / directory.name
+                    if not await self.exists(target):
+                        await self.mkdir(target.as_posix(), parents=True, exist_ok=False)
+                        created_dirs.add(target)
+                for file in files:
+                    target = target_dir / file.name
+                    await stage_target(target)
+                    await self.copy(PurePosixPath(file.path).as_posix(), target.as_posix(), overwrite=True)
+        except BaseException as primary:
+            rollback_errors: list[BaseException] = []
+            with anyio.CancelScope(shield=True):
+                for path in created:
+                    try:
+                        await self.unlink(path, missing_ok=True)
+                    except BaseException as error:
+                        rollback_errors.append(error)
+                for path, backup in backups.items():
+                    try:
+                        await client.move(self._remote_path(backup), self._remote_path(path), overwrite=True)
+                    except BaseException as error:
+                        rollback_errors.append(error)
+                for directory in sorted(created_dirs, key=lambda path: len(path.parts), reverse=True):
+                    try:
+                        await self.rmdir(directory)
+                    except BaseException as error:
+                        rollback_errors.append(error)
+            if rollback_errors:
+                if isinstance(primary, Exception) and all(isinstance(error, Exception) for error in rollback_errors):
+                    raise BaseExceptionGroup(
+                        "Failed to copy tree and restore destination", [primary, *rollback_errors]
+                    ) from None
+                if isinstance(rollback_errors[0], anyio.get_cancelled_exc_class()):
+                    raise
+            raise OSError(f"Failed to copy tree: {src_np} → {dst_np}") from primary
+        cleanup_errors: list[BaseException] = []
+        with anyio.CancelScope(shield=True):
+            for backup in backups.values():
+                try:
+                    await self.unlink(backup)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+        if cleanup_errors:
+            if len(cleanup_errors) == 1:
+                raise cleanup_errors[0]
+            raise BaseExceptionGroup("Failed to clean copytree backups", cleanup_errors)

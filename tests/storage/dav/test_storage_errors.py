@@ -10,6 +10,7 @@ from pytest_mock import MockerFixture
 from app.storage.abstract import FileInfo
 from app.storage.dav import DavStorage
 from app.storage.dav.client.errors import DavHttpStatusError
+from app.utils import flatten_exception_group
 
 
 @pytest.fixture
@@ -419,19 +420,78 @@ class TestMovetreeFallback:
 
 
 class TestCopytreeFallbackRollback:
-    async def test_failure_rolls_back_destination(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
+    async def test_failure_restores_overwritten_destination(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        state = {"src/a.txt": b"new", "dst/a.txt": b"old", "dst/keep.txt": b"keep"}
+
         async def walk(_path: PurePosixPath) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
-            yield "/src", [FileInfo(path="/src/sub", name="sub", is_dir=True)], []
+            yield "/src", [], [FileInfo(path="/src/a.txt", name="a.txt", is_dir=False)]
+            yield "/src/sub", [], [FileInfo(path="/src/sub/b.txt", name="b.txt", is_dir=False)]
+
+        async def stat(path: str | PurePosixPath) -> FileInfo:
+            key = str(path).lstrip("/")
+            if key not in state:
+                raise FileNotFoundError(key)
+            return FileInfo(path=f"/{key}", name=PurePosixPath(key).name, is_dir=False)
+
+        async def exists(path: str | PurePosixPath) -> bool:
+            return str(path).lstrip("/") in state or str(path).rstrip("/") in {"/dst", "dst"}
+
+        async def mkdir(_path: str, *, parents: bool = False, exist_ok: bool = False) -> None:
+            _ = parents, exist_ok
+
+        async def copy(source: str, destination: str, *, overwrite: bool = True) -> None:
+            _ = overwrite
+            source_key = source.lstrip("/")
+            destination_key = destination.lstrip("/")
+            if source_key.endswith("b.txt"):
+                raise OSError("injected second copy failure")
+            state[destination_key] = state[source_key]
+
+        async def unlink(path: PurePosixPath, *, missing_ok: bool = False) -> None:
+            _ = missing_ok
+            state.pop(path.as_posix().lstrip("/"), None)
+
+        async def move(source: str, destination: str, *, overwrite: bool = True) -> None:
+            _ = overwrite
+            state[destination] = state.pop(source)
 
         mocker.patch.object(dav_mocked, "walk", new=walk)
-        mocker.patch.object(
-            dav_mocked,
-            "mkdir",
-            new=AsyncMock(side_effect=[None, OSError("injected mkdir failure")]),
-        )
-        rmtree_mock = mocker.patch.object(dav_mocked, "rmtree", new=AsyncMock())
+        mocker.patch.object(dav_mocked, "stat", new=stat)
+        mocker.patch.object(dav_mocked, "exists", new=exists)
+        mocker.patch.object(dav_mocked, "mkdir", new=mkdir)
+        mocker.patch.object(dav_mocked, "copy", new=copy)
+        mocker.patch.object(dav_mocked, "unlink", new=unlink)
+        mocker.patch.object(dav_mocked._client, "move", new=AsyncMock(side_effect=move))
 
         with pytest.raises(OSError, match="Failed to copy tree"):
             await dav_mocked._copytree_fallback(PurePosixPath("/src"), PurePosixPath("/dst"), overwrite=True)
 
-        rmtree_mock.assert_awaited_once_with(PurePosixPath("/dst"))
+        assert state["dst/a.txt"] == b"old"
+        assert state["dst/keep.txt"] == b"keep"
+
+    async def test_restore_failure_is_grouped(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
+        async def walk(_path: PurePosixPath) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+            yield "/src", [], [FileInfo(path="/src/a.txt", name="a.txt", is_dir=False)]
+            yield "/src/sub", [], [FileInfo(path="/src/sub/b.txt", name="b.txt", is_dir=False)]
+
+        mocker.patch.object(dav_mocked, "walk", new=walk)
+
+        async def stat(path: str | PurePosixPath) -> FileInfo:
+            if str(path).endswith("a.txt"):
+                return FileInfo(path="/dst/a.txt", name="a.txt", is_dir=False)
+            raise FileNotFoundError(str(path))
+
+        mocker.patch.object(dav_mocked, "stat", new=stat)
+        mocker.patch.object(dav_mocked, "exists", new=AsyncMock(return_value=True))
+        mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        mocker.patch.object(dav_mocked, "copy", new=AsyncMock(side_effect=[None, OSError("copy failed")]))
+        mocker.patch.object(dav_mocked, "unlink", new=AsyncMock())
+        mocker.patch.object(dav_mocked._client, "move", new=AsyncMock(side_effect=[None, OSError("restore failed")]))
+
+        with pytest.raises(BaseExceptionGroup) as caught:
+            await dav_mocked._copytree_fallback(PurePosixPath("/src"), PurePosixPath("/dst"), overwrite=True)
+        flattened = list(flatten_exception_group(caught.value))
+        assert "copy failed" in str(flattened[0])
+        assert "restore failed" in str(flattened[1])

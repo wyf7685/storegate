@@ -133,6 +133,43 @@ class TestCopyAndTrees:
             monkeypatch.setattr(FTPStorage, "_copy_stream", original)
             await ftp_storage.rmtree(base)
 
+    async def test_copytree_failure_restores_overwritten_files(
+        self,
+        ftp_storage: FTPStorage,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        base = f"/ftp-rollback-overwrite-{uid()}"
+        source = PurePosixPath(base, "source")
+        destination = PurePosixPath(base, "destination")
+        await ftp_storage.upload_bytes(b"new-a", source / "a.txt")
+        await ftp_storage.upload_bytes(b"new-b", source / "b.txt")
+        await ftp_storage.upload_bytes(b"old-a", destination / "a.txt")
+        await ftp_storage.upload_bytes(b"old-b", destination / "b.txt")
+        original = FTPStorage._copy_stream
+
+        async def fail_second_copy(
+            self: FTPStorage,
+            source_client: aioftp.Client,
+            destination_client: aioftp.Client,
+            source_path: PurePosixPath,
+            destination_path: PurePosixPath,
+        ) -> None:
+            if source_path.name == "b.txt":
+                raise OSError("injected overwrite copy failure")
+            await original(self, source_client, destination_client, source_path, destination_path)
+
+        monkeypatch.setattr(FTPStorage, "_copy_stream", fail_second_copy)
+        try:
+            with pytest.raises(OSError, match="injected overwrite copy failure"):
+                await ftp_storage.copytree(source, destination, overwrite=True)
+            assert await ftp_storage.download_bytes(destination / "a.txt") == b"old-a"
+            assert await ftp_storage.download_bytes(destination / "b.txt") == b"old-b"
+            assert await ftp_storage.download_bytes(source / "a.txt") == b"new-a"
+            assert await ftp_storage.download_bytes(source / "b.txt") == b"new-b"
+        finally:
+            monkeypatch.setattr(FTPStorage, "_copy_stream", original)
+            await ftp_storage.rmtree(base)
+
     async def test_move_rename_mutates_then_raises_restores_paths(
         self, ftp_storage: FTPStorage, monkeypatch: pytest.MonkeyPatch
     ) -> None:

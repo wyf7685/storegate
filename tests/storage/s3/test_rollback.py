@@ -104,24 +104,23 @@ class TestMoveRollback:
         assert copy_calls == [("dst.txt", backup_key), (backup_key, "dst.txt")]
         assert deleted_keys == ["src.txt", backup_key]
 
-    async def test_rollback_itself_fails_still_raises(self, s3_mocked: S3Storage, mocker: MockerFixture):
-        """When both delete_object(src) and rollback delete_object(dst) fail, still raises."""
-        s = s3_mocked
-        src = "/src.txt"
-        dst = "/dst.txt"
+    async def test_delete_source_and_rollback_failure_are_grouped(
+        self, s3_mocked: S3Storage, mocker: MockerFixture
+    ) -> None:
+        storage = s3_mocked
+        mocker.patch.object(storage, "copy", new=AsyncMock())
+        mocker.patch.object(storage._client, "head_object", new=AsyncMock(return_value=None))
+        mocker.patch.object(storage._client, "put_object_copy", new=AsyncMock())
 
-        mocker.patch.object(s, "copy", new=AsyncMock())
-        mocker.patch.object(s._client, "head_object", new=AsyncMock(return_value=None))
+        async def delete(key: str) -> None:
+            raise OSError(f"delete failed: {key}")
 
-        async def _delete(key: str) -> None:
-            raise S3HttpStatusError("DELETE", key, 500, "always-fails")
-
-        mock_delete = mocker.patch.object(s._client, "delete_object", side_effect=_delete)
-
-        with pytest.raises(OSError, match="Failed to delete source after move"):
-            await s.move(src, dst)
-
-        assert mock_delete.call_count == 2
+        mocker.patch.object(storage._client, "delete_object", side_effect=delete)
+        with pytest.raises(BaseExceptionGroup) as caught:
+            await storage.move("/src.txt", "/dst.txt")
+        flattened = list(flatten_exception_group(caught.value))
+        assert "Failed to delete source after move" in str(flattened[0])
+        assert "delete failed: dst.txt" in str(flattened[1])
 
 
 # ---------------------------------------------------------------------------

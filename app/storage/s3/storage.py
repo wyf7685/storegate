@@ -293,25 +293,40 @@ class S3Storage(AbstractStorage):
         *,
         copy_completed: bool,
     ) -> None:
-        """Restore a move's source and destination without losing an overwritten file."""
+        """Restore a move's source and destination, preserving rollback failures."""
+        failures: list[BaseException] = []
         with anyio.CancelScope(shield=True):
             if copy_completed:
                 try:
                     if await client.head_object(key=src_key) is None:
                         await client.put_object_copy(dst_key, src_key)
-                except BaseException:
-                    self.log.exception(f"Failed to restore move source after rollback: {src_key}")
+                except BaseException as error:
+                    failures.append(error)
             try:
                 if backup_key is not None:
                     await client.put_object_copy(backup_key, dst_key)
                     await client.delete_object(key=backup_key)
                 elif copy_completed:
                     await client.delete_object(key=dst_key)
-            except BaseException:
-                self.log.exception(f"Failed to restore move destination after rollback: {dst_key}")
+            except BaseException as error:
+                failures.append(error)
+        if not failures:
+            return
+        if len(failures) == 1:
+            raise failures[0]
+        raise BaseExceptionGroup("Failed to roll back move destination", failures)
+
+    @staticmethod
+    def _raise_move_failure(primary: BaseException, rollback_error: BaseException | None) -> None:
+        if rollback_error is None:
+            raise primary
+        if isinstance(primary, Exception) and isinstance(rollback_error, Exception):
+            raise BaseExceptionGroup("Move and rollback failed", [primary, rollback_error]) from None
+        if isinstance(rollback_error, anyio.get_cancelled_exc_class()):
+            raise rollback_error
+        raise primary
 
     @override
-    @translator.wrap("Failed to move {src} → {dst}")
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         if self._remote_path_to_key(src) == self._remote_path_to_key(dst):
             if not overwrite:
@@ -340,16 +355,26 @@ class S3Storage(AbstractStorage):
 
         try:
             await self.copy(src, dst, overwrite=overwrite)
-        except BaseException:
+        except BaseException as primary:
+            rollback_error: BaseException | None = None
             if backup_key is not None:
-                await self._rollback_move_destination(client, src_key, dst_key, backup_key, copy_completed=False)
-            raise
+                try:
+                    await self._rollback_move_destination(client, src_key, dst_key, backup_key, copy_completed=False)
+                except BaseException as error:
+                    rollback_error = error
+            self._raise_move_failure(primary, rollback_error)
 
         try:
             await client.delete_object(key=src_key)
-        except BaseException as exc:
-            await self._rollback_move_destination(client, src_key, dst_key, backup_key, copy_completed=True)
-            raise OSError(f"Failed to delete source after move: {src}") from exc
+        except BaseException as error:
+            rollback_error: BaseException | None = None
+            try:
+                await self._rollback_move_destination(client, src_key, dst_key, backup_key, copy_completed=True)
+            except BaseException as rollback_failure:
+                rollback_error = rollback_failure
+            primary = OSError(f"Failed to delete source after move: {src}")
+            primary.__cause__ = error
+            self._raise_move_failure(primary, rollback_error)
 
         if backup_key is not None:
             with anyio.CancelScope(shield=True):
