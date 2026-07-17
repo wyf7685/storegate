@@ -1,15 +1,12 @@
-import asyncio
 import contextlib
 import dataclasses
 import functools
 import hashlib
-import json
 import math
-import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, Iterable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import ClassVar, final, override
+from typing import NoReturn, final, override
 
 import anyio
 import anyio.lowlevel
@@ -19,6 +16,8 @@ from pydantic import BaseModel, ValidationError
 from app.log import escape_tag
 
 from ..abstract import AbstractStorage, BytesLike, FileInfo, PathLike, make_cache_identity
+from .lock import LockLease, StorageFileLocker
+from .ref import ChunkRefManager, hash_to_path
 
 BLOCK_SIZE = 64 * 1024 * 1024  # 64 MB
 MAX_CONCURRENT_UPLOADS = 2
@@ -28,29 +27,6 @@ DEFAULT_LOCK_TIMEOUT = 30.0
 DEFAULT_LOCK_LEASE = 300.0
 
 
-class LockLeaseLostError(RuntimeError):
-    """Raised when an active IndexStorage lock can no longer prove ownership."""
-
-
-@dataclasses.dataclass(slots=True)
-class _LocalLockGuard:
-    lock: anyio.Lock = dataclasses.field(default_factory=anyio.Lock)
-    references: int = 0
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class _LockLease:
-    owner: str
-    expires: datetime
-    storage: AbstractStorage
-    path: PathLike
-
-
-def hash_to_path(hash_str: str, suffix: str | None = None) -> str:
-    """Convert a hash string to a path with subdirectories."""
-    return f"{hash_str[:2]}/{hash_str[2:6]}/{hash_str[6:]}{f".{suffix}" if suffix else ""}"
-
-
 class FileMeta(BaseModel):
     info: FileInfo
     chunks: list[str]
@@ -58,14 +34,8 @@ class FileMeta(BaseModel):
 
 @final
 class IndexStorage(AbstractStorage):
-    _local_lock_guards: ClassVar[dict[str, _LocalLockGuard]] = {}
     _index: AbstractStorage
     _chunks: AbstractStorage
-    _block_size: int
-    _max_concurrent_uploads: int
-    _skip_locking: bool
-    _lock_timeout: float
-    _lock_lease: float
 
     def __init__(
         self,
@@ -91,14 +61,23 @@ class IndexStorage(AbstractStorage):
             raise ValueError("lock_timeout must be finite and greater than zero")
         if not isinstance(lock_lease, (int, float)) or not math.isfinite(lock_lease) or lock_lease < MIN_LOCK_LEASE:
             raise ValueError(f"lock_lease must be finite and at least {MIN_LOCK_LEASE}")
+
         super().__init__()
         self._index = index
         self._chunks = chunks
         self._block_size = block_size
         self._max_concurrent_uploads = max_concurrent_uploads
-        self._skip_locking = skip_locking
-        self._lock_timeout = lock_timeout
-        self._lock_lease = lock_lease
+        self._locker = StorageFileLocker(
+            self,
+            lock_timeout=lock_timeout,
+            lock_lease=lock_lease,
+            skip_locking=skip_locking,
+        )
+        self._refs = ChunkRefManager(
+            storage=self,
+            chunks=chunks,
+            lock_chunk=self._lock_chunk,
+        )
         self._pending_rollback: list[AbstractStorage] = []
 
     @property
@@ -139,7 +118,7 @@ class IndexStorage(AbstractStorage):
                 existing = None
             if existing is None:
                 await chunks.upload_bytes(index.id.encode(), CHUNKS_INDEX_FILE, overwrite=False)
-                self.log.debug(f"Registered chunks storage <c>{chunks.id}</c> → index <c>{index.id}</c>")
+                self.log.success(f"Registered chunks storage <c>{chunks.id}</c> → index <c>{index.id}</c>")
             elif existing != index.id:
                 self.log.error(
                     f"Chunks storage <c>{chunks.id}</c> is already associated with "
@@ -200,280 +179,60 @@ class IndexStorage(AbstractStorage):
         return await self._index.ping() and await self._chunks.ping()
 
     @contextlib.asynccontextmanager
-    async def _local_lock_guard(self, key: str) -> AsyncGenerator[None]:
-        registry = IndexStorage._local_lock_guards
-        entry = registry.get(key)
-        if entry is None:
-            entry = _LocalLockGuard()
-            registry[key] = entry
-        entry.references += 1
-        acquired = False
-        try:
-            await entry.lock.acquire()
-            acquired = True
-            yield
-        finally:
-            if acquired:
-                entry.lock.release()
-            entry.references -= 1
-            if entry.references == 0 and registry.get(key) is entry:
-                del registry[key]
-
-    async def _release_storage_file_lock_locked(
-        self, storage: AbstractStorage, lock_path: PathLike, lease: _LockLease
-    ) -> None:
-        try:
-            current = await storage.download_bytes(lock_path)
-            data = json.loads(current.decode())
-            if data.get("owner") != lease.owner:
-                self.log.warning(f"Lock <y>{escape_tag(lock_path)}</y> owner changed; leaving it intact")
-                return
-            # The storage contract has no conditional delete. Re-reading immediately before
-            # unlink minimizes the takeover race, but another process can still replace the
-            # lock after this check and before unlink.
-            if await storage.download_bytes(lock_path) != current:
-                self.log.warning(f"Lock <y>{escape_tag(lock_path)}</y> changed; leaving it intact")
-                return
-            await storage.unlink(lock_path, missing_ok=True)
-            self.log.trace(f"Lock <y>{escape_tag(lock_path)}</y> released")
-        except FileNotFoundError, KeyError, TypeError, ValueError, UnicodeDecodeError:
-            return
-
-    def _renewal_validity(self) -> float:
-        """Leave a scheduler-safe validity window for one bounded renewal probe."""
-        return max(self._lock_lease + (2 * self._lock_timeout), 0.5)
-
-    async def _renew_storage_file_lock(self, lease: _LockLease) -> None:
-        interval = self._lock_lease / 3
-        key = f"{lease.storage.id}:{lease.storage.normalize_path(lease.path)}"
-        while True:
-            try:
-                with anyio.fail_after(self._lock_timeout):
-                    async with self._local_lock_guard(key):
-                        current = await lease.storage.download_bytes(lease.path)
-                        data = json.loads(current.decode())
-                        if data.get("owner") != lease.owner:
-                            raise LockLeaseLostError(f"Storage lock ownership lost during renewal: {lease.path}")
-                        now = datetime.now(UTC)
-                        if now >= lease.expires:
-                            raise LockLeaseLostError(f"Storage lock lease expired before renewal: {lease.path}")
-                        expires = now + timedelta(seconds=self._renewal_validity())
-                        data["expires"] = expires.isoformat()
-                        payload = json.dumps(data, separators=(",", ":")).encode()
-                        # A second read is the best ownership proof available without CAS.
-                        if await lease.storage.download_bytes(lease.path) != current:
-                            raise LockLeaseLostError(f"Storage lock ownership changed during renewal: {lease.path}")
-                        await lease.storage.upload_bytes(payload, lease.path, overwrite=True)
-                        lease = dataclasses.replace(lease, expires=expires)
-            except TimeoutError:
-                if datetime.now(UTC) >= lease.expires:
-                    raise LockLeaseLostError(f"Storage lock renewal probe timed out: {lease.path}") from None
-                await anyio.lowlevel.checkpoint()
-                continue
-            except (FileNotFoundError, KeyError, TypeError, ValueError, UnicodeDecodeError) as error:
-                raise LockLeaseLostError(f"Storage lock ownership lost during renewal: {lease.path}") from error
-            await anyio.sleep(interval)
-
-    @contextlib.asynccontextmanager
-    async def _renewing_locks(self, leases: Iterable[_LockLease | None]) -> AsyncGenerator[None]:
-        try:
-            tasks: set[asyncio.Task] = set()
-            for lease in leases:
-                if lease is not None:
-                    tasks.add(asyncio.create_task(self._renew_storage_file_lock(lease)))
-            try:
-                yield
-            finally:
-                for task in tasks:
-                    if task.done():
-                        task.result()  # Propagate any exception raised during renewal
-                    else:
-                        task.cancel()
-        except BaseExceptionGroup as group:
-            error: BaseException = group
-            while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
-                error = error.exceptions[0]
-            if error is group:
-                raise
-            raise error from group
-
-    async def _acquire_storage_file_lock(self, storage: AbstractStorage, lock_path: PathLike) -> _LockLease | None:
-        _colored_path = f"<y>{escape_tag(lock_path)}</y>"
-        if self._skip_locking:
-            self.log.trace(f"Lock {_colored_path} disabled, skipping ...")
-            return None
-
-        key = f"{storage.id}:{storage.normalize_path(lock_path)}"
-        deadline = anyio.current_time() + self._lock_timeout
-        while True:
-            remaining = deadline - anyio.current_time()
-            if remaining <= 0:
-                raise TimeoutError(f"Timed out waiting for storage lock: {lock_path}")
-            lease: _LockLease | None = None
-            try:
-                with anyio.fail_after(remaining):
-                    async with self._local_lock_guard(key):
-                        if not await storage.exists(lock_path):
-                            owner = uuid.uuid4().hex
-                            handoff_timeout = deadline - anyio.current_time()
-                            if handoff_timeout <= 0:
-                                raise TimeoutError
-                            now = datetime.now(UTC)
-                            # A backend may commit before its upload call returns. Cover its
-                            # bounded handoff plus one lease and renewal probe budget.
-                            expires = now + timedelta(seconds=handoff_timeout + self._renewal_validity())
-                            lease = _LockLease(owner, expires, storage, lock_path)
-                            payload = json.dumps(
-                                {"owner": owner, "created": now.isoformat(), "expires": expires.isoformat()},
-                                separators=(",", ":"),
-                            ).encode()
-                            try:
-                                # This shield protects the post-commit handoff from external
-                                # cancellation without extending the acquisition deadline.
-                                with anyio.fail_after(handoff_timeout, shield=True):
-                                    await storage.upload_bytes(payload, lock_path, overwrite=False)
-                            except FileExistsError:
-                                lease = None
-                            if lease is not None:
-                                await anyio.lowlevel.checkpoint()
-                                self.log.trace(f"Lock {_colored_path} acquired")
-                                return lease
-                        else:
-                            try:
-                                lock_bytes = await storage.download_bytes(lock_path)
-                            except FileNotFoundError:
-                                lock_bytes = None
-                            if lock_bytes is not None:
-                                try:
-                                    lock_data = json.loads(lock_bytes.decode())
-                                    stale = datetime.fromisoformat(lock_data["expires"]) <= datetime.now(UTC)
-                                except KeyError, TypeError, ValueError, UnicodeDecodeError:
-                                    try:
-                                        info = await storage.stat(lock_path)
-                                        stale = (
-                                            info.modified is not None
-                                            and (datetime.now(UTC) - info.modified).total_seconds() >= self._lock_lease
-                                        )
-                                    except FileNotFoundError:
-                                        stale = False
-                                if stale:
-                                    # The equality check narrows, but cannot eliminate, the
-                                    # final cross-process replace-before-unlink race without CAS.
-                                    try:
-                                        if await storage.download_bytes(lock_path) == lock_bytes:
-                                            await storage.unlink(lock_path, missing_ok=True)
-                                    except FileNotFoundError:
-                                        pass
-                                    continue
-            except BaseException as error:
-                if lease is not None:
-                    try:
-                        await self._release_storage_file_lock(storage, lock_path, lease)
-                    except BaseException as cleanup_error:
-                        self.log.warning(
-                            f"Failed to clean up uncertain lock <y>{escape_tag(lock_path)}</y>: {cleanup_error!r}"
-                        )
-                if isinstance(error, TimeoutError):
-                    raise TimeoutError(f"Timed out waiting for storage lock: {lock_path}") from error
-                raise
-
-            remaining = deadline - anyio.current_time()
-            if remaining <= 0:
-                raise TimeoutError(f"Timed out waiting for storage lock: {lock_path}")
-            await anyio.sleep(min(0.1, remaining))
-
-    async def _release_storage_file_lock(
-        self, storage: AbstractStorage, lock_path: PathLike, lease: _LockLease | None
-    ) -> None:
-        if self._skip_locking or lease is None:
-            return
-        key = f"{storage.id}:{storage.normalize_path(lock_path)}"
-        try:
-            with anyio.fail_after(self._lock_timeout, shield=True):
-                async with self._local_lock_guard(key):
-                    await self._release_storage_file_lock_locked(storage, lock_path, lease)
-        except TimeoutError as error:
-            raise TimeoutError(f"Timed out releasing storage lock: {lock_path}") from error
-
-    async def _release_storage_file_locks(
-        self,
-        storage: AbstractStorage,
-        leases: Iterable[tuple[PathLike, _LockLease | None]],
-        *,
-        suppress_errors: bool,
-    ) -> None:
-        failures: list[tuple[PathLike, BaseException]] = []
-        with anyio.CancelScope(shield=True):
-            for lock_path, lease in leases:
-                try:
-                    await self._release_storage_file_lock(storage, lock_path, lease)
-                except BaseException as error:
-                    failures.append((lock_path, error))
-        if not failures:
-            return
-        if suppress_errors:
-            for lock_path, error in failures:
-                self.log.warning(f"Failed to clean up storage lock <y>{escape_tag(lock_path)}</y>: {error!r}")
-            return
-        if len(failures) == 1:
-            raise failures[0][1]
-        raise BaseExceptionGroup("Failed to release storage locks", [error for _, error in failures])
-
-    @contextlib.asynccontextmanager
     async def _lock_index(self, index_path: PathLike) -> AsyncGenerator[None]:
         lock_path = f"{index_path}.lock"
-        lease = await self._acquire_storage_file_lock(self._index, lock_path)
+        lease = await self._locker.acquire_lock(self._index, lock_path)
         try:
-            async with self._renewing_locks([lease]):
+            async with self._locker.renewing_locks([lease]):
                 yield
         except BaseException:
-            await self._release_storage_file_locks(self._index, [(lock_path, lease)], suppress_errors=True)
+            await self._locker.release_locks(self._index, [(lock_path, lease)], suppress_errors=True)
             raise
         else:
-            await self._release_storage_file_locks(self._index, [(lock_path, lease)], suppress_errors=False)
+            await self._locker.release_locks(self._index, [(lock_path, lease)], suppress_errors=False)
 
     @contextlib.asynccontextmanager
     async def _lock_chunk(self, chunk_hash: str) -> AsyncGenerator[None]:
         lock_path = hash_to_path(chunk_hash, "lock")
-        lease = await self._acquire_storage_file_lock(self._chunks, lock_path)
+        lease = await self._locker.acquire_lock(self._chunks, lock_path)
         try:
-            async with self._renewing_locks([lease]):
+            async with self._locker.renewing_locks([lease]):
                 yield
         except BaseException:
-            await self._release_storage_file_locks(self._chunks, [(lock_path, lease)], suppress_errors=True)
+            await self._locker.release_locks(self._chunks, [(lock_path, lease)], suppress_errors=True)
             raise
         else:
-            await self._release_storage_file_locks(self._chunks, [(lock_path, lease)], suppress_errors=False)
+            await self._locker.release_locks(self._chunks, [(lock_path, lease)], suppress_errors=False)
 
     @contextlib.asynccontextmanager
     async def _lock_indexes(self, *index_paths: PathLike) -> AsyncGenerator[None]:
         lock_paths = [f"{index_path}.lock" for index_path in sorted(set(index_paths))]
-        leases: list[tuple[PathLike, _LockLease | None]] = []
+        leases: list[tuple[PathLike, LockLease | None]] = []
         try:
             for lock_path in lock_paths:
-                leases.append((lock_path, await self._acquire_storage_file_lock(self._index, lock_path)))  # noqa: PERF401
-            async with self._renewing_locks(lease for _, lease in leases):
+                leases.append((lock_path, await self._locker.acquire_lock(self._index, lock_path)))  # noqa: PERF401
+            async with self._locker.renewing_locks(lease for _, lease in leases):
                 yield
         except BaseException:
-            await self._release_storage_file_locks(self._index, reversed(leases), suppress_errors=True)
+            await self._locker.release_locks(self._index, reversed(leases), suppress_errors=True)
             raise
         else:
-            await self._release_storage_file_locks(self._index, reversed(leases), suppress_errors=False)
+            await self._locker.release_locks(self._index, reversed(leases), suppress_errors=False)
 
     @contextlib.asynccontextmanager
     async def _lock_chunks(self, chunk_hashes: Iterable[str]) -> AsyncGenerator[None]:
         lock_paths = [hash_to_path(chunk_hash, "lock") for chunk_hash in sorted(set(chunk_hashes))]
-        leases: list[tuple[PathLike, _LockLease | None]] = []
+        leases: list[tuple[PathLike, LockLease | None]] = []
         try:
             for lock_path in lock_paths:
-                leases.append((lock_path, await self._acquire_storage_file_lock(self._chunks, lock_path)))  # noqa: PERF401
-            async with self._renewing_locks(lease for _, lease in leases):
+                leases.append((lock_path, await self._locker.acquire_lock(self._chunks, lock_path)))  # noqa: PERF401
+            async with self._locker.renewing_locks(lease for _, lease in leases):
                 yield
         except BaseException:
-            await self._release_storage_file_locks(self._chunks, reversed(leases), suppress_errors=True)
+            await self._locker.release_locks(self._chunks, reversed(leases), suppress_errors=True)
             raise
         else:
-            await self._release_storage_file_locks(self._chunks, reversed(leases), suppress_errors=False)
+            await self._locker.release_locks(self._chunks, reversed(leases), suppress_errors=False)
 
     async def _get_file_meta(self, path: PathLike) -> FileMeta | None:
         try:
@@ -486,157 +245,6 @@ class IndexStorage(AbstractStorage):
             return FileMeta.model_validate_json(meta_bytes.decode())
         except ValidationError as e:
             raise OSError(f"Corrupted file metadata for {path}") from e
-
-    async def _chunk_load_refs(self, chunk_hash: str) -> set[str] | None:
-        ref_path = hash_to_path(chunk_hash, "ref")
-        try:
-            ref_bytes = await self._chunks.download_bytes(ref_path)
-        except FileNotFoundError:
-            return None
-        return set(ref_bytes.decode().splitlines())
-
-    async def _chunk_incref(self, chunk_hash: str, *remote_path: PathLike) -> None:
-        ref_path = hash_to_path(chunk_hash, "ref")
-        _colored_hash = f"<c>{chunk_hash[:8]}</c>"
-        _colored_remote_paths = ", ".join(f"<i>{escape_tag(p)}</i>" for p in remote_path)
-
-        refs: set[str] = await self._chunk_load_refs(chunk_hash) or set()
-
-        refs.update(self.normalize_path(p).as_posix() for p in remote_path)
-        await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
-        self.log.debug(f"Chunk {_colored_hash} +ref → <g>{len(refs)}</g> ({_colored_remote_paths})")
-
-    async def _chunk_decref(self, chunk_hash: str, *remote_path: PathLike) -> None:
-        ref_path = hash_to_path(chunk_hash, "ref")
-        _colored_hash = f"<c>{chunk_hash[:8]}</c>"
-        _colored_remote_paths = ", ".join(f"<i>{escape_tag(p)}</i>" for p in remote_path)
-
-        refs = await self._chunk_load_refs(chunk_hash)
-        if refs is None:
-            self.log.warning(f"Chunk {_colored_hash} ref file missing, skip decref ({_colored_remote_paths})")
-            return
-
-        removed = False
-        for p in remote_path:
-            p = self.normalize_path(p).as_posix()
-            if p in refs:
-                refs.remove(p)
-                removed = True
-            else:
-                self.log.warning(f"Chunk {_colored_hash} ref entry not found for <i>{escape_tag(p)}</i>, skip decref")
-
-        if refs:
-            if removed:
-                await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
-                self.log.debug(f"Chunk {_colored_hash} -ref → <g>{len(refs)}</g> (<i>{_colored_remote_paths}</i>)")
-            else:
-                self.log.debug(f"Chunk {_colored_hash} -ref no change (<i>{_colored_remote_paths}</i>)")
-        else:
-            await self._chunks.unlink(ref_path, missing_ok=True)
-            await self._chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
-            self.log.debug(f"Chunk {_colored_hash} ref=0, deleted data (<i>{_colored_remote_paths}</i>)")
-
-    async def _chunk_transref(
-        self,
-        chunk_hash: str,
-        *pairs: tuple[PathLike, PathLike],
-        missing_ok: bool = False,
-    ) -> None:
-        ref_path = hash_to_path(chunk_hash, "ref")
-        _colored_hash = f"<c>{chunk_hash[:8]}</c>"
-
-        refs: set[str] | None = await self._chunk_load_refs(chunk_hash)
-        if refs is None:
-            if not missing_ok:
-                raise FileNotFoundError(f"Chunk {chunk_hash} ref file missing for transref")
-            refs = set()
-
-        for src_path, dst_path in pairs:
-            src_path = self.normalize_path(src_path).as_posix()
-            dst_path = self.normalize_path(dst_path).as_posix()
-            if src_path not in refs:
-                if missing_ok:
-                    self.log.warning(
-                        f"Chunk {_colored_hash} ref entry not found for transref: <i>{escape_tag(src_path)}</i>"
-                    )
-                else:
-                    raise FileNotFoundError(f"Chunk {chunk_hash} ref entry not found for transref: {src_path}")
-
-            refs.remove(src_path)
-            refs.add(dst_path)
-
-        await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
-        self.log.debug(
-            f"Chunk {_colored_hash} transref: "
-            f"{", ".join(f"<i>{escape_tag(src)}</i> → <i>{escape_tag(dst)}</i>" for src, dst in pairs)} "
-            f"(<g>{len(refs)}</g> refs)"
-        )
-
-    @contextlib.asynccontextmanager
-    async def _chunk_temp_ref(self, chunk_hash: str) -> AsyncGenerator[None]:
-        ref_path = hash_to_path(chunk_hash, "ref")
-        _colored_hash = f"<c>{chunk_hash[:8]}</c>"
-        temp_ref = f"$tempref-{uuid.uuid4().hex[:8]}"
-
-        async with self._lock_chunk(chunk_hash):
-            refs = await self._chunk_load_refs(chunk_hash) or set()
-            refs.add(temp_ref)
-            await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
-        self.log.debug(f"Chunk {_colored_hash} +tempref → <g>{len(refs)}</g> (<i>{escape_tag(temp_ref)}</i>)")
-
-        try:
-            yield
-        finally:
-            async with self._lock_chunk(chunk_hash):
-                refs = await self._chunk_load_refs(chunk_hash) or set()
-                if temp_ref in refs:
-                    refs.remove(temp_ref)
-                    if refs:
-                        await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
-                        self.log.debug(
-                            f"Chunk {_colored_hash} -tempref → <g>{len(refs)}</g> (<i>{escape_tag(temp_ref)}</i>)"
-                        )
-                    else:
-                        await self._chunks.unlink(ref_path, missing_ok=True)
-                        await self._chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
-                        self.log.debug(f"Chunk {_colored_hash} tempref=0, deleted data (<i>{escape_tag(temp_ref)}</i>)")
-
-    async def _chunk_add_temp_ref_unlocked(self, chunk_hash: str, temp_ref: str) -> None:
-        ref_path = hash_to_path(chunk_hash, "ref")
-        refs = await self._chunk_load_refs(chunk_hash) or set()
-        refs.add(temp_ref)
-        await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
-
-    async def _chunk_remove_temp_ref_unlocked(self, chunk_hash: str, temp_ref: str) -> None:
-        ref_path = hash_to_path(chunk_hash, "ref")
-        refs = await self._chunk_load_refs(chunk_hash)
-        if refs is None or temp_ref not in refs:
-            return
-        refs.remove(temp_ref)
-        if refs:
-            await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
-        else:
-            await self._chunks.unlink(ref_path, missing_ok=True)
-            await self._chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
-
-    async def _chunk_add_rollback_guards(self, chunk_hashes: Iterable[str]) -> dict[str, str]:
-        guards: dict[str, str] = {}
-        try:
-            for chunk_hash in sorted(set(chunk_hashes)):
-                temp_ref = f"$rollback-{uuid.uuid4().hex}"
-                await self._chunk_add_temp_ref_unlocked(chunk_hash, temp_ref)
-                guards[chunk_hash] = temp_ref
-        except BaseException:
-            with anyio.CancelScope(shield=True):
-                for chunk_hash, temp_ref in guards.items():
-                    with contextlib.suppress(Exception):
-                        await self._chunk_remove_temp_ref_unlocked(chunk_hash, temp_ref)
-            raise
-        return guards
-
-    async def _chunk_release_rollback_guards(self, guards: dict[str, str]) -> None:
-        for chunk_hash, temp_ref in guards.items():
-            await self._chunk_remove_temp_ref_unlocked(chunk_hash, temp_ref)
 
     async def _save_chunk_worker(
         self,
@@ -657,7 +265,7 @@ class IndexStorage(AbstractStorage):
                     )
                 else:
                     self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> already exists, skipping upload")
-                await self._chunk_incref(chunk_hash, remote_path)
+                await self._refs.incref(chunk_hash, remote_path)
 
             incref_done.add(chunk_hash)
 
@@ -779,7 +387,7 @@ class IndexStorage(AbstractStorage):
             if old_meta is not None:
                 async with self._lock_chunks(old_meta.chunks), anyio.create_task_group() as tg:
                     for h in set(old_meta.chunks) - set(chunk_hashes):
-                        tg.start_soon(self._chunk_decref, h, remote_path)
+                        tg.start_soon(self._refs.decref, h, remote_path)
 
             self.log.info(
                 f"Upload complete: {_colored_path} (<g>{total_size}</g> bytes in <g>{len(chunk_hashes)}</g> chunks)"
@@ -795,7 +403,7 @@ class IndexStorage(AbstractStorage):
             with anyio.CancelScope(shield=True):
                 async with self._lock_chunks(incref_done), anyio.create_task_group() as tg:
                     for h in incref_done:
-                        tg.start_soon(self._chunk_decref, h, remote_path)
+                        tg.start_soon(self._refs.decref, h, remote_path)
             raise
 
     @override
@@ -850,7 +458,7 @@ class IndexStorage(AbstractStorage):
                     f"{" (target, skip <g>" + str(within_offset) + "</g>)" if is_target_chunk else ""}"
                 )
                 bin_path = hash_to_path(chunk_hash, "bin")
-                async with self._chunk_temp_ref(chunk_hash):
+                async with self._refs.temp_ref(chunk_hash):
                     if not await self._chunks.exists(bin_path):
                         raise FileNotFoundError(f"Chunk #{idx + 1} {chunk_hash} not found for file {remote_path}")
                     hasher = hashlib.sha256()
@@ -919,7 +527,7 @@ class IndexStorage(AbstractStorage):
             async with self._lock_chunks(meta.chunks):
                 async with anyio.create_task_group() as tg:
                     for chunk_hash in meta.chunks:
-                        tg.start_soon(self._chunk_decref, chunk_hash, path)
+                        tg.start_soon(self._refs.decref, chunk_hash, path)
                 await self._index.unlink(path)
         self.log.info(f"Deleted: {_colored_path} (<g>{meta.info.size}</g> bytes, <g>{len(meta.chunks)}</g> chunks)")
 
@@ -971,12 +579,12 @@ class IndexStorage(AbstractStorage):
             old_hashes = set(dst_meta.chunks) if dst_meta is not None else set()
             old_only = old_hashes - src_hashes
             async with self._lock_chunks(src_hashes | old_hashes):
-                guards = await self._chunk_add_rollback_guards(old_only)
+                guards = await self._refs.add_rollback_guards(old_only)
                 try:
                     try:
                         async with anyio.create_task_group() as tg:
                             for chunk_hash in src_meta.chunks:
-                                tg.start_soon(self._chunk_transref, chunk_hash, (src, dst))
+                                tg.start_soon(self._refs.transref, chunk_hash, (src, dst))
                         new_meta = FileMeta(
                             info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=dst.name),
                             chunks=src_meta.chunks.copy(),
@@ -988,45 +596,37 @@ class IndexStorage(AbstractStorage):
                             async with anyio.create_task_group() as tg:
                                 for chunk_hash in src_meta.chunks:
                                     if chunk_hash in old_hashes:
-                                        tg.start_soon(self._chunk_incref, chunk_hash, src)
+                                        tg.start_soon(self._refs.incref, chunk_hash, src)
                                     else:
-                                        tg.start_soon(
-                                            functools.partial(
-                                                self._chunk_transref,
-                                                chunk_hash,
-                                                (dst, src),
-                                                missing_ok=True,
-                                            )
+                                        pfunc = functools.partial(
+                                            self._refs.transref, chunk_hash, (dst, src), missing_ok=True
                                         )
-                            await self._chunk_release_rollback_guards(guards)
+                                        tg.start_soon(pfunc)
+                            await self._refs.release_rollback_guards(guards)
                         raise
 
                     try:
                         for chunk_hash in old_only:
-                            await self._chunk_decref(chunk_hash, dst)
+                            await self._refs.decref(chunk_hash, dst)
                     except BaseException:
                         with anyio.CancelScope(shield=True):
                             if dst_meta is not None:
                                 await self._index.upload_bytes(dst_meta.model_dump_json().encode(), dst, overwrite=True)
                             async with anyio.create_task_group() as tg:
                                 for chunk_hash in old_only:
-                                    tg.start_soon(self._chunk_incref, chunk_hash, dst)
+                                    tg.start_soon(self._refs.incref, chunk_hash, dst)
                                 for chunk_hash in src_meta.chunks:
                                     if chunk_hash in old_hashes:
-                                        tg.start_soon(self._chunk_incref, chunk_hash, src)
+                                        tg.start_soon(self._refs.incref, chunk_hash, src)
                                     else:
-                                        tg.start_soon(
-                                            functools.partial(
-                                                self._chunk_transref,
-                                                chunk_hash,
-                                                (dst, src),
-                                                missing_ok=True,
-                                            )
+                                        pfunc = functools.partial(
+                                            self._refs.transref, chunk_hash, (dst, src), missing_ok=True
                                         )
-                            await self._chunk_release_rollback_guards(guards)
+                                        tg.start_soon(pfunc)
+                            await self._refs.release_rollback_guards(guards)
                         raise
                     with anyio.CancelScope(shield=True):
-                        await self._chunk_release_rollback_guards(guards)
+                        await self._refs.release_rollback_guards(guards)
                 except BaseException:  # noqa: TRY203
                     raise
             await self._index.unlink(src)
@@ -1065,13 +665,13 @@ class IndexStorage(AbstractStorage):
             old_hashes = set(dst_meta.chunks) if dst_meta is not None else set()
             old_only = old_hashes - src_hashes
             async with self._lock_chunks(src_hashes | old_hashes):
-                guards = await self._chunk_add_rollback_guards(old_only)
+                guards = await self._refs.add_rollback_guards(old_only)
                 try:
                     try:
                         async with anyio.create_task_group() as tg:
                             for chunk_hash in src_meta.chunks:
                                 if chunk_hash not in old_hashes:
-                                    tg.start_soon(self._chunk_incref, chunk_hash, dst)
+                                    tg.start_soon(self._refs.incref, chunk_hash, dst)
                         new_meta = FileMeta(
                             info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=dst.name),
                             chunks=src_meta.chunks.copy(),
@@ -1083,27 +683,27 @@ class IndexStorage(AbstractStorage):
                             async with anyio.create_task_group() as tg:
                                 for chunk_hash in src_meta.chunks:
                                     if chunk_hash not in old_hashes:
-                                        tg.start_soon(self._chunk_decref, chunk_hash, dst)
-                            await self._chunk_release_rollback_guards(guards)
+                                        tg.start_soon(self._refs.decref, chunk_hash, dst)
+                            await self._refs.release_rollback_guards(guards)
                         raise
 
                     try:
                         for chunk_hash in old_only:
-                            await self._chunk_decref(chunk_hash, dst)
+                            await self._refs.decref(chunk_hash, dst)
                     except BaseException:
                         with anyio.CancelScope(shield=True):
                             if dst_meta is not None:
                                 await self._index.upload_bytes(dst_meta.model_dump_json().encode(), dst, overwrite=True)
                             async with anyio.create_task_group() as tg:
                                 for chunk_hash in old_only:
-                                    tg.start_soon(self._chunk_incref, chunk_hash, dst)
+                                    tg.start_soon(self._refs.incref, chunk_hash, dst)
                                 for chunk_hash in src_meta.chunks:
                                     if chunk_hash not in old_hashes:
-                                        tg.start_soon(self._chunk_decref, chunk_hash, dst)
-                            await self._chunk_release_rollback_guards(guards)
+                                        tg.start_soon(self._refs.decref, chunk_hash, dst)
+                            await self._refs.release_rollback_guards(guards)
                         raise
                     with anyio.CancelScope(shield=True):
-                        await self._chunk_release_rollback_guards(guards)
+                        await self._refs.release_rollback_guards(guards)
                 except BaseException:  # noqa: TRY203
                     raise
 
@@ -1145,7 +745,7 @@ class IndexStorage(AbstractStorage):
         return metas, relatives
 
     @staticmethod
-    def _raise_tree_failure(primary: BaseException, rollback_error: BaseException | None) -> None:
+    def _raise_tree_failure(primary: BaseException, rollback_error: BaseException | None) -> NoReturn:
         if rollback_error is None:
             raise primary
         if isinstance(primary, Exception) and isinstance(rollback_error, Exception):
@@ -1165,25 +765,6 @@ class IndexStorage(AbstractStorage):
         await self._index.mkdir(directory, parents=False, exist_ok=False)
         created.add(directory)
 
-    async def _add_tree_rollback_guards(self, chunk_hashes: Iterable[str]) -> dict[str, str]:
-        guards: dict[str, str] = {}
-        try:
-            for chunk_hash in sorted(set(chunk_hashes)):
-                temp_ref = f"$tree-rollback-{uuid.uuid4().hex}"
-                async with self._lock_chunk(chunk_hash):
-                    await self._chunk_add_temp_ref_unlocked(chunk_hash, temp_ref)
-                guards[chunk_hash] = temp_ref
-        except BaseException:
-            with anyio.CancelScope(shield=True):
-                await self._release_tree_rollback_guards(guards)
-            raise
-        return guards
-
-    async def _release_tree_rollback_guards(self, guards: dict[str, str]) -> None:
-        for chunk_hash, temp_ref in guards.items():
-            async with self._lock_chunk(chunk_hash):
-                await self._chunk_remove_temp_ref_unlocked(chunk_hash, temp_ref)
-
     async def _restore_tree_file(self, path: PurePosixPath, meta: FileMeta) -> None:
         current = await self._get_file_meta(path)
         if current is not None:
@@ -1191,14 +772,14 @@ class IndexStorage(AbstractStorage):
             expected_hashes = set(meta.chunks)
             for chunk_hash in current_hashes - expected_hashes:
                 async with self._lock_chunk(chunk_hash):
-                    await self._chunk_decref(chunk_hash, path)
+                    await self._refs.decref(chunk_hash, path)
         await self._index.mkdir(path.parent, parents=True, exist_ok=True)
         await self._index.upload_bytes(meta.model_dump_json().encode(), path, overwrite=True)
         for chunk_hash in meta.chunks:
             async with self._lock_chunk(chunk_hash):
-                refs = await self._chunk_load_refs(chunk_hash) or set()
+                refs = await self._refs.load_refs(chunk_hash) or set()
                 if self.normalize_path(path).as_posix() not in refs:
-                    await self._chunk_incref(chunk_hash, path)
+                    await self._refs.incref(chunk_hash, path)
 
     async def _restore_tree_transaction(
         self,
@@ -1248,7 +829,7 @@ class IndexStorage(AbstractStorage):
                 destination_metas[path] = meta
 
         old_destination_chunks = {chunk_hash for meta in destination_metas.values() for chunk_hash in meta.chunks}
-        guards = await self._add_tree_rollback_guards(old_destination_chunks)
+        guards = await self._refs.add_tree_rollback_guards(old_destination_chunks)
         created_destination_dirs: set[PurePosixPath] = set()
         try:
             for directory in sorted(
@@ -1281,13 +862,13 @@ class IndexStorage(AbstractStorage):
                 except BaseException as error:
                     rollback_error = error
                 try:
-                    await self._release_tree_rollback_guards(guards)
+                    await self._refs.release_tree_rollback_guards(guards)
                 except BaseException as error:
                     if rollback_error is None:
                         rollback_error = error
             self._raise_tree_failure(primary, rollback_error)
         else:
-            await self._release_tree_rollback_guards(guards)
+            await self._refs.release_tree_rollback_guards(guards)
         return len(source_metas), len(source_dirs)
 
     @override
@@ -1340,11 +921,11 @@ class IndexStorage(AbstractStorage):
     async def stat(self, path: PathLike) -> FileInfo:
         path = self.normalize_path(path)
         try:
-            stat = await self._index.stat(path)
+            info = await self._index.stat(path)
         except FileNotFoundError as e:
             raise FileNotFoundError(f"File not found: {path}") from e
-        if stat.is_dir:
-            return stat
+        if info.is_dir:
+            return info
         meta_bytes = await self._index.download_bytes(path)
         try:
             meta = FileMeta.model_validate_json(meta_bytes.decode())

@@ -28,7 +28,7 @@ class TestDeduplication:
                 assert await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin"), (
                     f"Chunk {chunk_hash[:8]} .bin should exist"
                 )
-                refs = await index_storage._chunk_load_refs(chunk_hash)
+                refs = await index_storage._refs.load_refs(chunk_hash)
                 assert refs is not None, f"Chunk {chunk_hash[:8]} .ref should exist"
                 abs1 = f"/{path1}"
                 abs2 = f"/{path2}"
@@ -86,7 +86,7 @@ class TestRefCounting:
             assert src_meta is not None
             refs_before: dict[str, set[str]] = {}
             for h in src_meta.chunks:
-                r = await index_storage._chunk_load_refs(h)
+                r = await index_storage._refs.load_refs(h)
                 refs_before[h] = r or set()
 
             await index_storage.copy(src, dst)
@@ -102,7 +102,7 @@ class TestRefCounting:
                 assert await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin"), (
                     f"Chunk {chunk_hash[:8]} .bin must exist after copy"
                 )
-                refs = await index_storage._chunk_load_refs(chunk_hash)
+                refs = await index_storage._refs.load_refs(chunk_hash)
                 assert refs is not None, f"Chunk {chunk_hash[:8]} .ref must exist"
                 abs_src = f"/{src}"
                 abs_dst = f"/{dst}"
@@ -129,7 +129,7 @@ class TestRefCounting:
             assert src_meta is not None
             refs_before: dict[str, set[str]] = {}
             for h in src_meta.chunks:
-                r = await index_storage._chunk_load_refs(h)
+                r = await index_storage._refs.load_refs(h)
                 refs_before[h] = r or set()
 
             await index_storage.move(src, dst)
@@ -147,7 +147,7 @@ class TestRefCounting:
                 assert await index_storage._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin"), (
                     f"Chunk {chunk_hash[:8]} .bin must exist after move"
                 )
-                refs = await index_storage._chunk_load_refs(chunk_hash)
+                refs = await index_storage._refs.load_refs(chunk_hash)
                 assert refs is not None, f"Chunk {chunk_hash[:8]} .ref must exist"
                 assert abs_src not in refs, f"src path must be removed from chunk {chunk_hash[:8]} refs"
                 assert abs_dst in refs, f"dst path must be added to chunk {chunk_hash[:8]} refs"

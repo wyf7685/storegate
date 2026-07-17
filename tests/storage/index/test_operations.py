@@ -68,7 +68,7 @@ class TestDirectoryOperations:
             assert meta_src.chunks == meta_dst.chunks, "Source and destination must share chunk hashes after copytree"
 
             for chunk_hash in meta_src.chunks:
-                refs = await index_storage._chunk_load_refs(chunk_hash)
+                refs = await index_storage._refs.load_refs(chunk_hash)
                 assert refs is not None, f"Chunk {chunk_hash[:8]} .ref must exist"
                 abs_src_file = f"/{src_file}"
                 abs_dst_file = f"/{dst_file}"

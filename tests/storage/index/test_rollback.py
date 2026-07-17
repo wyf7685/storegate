@@ -60,7 +60,7 @@ class TestRollback:
 
         # Fail _chunk_incref from the 2nd chunk onward
         call_count = 0
-        original_incref = s._chunk_incref
+        original_incref = s._refs.incref
 
         async def _failing_incref(chunk_hash: str, *remote_path: str) -> None:
             nonlocal call_count
@@ -69,7 +69,7 @@ class TestRollback:
                 raise RuntimeError("simulated incref failure")
             await original_incref(chunk_hash, *remote_path)
 
-        mocker.patch.object(s, "_chunk_incref", _failing_incref)
+        mocker.patch.object(s._refs, "incref", _failing_incref)
 
         with pytest.raises(BaseException) as _exc:  # noqa: PT011
             await s.copy(src, dst)
@@ -81,7 +81,7 @@ class TestRollback:
         assert await s.download_bytes(src) == data
         # All chunk refs must NOT contain dst (rolled back)
         for chunk_hash in chunk_hashes:
-            refs = await s._chunk_load_refs(chunk_hash)
+            refs = await s._refs.load_refs(chunk_hash)
             assert refs is not None
             assert f"/{dst}" not in refs, f"dst must be removed from chunk {chunk_hash[:8]} refs"
 
@@ -123,7 +123,7 @@ class TestRollback:
         assert await s.download_bytes(src) == data
         # All chunk refs must NOT contain dst (rollback cleaned them)
         for chunk_hash in chunk_hashes:
-            refs = await s._chunk_load_refs(chunk_hash)
+            refs = await s._refs.load_refs(chunk_hash)
             assert refs is not None
             assert f"/{dst}" not in refs, f"dst must be removed from chunk {chunk_hash[:8]} refs"
 
@@ -148,11 +148,11 @@ class TestRollback:
         chunk_hashes = src_meta.chunks[:]
         refs_before = {}
         for h in chunk_hashes:
-            r = await s._chunk_load_refs(h)
+            r = await s._refs.load_refs(h)
             refs_before[h] = r or set()
 
         # Fail _chunk_transref for all chunks
-        mocker.patch.object(s, "_chunk_transref", side_effect=RuntimeError("simulated transref failure"))
+        mocker.patch.object(s._refs, "transref", side_effect=RuntimeError("simulated transref failure"))
 
         with pytest.raises(BaseException) as _exc:  # noqa: PT011
             await s.move(src, dst)
@@ -164,7 +164,7 @@ class TestRollback:
         # Chunk refs must still point to src only (unchanged, rollback was a no-op
         # since transref never succeeded)
         for chunk_hash in chunk_hashes:
-            refs = await s._chunk_load_refs(chunk_hash)
+            refs = await s._refs.load_refs(chunk_hash)
             assert refs is not None
             assert f"/{src}" in refs, f"src must remain in chunk {chunk_hash[:8]} refs"
             assert f"/{dst}" not in refs, f"dst must not be in chunk {chunk_hash[:8]} refs"
@@ -205,7 +205,7 @@ class TestRollback:
         assert await s.download_bytes(src) == data
         # Chunk refs must point back to src (rollback reversed the transref)
         for chunk_hash in chunk_hashes:
-            refs = await s._chunk_load_refs(chunk_hash)
+            refs = await s._refs.load_refs(chunk_hash)
             assert refs is not None
             assert f"/{src}" in refs, f"src must be restored to chunk {chunk_hash[:8]} refs"
             assert f"/{dst}" not in refs, f"dst must not be in chunk {chunk_hash[:8]} refs"
@@ -228,7 +228,7 @@ class TestRollback:
         assert old_meta is not None
         assert len(old_meta.chunks) >= 2
         old_chunks = set(old_meta.chunks)
-        original_decref = s._chunk_decref
+        original_decref = s._refs.decref
         old_decrefs = 0
 
         async def fail_second_old_decref(chunk_hash: str, *remote_path: str) -> None:
@@ -239,7 +239,7 @@ class TestRollback:
                     raise RuntimeError("simulated second old-chunk decref failure")
             await original_decref(chunk_hash, *remote_path)
 
-        mocker.patch.object(s, "_chunk_decref", fail_second_old_decref)
+        mocker.patch.object(s._refs, "decref", fail_second_old_decref)
         with pytest.raises(RuntimeError, match="second old-chunk decref"):
             await getattr(s, operation)(src, dst, overwrite=True)
 
@@ -264,7 +264,7 @@ class TestRollback:
         old_meta = await s._get_file_meta(dst)
         assert old_meta is not None
         old_chunks = set(old_meta.chunks)
-        original_decref = s._chunk_decref
+        original_decref = s._refs.decref
         old_decrefs = 0
         cancel_scope: anyio.CancelScope | None = None
 
@@ -278,14 +278,14 @@ class TestRollback:
                     raise RuntimeError("simulated cancellation during decref")
             await original_decref(chunk_hash, *remote_path)
 
-        mocker.patch.object(s, "_chunk_decref", cancel_on_old_decref)
+        mocker.patch.object(s._refs, "decref", cancel_on_old_decref)
         with anyio.CancelScope() as active_scope:
             cancel_scope = active_scope
             with pytest.raises(RuntimeError, match="simulated cancellation"):
                 await s.copy(src, dst, overwrite=True)
 
         assert await s.download_bytes(dst) == old_data
-        refs = [await s._chunk_load_refs(chunk_hash) for chunk_hash in old_chunks]
+        refs = [await s._refs.load_refs(chunk_hash) for chunk_hash in old_chunks]
         for refs_for_chunk in refs:
             assert refs_for_chunk is not None
             assert not any(ref.startswith("$rollback-") for ref in refs_for_chunk)
@@ -334,7 +334,7 @@ class TestRollback:
 
             # New chunks must exist with refs for both src and dst
             for h in new_chunks:
-                refs = await s._chunk_load_refs(h)
+                refs = await s._refs.load_refs(h)
                 assert refs is not None
                 assert f"/{src}/f.txt" in refs
                 assert f"/{dst}/f.txt" in refs
@@ -389,7 +389,7 @@ class TestRollback:
 
             # New chunks only ref dst (src is gone)
             for h in new_chunks:
-                refs = await s._chunk_load_refs(h)
+                refs = await s._refs.load_refs(h)
                 assert refs is not None
                 assert f"/{src}/f.txt" not in refs, f"src ref must be removed from chunk {h[:8]}"
                 assert f"/{dst}/f.txt" in refs, f"dst ref must exist in chunk {h[:8]}"
@@ -432,7 +432,7 @@ class TestTreeTransactionRollback:
             assert await storage.download_bytes(f"{dst}/two.txt") == b"old-two"
             for meta, path in ((old_one, f"/{dst}/one.txt"), (old_two, f"/{dst}/two.txt")):
                 for chunk_hash in meta.chunks:
-                    refs = await storage._chunk_load_refs(chunk_hash)
+                    refs = await storage._refs.load_refs(chunk_hash)
                     assert refs is not None
                     assert path in refs
         finally:
