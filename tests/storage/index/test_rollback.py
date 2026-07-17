@@ -1,5 +1,6 @@
 """IndexStorage behavior tests."""
 
+import anyio
 import pytest
 from pytest_mock import MockerFixture
 
@@ -210,6 +211,85 @@ class TestRollback:
         await s.delete(src)
 
     # ------------------------------------------------------------------
+    @pytest.mark.parametrize("operation", ["copy", "move"])
+    async def test_overwrite_decref_failure_preserves_old_chunks(
+        self, index_storage: IndexStorage, mocker: MockerFixture, operation: str
+    ):
+        s = index_storage
+        old_data = b"O" * BLOCK_SIZE + b"P" * BLOCK_SIZE
+        new_data = b"N" * BLOCK_SIZE + b"Q" * BLOCK_SIZE
+        src = f"test-rollb-overwrite-src-{uid()}"
+        dst = f"test-rollb-overwrite-dst-{uid()}"
+        await s.upload_bytes(old_data, dst)
+        await s.upload_bytes(new_data, src)
+        old_meta = await s._get_file_meta(dst)
+        assert old_meta is not None
+        assert len(old_meta.chunks) >= 2
+        old_chunks = set(old_meta.chunks)
+        original_decref = s._chunk_decref
+        old_decrefs = 0
+
+        async def fail_second_old_decref(chunk_hash: str, *remote_path: str) -> None:
+            nonlocal old_decrefs
+            if chunk_hash in old_chunks and any(str(path) == f"/{dst}" for path in remote_path):
+                old_decrefs += 1
+                if old_decrefs == 2:
+                    raise RuntimeError("simulated second old-chunk decref failure")
+            await original_decref(chunk_hash, *remote_path)
+
+        mocker.patch.object(s, "_chunk_decref", fail_second_old_decref)
+        with pytest.raises(RuntimeError, match="second old-chunk decref"):
+            await getattr(s, operation)(src, dst, overwrite=True)
+
+        assert await s.download_bytes(dst) == old_data
+        assert await s.download_bytes(src) == new_data
+        for chunk_hash in old_chunks:
+            assert await s._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin")
+
+        await s.delete(src)
+        await s.delete(dst)
+
+    async def test_overwrite_cancellation_releases_rollback_guards(
+        self, index_storage: IndexStorage, mocker: MockerFixture
+    ):
+        s = index_storage
+        old_data = b"O" * BLOCK_SIZE + b"P" * BLOCK_SIZE
+        new_data = b"N" * BLOCK_SIZE + b"Q" * BLOCK_SIZE
+        src = f"test-rollb-cancel-src-{uid()}"
+        dst = f"test-rollb-cancel-dst-{uid()}"
+        await s.upload_bytes(old_data, dst)
+        await s.upload_bytes(new_data, src)
+        old_meta = await s._get_file_meta(dst)
+        assert old_meta is not None
+        old_chunks = set(old_meta.chunks)
+        original_decref = s._chunk_decref
+        old_decrefs = 0
+        cancel_scope: anyio.CancelScope | None = None
+
+        async def cancel_on_old_decref(chunk_hash: str, *remote_path: str) -> None:
+            nonlocal old_decrefs
+            if chunk_hash in old_chunks and any(str(path) == f"/{dst}" for path in remote_path):
+                old_decrefs += 1
+                if old_decrefs == 1:
+                    assert cancel_scope is not None
+                    cancel_scope.cancel()
+                    raise RuntimeError("simulated cancellation during decref")
+            await original_decref(chunk_hash, *remote_path)
+
+        mocker.patch.object(s, "_chunk_decref", cancel_on_old_decref)
+        with anyio.CancelScope() as active_scope:
+            cancel_scope = active_scope
+            with pytest.raises(RuntimeError, match="simulated cancellation"):
+                await s.copy(src, dst, overwrite=True)
+
+        assert await s.download_bytes(dst) == old_data
+        refs = [await s._chunk_load_refs(chunk_hash) for chunk_hash in old_chunks]
+        for refs_for_chunk in refs:
+            assert refs_for_chunk is not None
+            assert not any(ref.startswith("$rollback-") for ref in refs_for_chunk)
+        await s.delete(src)
+        await s.delete(dst)
+
     # copytree — overwrite cleans up old chunks
     # ------------------------------------------------------------------
 

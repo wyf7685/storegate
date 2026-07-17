@@ -281,11 +281,19 @@ storage = S3Storage("s3.json")
 - 生命周期：`connect()`、`close()`、`ping()`
 - 上传：`upload_stream()`、`upload_bytes()`、`upload_file()`
 - 下载：`download_stream()`、`download_bytes()`、`download_file()`
-- 文件操作：`copy()`、`move()`、`unlink()`、`delete()`、`delete_many()`
+- 文件操作：`copy()`、`move()`（均支持 `overwrite=True|False`）、`unlink()`、`delete()`、`delete_many()`
 - 目录操作：`mkdir()`、`rmdir()`、`rmtree()`、`copytree()`、`movetree()`
 - 查询与遍历：`exists()`、`is_file()`、`is_dir()`、`stat()`、`iterdir()`、`list_()`、`walk()`
 
-路径会被统一规范化为 POSIX 风格的绝对逻辑路径。具体异常语义以 `app/storage/abstract.py` 中的接口文档和契约测试为准；少数远程协议受服务端行为限制，可能存在后端差异。
+路径会被统一规范化为 POSIX 风格的绝对逻辑路径。`unlink()` 对不存在文件严格抛出
+`FileNotFoundError`（除非 `missing_ok=True`）；`rmdir()` 对不存在路径、文件和非空目录分别抛出
+`FileNotFoundError`、`NotADirectoryError` 和 `OSError`。`delete()` 对不存在路径抛出
+`FileNotFoundError`；`delete_many()` 按输入顺序 fail-fast，但跳过不存在路径。
+
+`copy()` / `move()` 默认覆盖目标文件，传入 `overwrite=False` 时目标文件冲突抛出
+`FileExistsError`，源或目标目录始终抛出 `IsADirectoryError`。同一路径仅在
+`overwrite=True` 且源为文件时是无操作；缺少源仍抛出 `FileNotFoundError`。具体异常语义以
+`app/storage/abstract.py` 中的接口文档和契约测试为准；远端协议无法分类的错误才保留为 `OSError`。
 
 ## 开发与测试
 
@@ -342,7 +350,7 @@ tests/
 ```
 
 ## 安全说明与当前限制
-
+- S3、WebDAV 和 FTP 通过适配层将服务端状态翻译为统一异常；服务端仍可能拒绝不支持的原子操作，此时保留为 `OSError`，不会改变 `overwrite` 或删除契约。
 - 当前 WebDAV 服务端允许匿名访问，FTP 服务端同样使用匿名用户；请仅绑定到可信网络或在前置代理/网络层增加认证与访问控制。
 - FTP 后端目前不支持加密传输；跨不可信网络应优先使用 WebDAV over HTTPS 或在受保护网络中部署。
 - 配置文件可能包含 S3、WebDAV、FTP 或 Redis 凭据。不要提交真实密钥；项目已忽略根目录下的 `data/`。

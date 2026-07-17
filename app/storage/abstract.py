@@ -361,19 +361,17 @@ class AbstractStorage(ABC):
     async def rmdir(self, path: PathLike) -> None:
         """Delete an empty directory.
 
-        Raises:
-            NotADirectoryError: If *path* is a file.
-            OSError: If the directory is not empty.
-            FileNotFoundError: If *path* does not exist (implementations may
-                silently succeed instead).
+        Missing paths raise ``FileNotFoundError``. ``NotADirectoryError`` is
+        raised for files and ``OSError`` for non-empty directories.
         """
         raise NotImplementedError
 
     async def delete(self, path: PathLike) -> None:
         """Delete a file or an empty directory.
 
-        Convenience method that calls :meth:`rmdir` if *path* is a directory,
-        otherwise :meth:`unlink`.
+        Missing paths raise :class:`FileNotFoundError`. Non-empty directories
+        raise ``OSError`` without removing the directory. Use :meth:`unlink`
+        with ``missing_ok=True`` for idempotent file cleanup.
         """
         if await self.is_dir(path):
             await self.rmdir(path)
@@ -381,26 +379,33 @@ class AbstractStorage(ABC):
             await self.unlink(path)
 
     async def delete_many(self, *paths: PathLike) -> None:
-        """Delete multiple files or empty directories.
+        """Delete paths in order, skipping only paths that do not exist.
 
-        **Fail-fast semantics**: raises on the first error encountered.
-        No guarantee is made about which prior *paths* were processed
-        (and thus deleted) before the error occurred.  Nonexistent paths
-        are silently skipped.
-
-        Implementations MAY batch operations for efficiency but MUST
-        maintain fail-fast semantics.
+        The operation is fail-fast for every error other than
+        :class:`FileNotFoundError`; paths before the failing path stay deleted.
         """
         for path in paths:
-            await self.delete(path)
+            try:
+                await self.delete(path)
+            except FileNotFoundError:
+                continue
 
     @abstractmethod
     async def move(
         self,
         src: PathLike,
         dst: PathLike,
+        *,
+        overwrite: bool = True,
     ) -> None:
-        """Move or rename."""
+        """Move a file using the explicit destination conflict policy.
+
+        A missing source raises ``FileNotFoundError`` and a source or
+        destination directory raises ``IsADirectoryError``. An existing
+        destination file is replaced when ``overwrite=True`` and raises
+        ``FileExistsError`` otherwise. Moving a file onto itself is a no-op
+        only when ``overwrite=True``.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -408,11 +413,16 @@ class AbstractStorage(ABC):
         self,
         src: PathLike,
         dst: PathLike,
+        *,
+        overwrite: bool = True,
     ) -> None:
-        """
-        Copy a file.
+        """Copy a file using the explicit destination conflict policy.
 
-        FTP does not support COPY natively; implementations may emulate it.
+        A missing source raises ``FileNotFoundError`` and a source or
+        destination directory raises ``IsADirectoryError``. An existing
+        destination file is replaced when ``overwrite=True`` and raises
+        ``FileExistsError`` otherwise. Copying a file onto itself is a no-op
+        only when ``overwrite=True``.
         """
         raise NotImplementedError
 

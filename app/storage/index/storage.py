@@ -591,6 +591,43 @@ class IndexStorage(AbstractStorage):
                         await self._chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
                         self.log.debug(f"Chunk {_colored_hash} tempref=0, deleted data (<i>{escape_tag(temp_ref)}</i>)")
 
+    async def _chunk_add_temp_ref_unlocked(self, chunk_hash: str, temp_ref: str) -> None:
+        ref_path = hash_to_path(chunk_hash, "ref")
+        refs = await self._chunk_load_refs(chunk_hash) or set()
+        refs.add(temp_ref)
+        await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
+
+    async def _chunk_remove_temp_ref_unlocked(self, chunk_hash: str, temp_ref: str) -> None:
+        ref_path = hash_to_path(chunk_hash, "ref")
+        refs = await self._chunk_load_refs(chunk_hash)
+        if refs is None or temp_ref not in refs:
+            return
+        refs.remove(temp_ref)
+        if refs:
+            await self._chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
+        else:
+            await self._chunks.unlink(ref_path, missing_ok=True)
+            await self._chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
+
+    async def _chunk_add_rollback_guards(self, chunk_hashes: Iterable[str]) -> dict[str, str]:
+        guards: dict[str, str] = {}
+        try:
+            for chunk_hash in sorted(set(chunk_hashes)):
+                temp_ref = f"$rollback-{uuid.uuid4().hex}"
+                await self._chunk_add_temp_ref_unlocked(chunk_hash, temp_ref)
+                guards[chunk_hash] = temp_ref
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                for chunk_hash, temp_ref in guards.items():
+                    with contextlib.suppress(Exception):
+                        await self._chunk_remove_temp_ref_unlocked(chunk_hash, temp_ref)
+            raise
+        return guards
+
+    async def _chunk_release_rollback_guards(self, guards: dict[str, str]) -> None:
+        for chunk_hash, temp_ref in guards.items():
+            await self._chunk_remove_temp_ref_unlocked(chunk_hash, temp_ref)
+
     async def _save_chunk_worker(
         self,
         recv: MemoryObjectReceiveStream[tuple[str, bytes, PathLike]],
@@ -894,143 +931,171 @@ class IndexStorage(AbstractStorage):
         self,
         src: PathLike,
         dst: PathLike,
+        *,
+        overwrite: bool = True,
     ) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
         if src == dst:
+            if await self._index.is_dir(src):
+                raise IsADirectoryError(f"Is a directory: {src}")
+            if await self._get_file_meta(src) is None:
+                raise FileNotFoundError(f"Source file not found: {src}")
+            if not overwrite:
+                raise FileExistsError(f"Destination file already exists: {dst}")
             return
 
         _colored_src = f"<y>{escape_tag(src)}</y>"
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
-        self.log.info(f"Move: {_colored_src} → {_colored_dst}")
-
         async with self._lock_indexes(src, dst):
+            if await self._index.is_dir(src):
+                raise IsADirectoryError(f"Is a directory: {src}")
             src_meta = await self._get_file_meta(src)
             if src_meta is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
             dst_meta = await self._get_file_meta(dst)
-            if dst_meta is not None:
+            if dst_meta is not None and not overwrite:
                 raise FileExistsError(f"Destination file already exists: {dst}")
 
-            new_dst_meta = FileMeta(
-                info=FileInfo(
-                    path=dst.as_posix(),
-                    name=dst.name,
-                    is_dir=False,
-                    size=src_meta.info.size,
-                    modified=src_meta.info.modified,
-                    created=src_meta.info.created,
-                ),
-                chunks=src_meta.chunks,
-            )
-            new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
-
-            async def rollback_chunks() -> None:
+            src_hashes = set(src_meta.chunks)
+            old_hashes = set(dst_meta.chunks) if dst_meta is not None else set()
+            old_only = old_hashes - src_hashes
+            async with self._lock_chunks(src_hashes | old_hashes):
+                guards = await self._chunk_add_rollback_guards(old_only)
                 try:
-                    with anyio.CancelScope(shield=True):
+                    try:
                         async with anyio.create_task_group() as tg:
                             for chunk_hash in src_meta.chunks:
-                                pfunc = functools.partial(
-                                    self._chunk_transref,
-                                    chunk_hash,
-                                    (dst, src),
-                                    missing_ok=True,
-                                )
-                                tg.start_soon(pfunc)
-                except Exception:
-                    self.log.exception(f"Failed to rollback chunks for move: {_colored_src} → {_colored_dst}")
+                                tg.start_soon(self._chunk_transref, chunk_hash, (src, dst))
+                        new_meta = FileMeta(
+                            info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=dst.name),
+                            chunks=src_meta.chunks.copy(),
+                        )
+                        await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
+                        await self._index.upload_bytes(new_meta.model_dump_json().encode(), dst, overwrite=True)
+                    except BaseException:
+                        with anyio.CancelScope(shield=True):
+                            async with anyio.create_task_group() as tg:
+                                for chunk_hash in src_meta.chunks:
+                                    if chunk_hash in old_hashes:
+                                        tg.start_soon(self._chunk_incref, chunk_hash, src)
+                                    else:
+                                        tg.start_soon(
+                                            functools.partial(
+                                                self._chunk_transref,
+                                                chunk_hash,
+                                                (dst, src),
+                                                missing_ok=True,
+                                            )
+                                        )
+                            await self._chunk_release_rollback_guards(guards)
+                        raise
 
-            async with self._lock_chunks(src_meta.chunks):
-                try:
-                    async with anyio.create_task_group() as tg:
-                        for chunk_hash in src_meta.chunks:
-                            tg.start_soon(self._chunk_transref, chunk_hash, (src, dst))
-                except Exception as exc:
-                    self.log.error(  # noqa: TRY400
-                        f"Failed to transref chunks for move: {_colored_src} → {_colored_dst} "
-                        f"— <r>{escape_tag(repr(exc))}</r>"
-                    )
-                    await rollback_chunks()
+                    try:
+                        for chunk_hash in old_only:
+                            await self._chunk_decref(chunk_hash, dst)
+                    except BaseException:
+                        with anyio.CancelScope(shield=True):
+                            if dst_meta is not None:
+                                await self._index.upload_bytes(dst_meta.model_dump_json().encode(), dst, overwrite=True)
+                            async with anyio.create_task_group() as tg:
+                                for chunk_hash in old_only:
+                                    tg.start_soon(self._chunk_incref, chunk_hash, dst)
+                                for chunk_hash in src_meta.chunks:
+                                    if chunk_hash in old_hashes:
+                                        tg.start_soon(self._chunk_incref, chunk_hash, src)
+                                    else:
+                                        tg.start_soon(
+                                            functools.partial(
+                                                self._chunk_transref,
+                                                chunk_hash,
+                                                (dst, src),
+                                                missing_ok=True,
+                                            )
+                                        )
+                            await self._chunk_release_rollback_guards(guards)
+                        raise
+                    with anyio.CancelScope(shield=True):
+                        await self._chunk_release_rollback_guards(guards)
+                except BaseException:  # noqa: TRY203
                     raise
-
-                try:
-                    await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
-                    await self._index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
-                except Exception as exc:
-                    self.log.error(  # noqa: TRY400
-                        f"Failed to upload metadata for move: {_colored_src} → {_colored_dst} "
-                        f"— <r>{escape_tag(repr(exc))}</r>"
-                    )
-                    await rollback_chunks()
-                    raise
-
             await self._index.unlink(src)
-
-        self.log.info(
-            f"Moved: {_colored_src} → {_colored_dst} "
-            f"(<g>{src_meta.info.size}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
-        )
 
     @override
     async def copy(
         self,
         src: PathLike,
         dst: PathLike,
+        *,
+        overwrite: bool = True,
     ) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
         if src == dst:
+            if await self._index.is_dir(src):
+                raise IsADirectoryError(f"Is a directory: {src}")
+            if await self._get_file_meta(src) is None:
+                raise FileNotFoundError(f"Source file not found: {src}")
+            if not overwrite:
+                raise FileExistsError(f"Destination file already exists: {dst}")
             return
 
-        _colored_src = f"<y>{escape_tag(src)}</y>"
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
-        self.log.info(f"Copy: {_colored_src} → {_colored_dst}")
-
         async with self._lock_indexes(src, dst):
+            if await self._index.is_dir(src):
+                raise IsADirectoryError(f"Is a directory: {src}")
             src_meta = await self._get_file_meta(src)
             if src_meta is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
             dst_meta = await self._get_file_meta(dst)
-            if dst_meta is not None:
+            if dst_meta is not None and not overwrite:
                 raise FileExistsError(f"Destination file already exists: {dst}")
 
-            new_dst_meta = FileMeta(
-                info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=dst.name),
-                chunks=src_meta.chunks.copy(),
-            )
-            new_dst_meta_bytes = new_dst_meta.model_dump_json().encode()
-
-            async def rollback_chunks() -> None:
+            src_hashes = set(src_meta.chunks)
+            old_hashes = set(dst_meta.chunks) if dst_meta is not None else set()
+            old_only = old_hashes - src_hashes
+            async with self._lock_chunks(src_hashes | old_hashes):
+                guards = await self._chunk_add_rollback_guards(old_only)
                 try:
-                    with anyio.CancelScope(shield=True):
+                    try:
                         async with anyio.create_task_group() as tg:
                             for chunk_hash in src_meta.chunks:
-                                tg.start_soon(self._chunk_decref, chunk_hash, dst)
-                except Exception:
-                    self.log.exception(f"Failed to rollback chunks for {_colored_dst}")
+                                if chunk_hash not in old_hashes:
+                                    tg.start_soon(self._chunk_incref, chunk_hash, dst)
+                        new_meta = FileMeta(
+                            info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=dst.name),
+                            chunks=src_meta.chunks.copy(),
+                        )
+                        await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
+                        await self._index.upload_bytes(new_meta.model_dump_json().encode(), dst, overwrite=True)
+                    except BaseException:
+                        with anyio.CancelScope(shield=True):
+                            async with anyio.create_task_group() as tg:
+                                for chunk_hash in src_meta.chunks:
+                                    if chunk_hash not in old_hashes:
+                                        tg.start_soon(self._chunk_decref, chunk_hash, dst)
+                            await self._chunk_release_rollback_guards(guards)
+                        raise
 
-            async with self._lock_chunks(src_meta.chunks):
-                try:
-                    async with anyio.create_task_group() as tg:
-                        for chunk_hash in src_meta.chunks:
-                            tg.start_soon(self._chunk_incref, chunk_hash, dst)
-                except Exception as exc:
-                    self.log.error(f"Failed to incref chunks for {_colored_dst}: — <r>{escape_tag(repr(exc))}</r>")  # noqa: TRY400
-                    await rollback_chunks()
+                    try:
+                        for chunk_hash in old_only:
+                            await self._chunk_decref(chunk_hash, dst)
+                    except BaseException:
+                        with anyio.CancelScope(shield=True):
+                            if dst_meta is not None:
+                                await self._index.upload_bytes(dst_meta.model_dump_json().encode(), dst, overwrite=True)
+                            async with anyio.create_task_group() as tg:
+                                for chunk_hash in old_only:
+                                    tg.start_soon(self._chunk_incref, chunk_hash, dst)
+                                for chunk_hash in src_meta.chunks:
+                                    if chunk_hash not in old_hashes:
+                                        tg.start_soon(self._chunk_decref, chunk_hash, dst)
+                            await self._chunk_release_rollback_guards(guards)
+                        raise
+                    with anyio.CancelScope(shield=True):
+                        await self._chunk_release_rollback_guards(guards)
+                except BaseException:  # noqa: TRY203
                     raise
-
-                try:
-                    await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
-                    await self._index.upload_bytes(new_dst_meta_bytes, dst, overwrite=True)
-                except Exception as exc:
-                    self.log.error(f"Failed to upload metadata for {_colored_dst}: — <r>{escape_tag(repr(exc))}</r>")  # noqa: TRY400
-                    await rollback_chunks()
-                    raise
-
-        self.log.info(
-            f"Copied: {_colored_src} → {_colored_dst} "
-            f"(<g>{src_meta.info.size}</g> bytes, <g>{len(src_meta.chunks)}</g> chunks)"
-        )
 
     @override
     async def mkdir(

@@ -1,4 +1,5 @@
 import contextlib
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -550,6 +551,8 @@ class FTPStorage(AbstractStorage):
         destination_client: aioftp.Client,
         source: PurePosixPath,
         destination: PurePosixPath,
+        *,
+        overwrite: bool = True,
     ) -> bool:
         source_info = await self._stat(source_client, source)
         if source_info.is_dir:
@@ -564,43 +567,138 @@ class FTPStorage(AbstractStorage):
             destination_existed = True
             if destination_info.is_dir:
                 raise IsADirectoryError(f"Is a directory: {destination.as_posix()}")
+            if not overwrite:
+                raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
 
         await self._mkdir(source_client, destination.parent, parents=True, exist_ok=True)
         await self._copy_stream(source_client, destination_client, source, destination)
         return not destination_existed
 
+    async def _reconcile_move_failure(
+        self,
+        source: PurePosixPath,
+        destination: PurePosixPath,
+        temporary: PurePosixPath,
+        destination_existed: bool,
+    ) -> None:
+        """Restore source/destination from the actual state after a failed rename."""
+        with anyio.CancelScope(shield=True):
+            try:
+                async with self._client_lease() as lease:
+
+                    async def _exists(path: PurePosixPath) -> bool:
+                        try:
+                            await self._stat(lease.client, path)
+                        except FileNotFoundError:
+                            return False
+                        return True
+
+                    source_exists = await _exists(source)
+                    destination_exists = await _exists(destination)
+                    temporary_exists = await _exists(temporary)
+
+                    if not source_exists and destination_exists:
+                        await lease.client.rename(self._remote_path(destination), self._remote_path(source))
+                        destination_exists = False
+                    if destination_existed and temporary_exists and not destination_exists:
+                        await lease.client.rename(self._remote_path(temporary), self._remote_path(destination))
+                        temporary_exists = False
+                    elif not destination_existed and temporary_exists:
+                        await lease.client.remove_file(self._remote_path(temporary))
+                        temporary_exists = False
+                    if temporary_exists:
+                        await lease.client.remove_file(self._remote_path(temporary))
+            except BaseException:
+                self.log.exception(f"Failed to reconcile move state: {source} → {destination}")
+
+    async def _move_backup_exists(self, temporary: PurePosixPath) -> bool | None:
+        with anyio.CancelScope(shield=True):
+            try:
+                async with self._client_lease() as lease:
+                    return await self._exists(lease.client, temporary)
+            except BaseException:
+                self.log.exception(f"Failed to inspect move backup: {temporary}")
+                return None
+
     @override
     @translator.wrap("Failed to move {src} → {dst}")
-    async def move(self, src: PathLike, dst: PathLike) -> None:
+    async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
         if source == PurePosixPath("/"):
             raise OSError("Cannot move root directory")
 
+        failure: BaseException | None = None
+        temporary: PurePosixPath | None = None
+        destination_existed = False
         async with self._client_lease() as lease:
             source_info = await self._stat(lease.client, source)
             if source_info.is_dir:
                 raise IsADirectoryError(f"Is a directory: {source.as_posix()}")
-            if await self._exists(lease.client, destination):
-                raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
+            if source == destination:
+                if not overwrite:
+                    raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
+                return
+            try:
+                destination_info = await self._stat(lease.client, destination)
+            except FileNotFoundError:
+                pass
+            else:
+                destination_existed = True
+                if destination_info.is_dir:
+                    raise IsADirectoryError(f"Destination is a directory: {destination.as_posix()}")
+                if not overwrite:
+                    raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
+
             await self._mkdir(lease.client, destination.parent, parents=True, exist_ok=True)
-            await lease.client.rename(self._remote_path(source), self._remote_path(destination))
+            temporary = destination.parent / f".storegate-move-{uuid.uuid4().hex}"
+            staged = False
+            try:
+                if destination_existed:
+                    await lease.client.rename(self._remote_path(destination), self._remote_path(temporary))
+                    staged = True
+                await lease.client.rename(self._remote_path(source), self._remote_path(destination))
+            except BaseException as exc:
+                lease.invalidate()
+                failure = exc
+            else:
+                if staged:
+                    try:
+                        with anyio.CancelScope(shield=True):
+                            await lease.client.remove_file(self._remote_path(temporary))
+                    except BaseException as exc:
+                        lease.invalidate()
+                        failure = exc
+
+        if failure is not None:
+            assert temporary is not None
+            backup_exists = await self._move_backup_exists(temporary)
+            if backup_exists is True:
+                await self._reconcile_move_failure(source, destination, temporary, destination_existed)
+                raise failure
+            if backup_exists is None:
+                raise failure
+            self.log.warning(f"Move backup cleanup response lost after commit: {temporary}")
 
     @override
     @translator.wrap("Failed to copy {src} → {dst}")
-    async def copy(self, src: PathLike, dst: PathLike) -> None:
+    async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
         if source == PurePosixPath("/"):
             raise IsADirectoryError("Cannot copy root directory as a file")
-        if source == destination:
-            raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
-
         async with self._client_lease() as lease:
+            source_info = await self._stat(lease.client, source)
+            if source_info.is_dir:
+                raise IsADirectoryError(f"Is a directory: {source.as_posix()}")
+            if source == destination:
+                if overwrite:
+                    return
+                raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
             destination_existed = await self._exists(lease.client, destination)
             try:
                 async with self._temporary_client() as destination_client:
-                    await self._copy_file(lease.client, destination_client, source, destination)
+                    await self._copy_file(lease.client, destination_client, source, destination, overwrite=overwrite)
             except BaseException:
                 if not destination_existed:
                     await self._cleanup_partial_file(destination)

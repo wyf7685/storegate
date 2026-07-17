@@ -1,6 +1,7 @@
 import contextlib
 import itertools
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
+import uuid
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Iterable
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import final, override
@@ -246,126 +247,143 @@ class S3Storage(AbstractStorage):
     async def rmdir(self, path: PathLike) -> None:
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
-
-        # 1. 文件：报错
         if await client.head_object(key=key) is not None:
             raise NotADirectoryError(f"Not a directory: {path}")
-
-        # 2. 目录：检查为空后删除标记对象
         if await self.is_dir(path):
             if not await self._is_dir_empty(path):
                 raise OSError(f"Directory not empty: {path}")
-
             dir_key = self._dir_key(path)
-            assert dir_key is not None  # is_dir=True 且不是根目录
-            self.log.info(f"Delete dir: <y>{escape_tag(dir_key)}</y>")
-            await client.delete_object(key=dir_key)
+            if dir_key is not None:
+                await client.delete_object(key=dir_key)
             return
-
-        # 3. 不存在：静默成功
+        raise FileNotFoundError(f"Directory not found: {path}")
 
     @override
     @translator.wrap("Failed to delete {path}")
     async def delete(self, path: PathLike) -> None:
-        """Delete a file or an empty directory.
-
-        Uses inline branching to minimize S3 API calls, rather than the
-        base class convenience method which would require an extra
-        ``head_object`` via :meth:`is_dir`.
-        """
         client = self._ensure_client()
         key = self._remote_path_to_key(path)
-
-        # 1. 文件：直接删除
         if await client.head_object(key=key) is not None:
-            self.log.info(f"Delete: <y>{escape_tag(key)}</y>")
             await client.delete_object(key=key)
             return
-
-        # 2. 目录：检查为空后删除标记对象
         if await self.is_dir(path):
             if not await self._is_dir_empty(path):
                 raise OSError(f"Directory not empty: {path}")
-
             dir_key = self._dir_key(path)
-            assert dir_key is not None  # is_dir=True 且不是根目录
-            self.log.info(f"Delete dir: <y>{escape_tag(dir_key)}</y>")
-            await client.delete_object(key=dir_key)
+            if dir_key is not None:
+                await client.delete_object(key=dir_key)
             return
-
-        # 3. 不存在：静默成功
+        raise FileNotFoundError(f"Path not found: {path}")
 
     @override
     @translator.wrap("Failed to delete objects: {paths}")
     async def delete_many(self, *paths: PathLike) -> None:
-        client = self._ensure_client()
-        objects_to_delete: list[str] = []
-
         for path in paths:
-            key = self._remote_path_to_key(path)
-
-            # 1. 文件：直接删除
-            if await client.head_object(key=key) is not None:
-                objects_to_delete.append(key)
+            try:
+                await self.delete(path)
+            except FileNotFoundError:
                 continue
 
-            # 2. 目录：内联检查（复用已计算的 dir_key，避免 is_dir 的冗余 head_object）
-            dir_key = self._dir_key(path)
-            if dir_key is not None and await client.head_object(key=dir_key) is not None:
-                if not await self._is_dir_empty(path):
-                    raise OSError(f"Directory not empty: {path}")
-                objects_to_delete.append(dir_key)
-                continue
-
-            # 3. 不存在：静默成功
-
-        if objects_to_delete:
-            self.log.info(f"Delete many: <y>{escape_tag(repr(objects_to_delete))}</y>")
-            await client.delete_objects(objects_to_delete)
+    async def _rollback_move_destination(
+        self,
+        client: AsyncS3Client,
+        src_key: str,
+        dst_key: str,
+        backup_key: str | None,
+        *,
+        copy_completed: bool,
+    ) -> None:
+        """Restore a move's source and destination without losing an overwritten file."""
+        with anyio.CancelScope(shield=True):
+            if copy_completed:
+                try:
+                    if await client.head_object(key=src_key) is None:
+                        await client.put_object_copy(dst_key, src_key)
+                except BaseException:
+                    self.log.exception(f"Failed to restore move source after rollback: {src_key}")
+            try:
+                if backup_key is not None:
+                    await client.put_object_copy(backup_key, dst_key)
+                    await client.delete_object(key=backup_key)
+                elif copy_completed:
+                    await client.delete_object(key=dst_key)
+            except BaseException:
+                self.log.exception(f"Failed to restore move destination after rollback: {dst_key}")
 
     @override
     @translator.wrap("Failed to move {src} → {dst}")
-    async def move(
-        self,
-        src: PathLike,
-        dst: PathLike,
-    ) -> None:
+    async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        if self._remote_path_to_key(src) == self._remote_path_to_key(dst):
+            if not overwrite:
+                raise FileExistsError(f"Source and destination are the same: {src}")
+            if await self.is_dir(src):
+                raise IsADirectoryError(f"Is a directory: {src}")
+            if await self._ensure_client().head_object(key=self._remote_path_to_key(src)) is None:
+                raise FileNotFoundError(f"Source not found: {src}")
+            return
+
+        client = self._ensure_client()
         src_key = self._remote_path_to_key(src)
         dst_key = self._remote_path_to_key(dst)
-        self.log.info(f"Move: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y>")
-        await self.copy(src, dst)
         try:
-            await self._ensure_client().delete_object(key=src_key)
-        except Exception as exc:
-            self.log.error(  # noqa: TRY400
-                f"Failed to delete source after move: <y>{escape_tag(src_key)}</y> — <r>{escape_tag(repr(exc))}</r>"
-            )
-            try:
-                await self._ensure_client().delete_object(key=dst_key)
-            except Exception:
-                self.log.exception(f"Failed to rollback destination after failed move: <y>{escape_tag(dst_key)}</y>")
+            if await self.is_dir(dst):
+                raise IsADirectoryError(f"Destination is a directory: {dst}")
+        except TypeError:
+            pass
+        if not overwrite and await self.exists(dst):
+            raise FileExistsError(f"Destination already exists: {dst}")
+
+        backup_key: str | None = None
+        if overwrite and await client.head_object(key=dst_key) is not None:
+            backup_key = f"{dst_key}.storegate-move-backup-{uuid.uuid4().hex}"
+            await client.put_object_copy(dst_key, backup_key)
+
+        try:
+            await self.copy(src, dst, overwrite=overwrite)
+        except BaseException:
+            if backup_key is not None:
+                await self._rollback_move_destination(client, src_key, dst_key, backup_key, copy_completed=False)
+            raise
+
+        try:
+            await client.delete_object(key=src_key)
+        except BaseException as exc:
+            await self._rollback_move_destination(client, src_key, dst_key, backup_key, copy_completed=True)
             raise OSError(f"Failed to delete source after move: {src}") from exc
+
+        if backup_key is not None:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await client.delete_object(key=backup_key)
+                except BaseException:
+                    self.log.exception(f"Failed to delete move backup: {backup_key}")
 
     @override
     @translator.wrap("Failed to copy {src} → {dst}")
-    async def copy(
-        self,
-        src: PathLike,
-        dst: PathLike,
-    ) -> None:
+    async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         src_key = self._remote_path_to_key(src)
         dst_key = self._remote_path_to_key(dst)
         client = self._ensure_client()
-
+        if src_key == dst_key:
+            if not overwrite:
+                raise FileExistsError(f"Source and destination are the same: {src}")
+            if await self.is_dir(src):
+                raise IsADirectoryError(f"Is a directory: {src}")
+            if await client.head_object(key=src_key) is None:
+                raise FileNotFoundError(f"Source not found: {src}")
+            return
         head = await client.head_object(key=src_key)
+        if await self.is_dir(src):
+            raise IsADirectoryError(f"Is a directory: {src}")
         if head is None:
             raise FileNotFoundError(f"Source not found: {src}")
-
+        if await self.is_dir(dst):
+            raise IsADirectoryError(f"Destination is a directory: {dst}")
+        if not overwrite and await client.head_object(key=dst_key) is not None:
+            raise FileExistsError(f"Destination already exists: {dst}")
         if head.content_length <= COPY_MULTIPART_THRESHOLD:
-            self.log.debug(f"Copy: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y> (CopyObject)")
             await client.put_object_copy(src_key, dst_key)
         else:
-            self.log.debug(f"Copy: <y>{escape_tag(src_key)}</y> → <y>{escape_tag(dst_key)}</y> (multipart copy)")
             await self._copy_multipart(src_key, dst_key, head.content_length)
 
     @override
@@ -464,8 +482,96 @@ class S3Storage(AbstractStorage):
             f"RmTree complete: <y>{escape_tag(key)}</y> (<g>{deleted_files}</g> files, <g>{deleted_dirs}</g> dirs)"
         )
 
+    async def _cleanup_copytree_backups(self, client: AsyncS3Client, backup_keys: Iterable[str]) -> None:
+        pending = set(backup_keys)
+        if not pending:
+            return
+
+        last_error: BaseException | None = None
+        with anyio.CancelScope(shield=True):
+            for _attempt in range(2):
+                try:
+                    await client.delete_objects(pending)
+                except BaseException as exc:
+                    last_error = exc
+
+                remaining: set[str] = set()
+                for backup_key in pending:
+                    try:
+                        if await client.head_object(key=backup_key) is not None:
+                            remaining.add(backup_key)
+                    except BaseException as exc:
+                        last_error = exc
+                        remaining.add(backup_key)
+                if not remaining:
+                    return
+                pending = remaining
+
+        message = f"Failed to remove copytree backups: {sorted(pending)}"
+        if last_error is None:
+            raise OSError(message)
+        raise OSError(message) from last_error
+
+    async def _stage_copytree_targets(
+        self, client: AsyncS3Client, target_keys: set[str]
+    ) -> tuple[dict[str, str], set[str]]:
+        backups: dict[str, str] = {}
+        created_targets: set[str] = set()
+        backup_prefix = f".storegate-copytree-backup-{uuid.uuid4().hex}/"
+        try:
+            for target_key in sorted(target_keys):
+                if await client.head_object(key=target_key) is None:
+                    created_targets.add(target_key)
+                else:
+                    backup_key = f"{backup_prefix}{target_key}"
+                    await client.put_object_copy(target_key, backup_key)
+                    backups[target_key] = backup_key
+        except BaseException:
+            try:
+                await self._cleanup_copytree_backups(client, backups.values())
+            except BaseException as cleanup_exc:
+                raise OSError(f"Failed to clean staged copytree backups: {cleanup_exc}") from cleanup_exc
+            raise
+        return backups, created_targets
+
+    async def _rollback_copytree_targets(
+        self,
+        client: AsyncS3Client,
+        backups: dict[str, str],
+        created_targets: set[str],
+    ) -> None:
+        errors: list[str] = []
+        first_error: BaseException | None = None
+        restored_backup_keys: set[str] = set()
+        with anyio.CancelScope(shield=True):
+            if created_targets:
+                try:
+                    await client.delete_objects(created_targets)
+                except BaseException as exc:
+                    errors.append(f"Failed to remove newly created copytree targets: {exc}")
+                    first_error = exc
+            for target_key, backup_key in backups.items():
+                try:
+                    await client.put_object_copy(backup_key, target_key)
+                except BaseException as exc:
+                    errors.append(f"Failed to restore copytree target {target_key}: {exc}")
+                    if first_error is None:
+                        first_error = exc
+                else:
+                    restored_backup_keys.add(backup_key)
+            try:
+                await self._cleanup_copytree_backups(client, restored_backup_keys)
+            except BaseException as exc:
+                errors.append(f"Failed to clean restored copytree backups: {exc}")
+                if first_error is None:
+                    first_error = exc
+        if errors:
+            message = "Failed to roll back copytree: " + "; ".join(errors)
+            if first_error is None:
+                raise OSError(message)
+            raise OSError(message) from first_error
+
     @override
-    @translator.wrap("Failed to copy tree {src} → {dst} (overwrite={overwrite})")
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         client = self._ensure_client()
 
@@ -497,60 +603,51 @@ class S3Storage(AbstractStorage):
         for src_file in file_paths:
             all_dst_dirs.add(dst.joinpath(src_file.relative_to(src)).parent)
 
+        dir_keys = {dir_key for directory in all_dst_dirs if (dir_key := self._dir_key(directory)) is not None}
+        file_keys = {self._remote_path_to_key(dst.joinpath(src_file.relative_to(src))) for src_file in file_paths}
+        backups, created_targets = await self._stage_copytree_targets(client, dir_keys | file_keys)
+
         dir_created = datetime.now(UTC)
-        dir_create_done: set[str] = set()
-        d = None
+
         try:
-            for d in sorted(all_dst_dirs, key=lambda p: len(p.parts)):
-                if dir_key := self._dir_key(d):
+            for directory in sorted(all_dst_dirs, key=lambda path: len(path.parts)):
+                if dir_key := self._dir_key(directory):
                     info = FileInfo(
-                        path=d.as_posix(),
-                        name=d.name,
+                        path=directory.as_posix(),
+                        name=directory.name,
                         is_dir=True,
                         size=0,
                         modified=dir_created,
                         created=dir_created,
                     )
                     await client.put_object(key=dir_key, data=serialize_file_info(info))
-                    dir_create_done.add(dir_key)
-        except Exception as exc:
-            self.log.error(  # noqa: TRY400
-                f"Failed to create directory: <y>{escape_tag(d)}</y> — <r>{escape_tag(repr(exc))}</r>"
-            )
-            # 回滚已创建的目录标记对象
-            try:
-                with anyio.CancelScope(shield=True):
-                    await client.delete_objects(dir_create_done)
-            except Exception:
-                self.log.exception(
-                    f"Failed to rollback created directories: <y>{escape_tag(repr(dir_create_done))}</y>"
-                )
-            raise OSError(f"Failed to create directory: {d}") from exc
 
-        # 并发复制所有文件
-        started_dst_keys: set[str] = set()
-        try:
             async with anyio.create_task_group() as tg:
                 for src_file in file_paths:
                     dst_file = dst.joinpath(src_file.relative_to(src))
                     tg.start_soon(self.copy, src_file, dst_file)
-                    started_dst_keys.add(self._remote_path_to_key(dst_file))
                     await anyio.lowlevel.checkpoint()
-        except Exception as exc:
+        except BaseException as exc:
             self.log.error(  # noqa: TRY400
-                f"Failed to copy tree: <y>{escape_tag(src)}</y> → <y>{escape_tag(dst)}</y>"
-                f" — <r>{escape_tag(repr(exc))}</r>"
+                f"Failed to copy tree: <y>{escape_tag(src)}</y> → <y>{escape_tag(dst)}</y> "
+                f"— <r>{escape_tag(repr(exc))}</r>"
             )
-            # 回滚已复制的文件
             try:
-                with anyio.CancelScope(shield=True):
-                    await client.delete_objects(started_dst_keys | dir_create_done)
-            except Exception:
-                self.log.exception(
-                    f"Failed to rollback copied files and created directories: "
-                    f"<y>{escape_tag(repr(started_dst_keys | dir_create_done))}</y>"
-                )
-            raise OSError(f"Failed to copy tree: {src} → {dst}") from exc
+                await self._rollback_copytree_targets(client, backups, created_targets)
+            except BaseException as rollback_exc:
+                if isinstance(exc, Exception) and isinstance(rollback_exc, Exception):
+                    raise BaseExceptionGroup(
+                        f"Failed to copy tree: {src} → {dst}; rollback also failed",
+                        [exc, rollback_exc],
+                    )
+                if isinstance(rollback_exc, anyio.get_cancelled_exc_class()):
+                    raise rollback_exc
+                raise exc
+            if isinstance(exc, Exception):
+                raise OSError(f"Failed to copy tree: {src} → {dst}") from exc
+            raise
+
+        await self._cleanup_copytree_backups(client, backups.values())
 
     @override
     @translator.wrap("Failed to check existence of {path}")

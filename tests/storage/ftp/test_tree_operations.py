@@ -19,7 +19,7 @@ class TestCopyAndTrees:
             await ftp_storage.copy(f"{base}/source.bin", f"{base}/copy.bin")
             assert await ftp_storage.download_bytes(f"{base}/copy.bin") == b"0123456789"
             with pytest.raises(FileExistsError):
-                await ftp_storage.copy(f"{base}/source.bin", f"{base}/source.bin")
+                await ftp_storage.copy(f"{base}/source.bin", f"{base}/source.bin", overwrite=False)
         finally:
             await ftp_storage.rmtree(base)
 
@@ -131,6 +131,93 @@ class TestCopyAndTrees:
             assert await ftp_storage.exists(source / "b.txt")
         finally:
             monkeypatch.setattr(FTPStorage, "_copy_stream", original)
+            await ftp_storage.rmtree(base)
+
+    async def test_move_rename_mutates_then_raises_restores_paths(
+        self, ftp_storage: FTPStorage, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base = f"/ftp-move-rename-failure-{uid()}"
+        source = PurePosixPath(base, "source.bin")
+        destination = PurePosixPath(base, "destination.bin")
+        await ftp_storage.upload_bytes(b"source", source)
+        await ftp_storage.upload_bytes(b"existing", destination)
+        original_rename = aioftp.Client.rename
+        raised = False
+
+        async def mutate_then_raise(client: aioftp.Client, old: str, new: str) -> None:
+            nonlocal raised
+            await original_rename(client, old, new)
+            if not raised and old.endswith("/source.bin") and new.endswith("/destination.bin"):
+                raised = True
+                raise OSError("rename response lost after commit")
+
+        monkeypatch.setattr(aioftp.Client, "rename", mutate_then_raise)
+        try:
+            with pytest.raises(OSError, match="rename response lost"):
+                await ftp_storage.move(source, destination, overwrite=True)
+            assert await ftp_storage.download_bytes(source) == b"source"
+            assert await ftp_storage.download_bytes(destination) == b"existing"
+            entries = [info async for info in ftp_storage.iterdir(base)]
+            assert not any(info.name.startswith(".storegate-move-") for info in entries)
+        finally:
+            await ftp_storage.rmtree(base)
+
+    async def test_move_backup_cleanup_failure_restores_paths(
+        self, ftp_storage: FTPStorage, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base = f"/ftp-move-cleanup-failure-{uid()}"
+        source = PurePosixPath(base, "source.bin")
+        destination = PurePosixPath(base, "destination.bin")
+        await ftp_storage.upload_bytes(b"source", source)
+        await ftp_storage.upload_bytes(b"existing", destination)
+        original_remove = aioftp.Client.remove_file
+        raised = False
+
+        async def fail_backup_cleanup(client: aioftp.Client, path: str) -> None:
+            nonlocal raised
+            if not raised and ".storegate-move-" in path:
+                raised = True
+                raise OSError("control channel lost removing backup")
+            await original_remove(client, path)
+
+        monkeypatch.setattr(aioftp.Client, "remove_file", fail_backup_cleanup)
+        try:
+            with pytest.raises(OSError, match="control channel lost"):
+                await ftp_storage.move(source, destination, overwrite=True)
+            assert await ftp_storage.download_bytes(source) == b"source"
+            assert await ftp_storage.download_bytes(destination) == b"existing"
+            entries = [info async for info in ftp_storage.iterdir(base)]
+            assert not any(info.name.startswith(".storegate-move-") for info in entries)
+        finally:
+            await ftp_storage.rmtree(base)
+
+    async def test_move_backup_cleanup_mutates_then_raises_commits(
+        self, ftp_storage: FTPStorage, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        base = f"/ftp-move-cleanup-committed-{uid()}"
+        source = PurePosixPath(base, "source.bin")
+        destination = PurePosixPath(base, "destination.bin")
+        await ftp_storage.upload_bytes(b"source", source)
+        await ftp_storage.upload_bytes(b"existing", destination)
+        original_remove = aioftp.Client.remove_file
+        raised = False
+
+        async def remove_then_raise(client: aioftp.Client, path: str) -> None:
+            nonlocal raised
+            if not raised and ".storegate-move-" in path:
+                raised = True
+                await original_remove(client, path)
+                raise OSError("cleanup response lost after commit")
+            await original_remove(client, path)
+
+        monkeypatch.setattr(aioftp.Client, "remove_file", remove_then_raise)
+        try:
+            await ftp_storage.move(source, destination, overwrite=True)
+            assert not await ftp_storage.exists(source)
+            assert await ftp_storage.download_bytes(destination) == b"source"
+            entries = [info async for info in ftp_storage.iterdir(base)]
+            assert not any(info.name.startswith(".storegate-move-") for info in entries)
+        finally:
             await ftp_storage.rmtree(base)
 
     async def test_movetree_failure_keeps_source(

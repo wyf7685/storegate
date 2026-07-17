@@ -166,8 +166,6 @@ class MemoryStorage(AbstractStorage):
         if target not in self._dirs and target != "" and not self._is_dir(target):
             raise FileNotFoundError(f"Directory not found: {path}")
 
-        if target in self._dirs:
-            self._dirs.discard(target)
         prefix = target + "/" if target else ""
         # Only allow deletion of empty directories.
         for key in self._files:
@@ -176,34 +174,40 @@ class MemoryStorage(AbstractStorage):
         for key in self._dirs:
             if key != target and key.startswith(prefix):
                 raise OSError(f"Directory not empty: {path}")
+        if target in self._dirs:
+            self._dirs.discard(target)
 
     @override
-    async def move(self, src: PathLike, dst: PathLike) -> None:
+    async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._resolve(src)
         dest = self._resolve(dst)
-
         if source not in self._files:
+            if self._is_dir(source) or source == "":
+                raise IsADirectoryError(f"Is a directory: {src}")
             raise FileNotFoundError(f"Source not found: {src}")
-        if dest in self._dirs:
-            raise FileExistsError(f"Destination is an existing directory: {dst}")
-        if dest in self._files:
+        if source == dest and overwrite:
+            return
+        if dest in self._dirs or dest == "" or self._is_dir(dest):
+            raise IsADirectoryError(f"Destination is a directory: {dst}")
+        if dest in self._files and not overwrite:
             raise FileExistsError(f"Destination file already exists: {dst}")
-
         self._ensure_parent_dirs(dest)
         self._files[dest] = self._files.pop(source)
 
     @override
-    async def copy(self, src: PathLike, dst: PathLike) -> None:
+    async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._resolve(src)
         dest = self._resolve(dst)
-
         if source not in self._files:
+            if self._is_dir(source) or source == "":
+                raise IsADirectoryError(f"Is a directory: {src}")
             raise FileNotFoundError(f"Source not found: {src}")
-        if dest in self._dirs:
-            raise FileExistsError(f"Destination is an existing directory: {dst}")
-        if dest in self._files:
+        if source == dest and overwrite:
+            return
+        if dest in self._dirs or dest == "" or self._is_dir(dest):
+            raise IsADirectoryError(f"Destination is a directory: {dst}")
+        if dest in self._files and not overwrite:
             raise FileExistsError(f"Destination file already exists: {dst}")
-
         self._ensure_parent_dirs(dest)
         self._files[dest] = self._files[source]
 

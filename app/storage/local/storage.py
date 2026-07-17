@@ -180,26 +180,58 @@ class LocalStorage(AbstractStorage):
     @override
     async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
         target = self._resolve(path)
+        if await anyio.Path(target).is_dir():
+            raise IsADirectoryError(f"Is a directory: {path}")
         await anyio.Path(target).unlink(missing_ok=missing_ok)
 
     @override
     async def rmdir(self, path: PathLike) -> None:
         target = self._resolve(path)
-        await anyio.Path(target).rmdir()
+        try:
+            await anyio.Path(target).rmdir()
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError):
+                raise
+            if isinstance(exc, NotADirectoryError):
+                raise
+            raise OSError(f"Directory not empty: {path}") from exc
 
     @override
-    async def move(self, src: PathLike, dst: PathLike) -> None:
+    async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._resolve(src)
         dest = self._resolve(dst)
-
+        if await anyio.Path(source).is_dir():
+            raise IsADirectoryError(f"Is a directory: {src}")
+        if not await anyio.Path(source).exists():
+            raise FileNotFoundError(f"Source not found: {src}")
+        if await anyio.Path(dest).is_dir():
+            raise IsADirectoryError(f"Destination is a directory: {dst}")
+        if await anyio.Path(dest).exists() and not overwrite:
+            raise FileExistsError(f"Destination file already exists: {dst}")
         await anyio.Path(dest.parent).mkdir(parents=True, exist_ok=True)
-        await anyio.Path(source).rename(dest)
+        if overwrite:
+            await anyio.to_thread.run_sync(os.replace, str(source), str(dest))
+        else:
+            await anyio.Path(source).rename(dest)
 
     @override
-    async def copy(self, src: PathLike, dst: PathLike) -> None:
+    async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._resolve(src)
         dest = self._resolve(dst)
-
+        if source == dest and overwrite:
+            if not await anyio.Path(source).exists():
+                raise FileNotFoundError(f"Source not found: {src}")
+            if await anyio.Path(source).is_dir():
+                raise IsADirectoryError(f"Is a directory: {src}")
+            return
+        if not await anyio.Path(source).exists():
+            raise FileNotFoundError(f"Source not found: {src}")
+        if await anyio.Path(source).is_dir():
+            raise IsADirectoryError(f"Is a directory: {src}")
+        if await anyio.Path(dest).is_dir():
+            raise IsADirectoryError(f"Destination is a directory: {dst}")
+        if await anyio.Path(dest).exists() and not overwrite:
+            raise FileExistsError(f"Destination file already exists: {dst}")
         await anyio.Path(dest.parent).mkdir(parents=True, exist_ok=True)
         await anyio.to_thread.run_sync(shutil.copy2, str(source), str(dest))
 

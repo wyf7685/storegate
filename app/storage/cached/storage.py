@@ -338,30 +338,18 @@ class CachedStorage(AbstractStorage):
                 await self._invalidate_path(path)
 
     @override
-    async def move(self, src: PathLike, dst: PathLike) -> None:
-        await self._storage.move(src, dst)
-
-        # Attempt to infer dst type from src cache (may be expired -> None)
+    async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        await self._storage.move(src, dst, overwrite=overwrite)
         src_np = self._normalize(src)
-        [dst_is_file, dst_is_dir] = await self._cache.mget(
-            ("is_file", src_np),
-            ("is_dir", src_np),
-        )
-
+        [dst_is_file, dst_is_dir] = await self._cache.mget(("is_file", src_np), ("is_dir", src_np))
         await self._invalidate_path(src, exists=False, is_file=False, is_dir=False)
         await self._invalidate_path(dst, exists=True, is_file=dst_is_file, is_dir=dst_is_dir)
 
     @override
-    async def copy(self, src: PathLike, dst: PathLike) -> None:
-        await self._storage.copy(src, dst)
-
-        # Attempt to infer dst type from src cache (may be expired -> None)
+    async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        await self._storage.copy(src, dst, overwrite=overwrite)
         src_np = self._normalize(src)
-        [dst_is_file, dst_is_dir] = await self._cache.mget(
-            ("is_file", src_np),
-            ("is_dir", src_np),
-        )
-
+        [dst_is_file, dst_is_dir] = await self._cache.mget(("is_file", src_np), ("is_dir", src_np))
         await self._invalidate_path(dst, exists=True, is_file=dst_is_file, is_dir=dst_is_dir)
 
     # ------------------------------------------------------------------
