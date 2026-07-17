@@ -1,6 +1,7 @@
 import functools
 import os
 import shutil
+import stat
 from collections.abc import AsyncGenerator, AsyncIterable
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -18,6 +19,13 @@ from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike,
 class LocalStorage(AbstractStorage):
     """Local filesystem storage backend.
 
+    The configured root is canonicalized once at construction. Every logical
+    path is then checked for symlink/junction/reparse-point components before
+    use; link components are rejected rather than followed. This protects
+    against static path configuration mistakes, but is not a defense against
+    a concurrent attacker swapping directory entries between the check and
+    the filesystem operation (TOCTOU).
+
     Usage::
 
         async with LocalStorage("/data/ftp") as storage:
@@ -26,7 +34,20 @@ class LocalStorage(AbstractStorage):
 
     def __init__(self, root: str | Path) -> None:
         super().__init__()
-        self._root: Path = Path(root).absolute()
+        # A symlink is an explicit, stable root configuration: resolve it once
+        # so subsequent path checks cannot accidentally escape via the alias.
+        self._root: Path = Path(root).absolute().resolve(strict=False)
+
+    @staticmethod
+    def _is_link_or_reparse(path: Path) -> bool:
+        try:
+            result = path.lstat()
+        except FileNotFoundError:
+            return False
+        if path.is_symlink():
+            return True
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        return bool(getattr(result, "st_file_attributes", 0) & reparse_flag)
 
     # ------------------------------------------------------------------
     # Identity
@@ -63,21 +84,43 @@ class LocalStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     def _resolve(self, path: PathLike) -> Path:
-        """Resolve *path* to an absolute ``Path`` under ``self._root``.
+        """Resolve *path* under the canonical root without following links.
 
-        Raises :exc:`ValueError` if *path* attempts to escape the root
-        directory.
+        Existing symlink, junction, and Windows reparse-point components are
+        rejected, including the final component. Missing final components are
+        allowed for create operations, while all existing parent components
+        must pass the same check.
         """
-        # Normalise: treat every path as relative.
         p = self.normalize_path(path).relative_to("/")
         full = Path(os.path.normpath(self._root / p))
 
         try:
-            full.relative_to(self._root)
+            relative = full.relative_to(self._root)
         except ValueError:
             raise ValueError(f"Path traversal detected: {path!r}") from None
 
+        current = self._root
+        for component in relative.parts:
+            current /= component
+            if self._is_link_or_reparse(current):
+                raise ValueError(f"Path contains a symlink or reparse point: {path!r}")
+
         return full
+
+    def _assert_tree_safe(self, root: Path) -> None:
+        """Reject links anywhere in a tree before an operation can traverse it."""
+        if self._is_link_or_reparse(root):
+            raise ValueError(f"Path contains a symlink or reparse point: {root}")
+        try:
+            entries = list(os.scandir(root))
+        except NotADirectoryError:
+            return
+        for entry in entries:
+            child = Path(entry.path)
+            if self._is_link_or_reparse(child):
+                raise ValueError(f"Path contains a symlink or reparse point: {child}")
+            if entry.is_dir(follow_symlinks=False):
+                self._assert_tree_safe(child)
 
     # ------------------------------------------------------------------
     # Upload
@@ -178,6 +221,7 @@ class LocalStorage(AbstractStorage):
     @override
     async def rmtree(self, path: PathLike) -> None:
         target = self._resolve(path)
+        self._assert_tree_safe(target)
         await anyio.to_thread.run_sync(functools.partial(shutil.rmtree, target))
 
     @override
@@ -187,6 +231,9 @@ class LocalStorage(AbstractStorage):
 
         if not await anyio.Path(source).is_dir():
             raise NotADirectoryError(f"Not a directory: {src}")
+        self._assert_tree_safe(source)
+        if await anyio.Path(destination).exists():
+            self._assert_tree_safe(destination)
         if not overwrite and await anyio.Path(destination).exists():
             raise FileExistsError(f"Destination already exists: {dst}")
 
@@ -199,6 +246,9 @@ class LocalStorage(AbstractStorage):
 
         if not await anyio.Path(source).is_dir():
             raise NotADirectoryError(f"Not a directory: {src}")
+        self._assert_tree_safe(source)
+        if await anyio.Path(dest).exists():
+            self._assert_tree_safe(dest)
         if not overwrite and await anyio.Path(dest).exists():
             raise FileExistsError(f"Destination already exists: {dst}")
 
@@ -257,6 +307,9 @@ class LocalStorage(AbstractStorage):
             raise NotADirectoryError(f"Not a directory: {path}")
 
         async for entry in p.iterdir():
+            entry_path = Path(entry)
+            if self._is_link_or_reparse(entry_path):
+                raise ValueError(f"Path contains a symlink or reparse point: {entry_path}")
             stat_result = await entry.stat()
             entry_is_dir = await entry.is_dir()
             yield FileInfo(
@@ -282,6 +335,9 @@ class LocalStorage(AbstractStorage):
         files: list[FileInfo] = []
 
         async for entry in p.iterdir():
+            entry_path = Path(entry)
+            if self._is_link_or_reparse(entry_path):
+                raise ValueError(f"Path contains a symlink or reparse point: {entry_path}")
             stat_result = await entry.stat()
             entry_is_dir = await entry.is_dir()
             info = FileInfo(

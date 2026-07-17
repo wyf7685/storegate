@@ -51,6 +51,16 @@ class TestDavStorageIntegration:
             with contextlib.suppress(Exception):
                 await dav_storage.delete(path)
 
+    async def test_protocol_download_reads_to_eof(self, dav_storage: DavStorage) -> None:
+        path = f"itd-eof-{uid()}"
+        payload = b"webdav-reader-eof" * 1024
+        try:
+            await dav_storage.upload_bytes(payload, path)
+            assert await dav_storage.download_bytes(path) == payload
+        finally:
+            with contextlib.suppress(Exception):
+                await dav_storage.delete(path)
+
     async def test_copytree_deep_structure(self, dav_storage: DavStorage) -> None:
         src = f"itd-ct-{uid()}"
         dst = f"itd-ct-dst-{uid()}"

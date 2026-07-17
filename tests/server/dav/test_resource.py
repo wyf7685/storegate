@@ -43,6 +43,30 @@ async def test_reader_seek_buffer_close_and_closed_state() -> None:
         await anyio.to_thread.run_sync(reader.read, 1)
 
 
+async def test_reader_negative_size_reads_to_eof_and_zero_is_non_consuming() -> None:
+    storage = MemoryStorage("/")
+    await storage.upload_bytes(b"abcdef", "/file.bin")
+
+    reader = ResourceReader(storage, "/file.bin")
+    assert await anyio.to_thread.run_sync(reader.read, 0) == b""
+    with pytest.raises(ValueError, match="Cannot seek"):
+        reader.seek(1)
+    assert await anyio.to_thread.run_sync(reader.read, 2) == b"ab"
+    assert await anyio.to_thread.run_sync(reader.read, -1) == b"cdef"
+    assert await anyio.to_thread.run_sync(reader.read, -1) == b""
+    await anyio.to_thread.run_sync(reader.close)
+
+
+async def test_reader_seek_then_negative_size_reads_remaining_file() -> None:
+    storage = MemoryStorage("/")
+    await storage.upload_bytes(b"abcdef", "/file.bin")
+    reader = ResourceReader(storage, "/file.bin")
+    reader.seek(3)
+
+    assert await anyio.to_thread.run_sync(reader.read, -1) == b"def"
+    await anyio.to_thread.run_sync(reader.close)
+
+
 async def test_writer_streams_chunks_and_rejects_writes_after_close() -> None:
     received = bytearray()
 

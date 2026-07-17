@@ -29,16 +29,31 @@ class ResourceReader:
         self._offset = 0
         self._buffer = bytearray()
         self._closed = False
+        self._read_started = False
         self._agen: AsyncGenerator[bytes] | None = None
 
     def seek(self, offset: int) -> None:
-        if self._agen is not None:
+        if self._read_started:
             raise ValueError("Cannot seek after reading has started")
         self._offset = offset
 
     async def _read_impl(self, size: int) -> bytes:
+        self._read_started = True
+        if size == 0:
+            return b""
         if self._agen is None:
             self._agen = self._storage.download_stream(self._path, offset=self._offset)
+
+        if size < 0:
+            while True:
+                try:
+                    chunk = await anext(self._agen)
+                except StopAsyncIteration:
+                    break
+                self._buffer.extend(chunk)
+            result = bytes(self._buffer)
+            self._buffer.clear()
+            return result
 
         while len(self._buffer) < size:
             try:

@@ -55,6 +55,14 @@ flowchart LR
 | `CachedStorage` | 装饰其他后端 | 元数据交叉回填、写后回填、内存/Redis 缓存 |
 | `IndexStorage` | 大文件分块与去重 | SHA-256 内容寻址、引用计数、并发上传、文件锁 |
 
+`LocalStorage` canonicalizes the configured root once (so a symlinked root is
+stable) and rejects symlink, junction, and Windows reparse-point components
+in every logical path, including operation destinations and tree operations.
+This policy addresses static path configuration and accidental link traversal;
+it is not a general OS sandbox and does not claim to close check-to-use (TOCTOU)
+races against a concurrent local attacker. Descriptor/handle-relative access is
+outside this backend's threat model.
+
 ## 环境要求
 
 - Python `>= 3.14`
