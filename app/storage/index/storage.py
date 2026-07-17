@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import dataclasses
 import functools
@@ -33,7 +34,7 @@ class LockLeaseLostError(RuntimeError):
 
 @dataclasses.dataclass(slots=True)
 class _LocalLockGuard:
-    lock: anyio.Lock
+    lock: anyio.Lock = dataclasses.field(default_factory=anyio.Lock)
     references: int = 0
 
 
@@ -203,7 +204,7 @@ class IndexStorage(AbstractStorage):
         registry = IndexStorage._local_lock_guards
         entry = registry.get(key)
         if entry is None:
-            entry = _LocalLockGuard(anyio.Lock())
+            entry = _LocalLockGuard()
             registry[key] = entry
         entry.references += 1
         acquired = False
@@ -276,14 +277,18 @@ class IndexStorage(AbstractStorage):
     @contextlib.asynccontextmanager
     async def _renewing_locks(self, leases: Iterable[_LockLease | None]) -> AsyncGenerator[None]:
         try:
-            async with anyio.create_task_group() as tg:
-                for lease in leases:
-                    if lease is not None:
-                        tg.start_soon(self._renew_storage_file_lock, lease)
-                try:
-                    yield
-                finally:
-                    tg.cancel_scope.cancel()
+            tasks: set[asyncio.Task] = set()
+            for lease in leases:
+                if lease is not None:
+                    tasks.add(asyncio.create_task(self._renew_storage_file_lock(lease)))
+            try:
+                yield
+            finally:
+                for task in tasks:
+                    if task.done():
+                        task.result()  # Propagate any exception raised during renewal
+                    else:
+                        task.cancel()
         except BaseExceptionGroup as group:
             error: BaseException = group
             while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
