@@ -1,6 +1,8 @@
+from typing import Self
 from unittest.mock import AsyncMock
 
 import anyio
+import anyio.lowlevel
 import pytest
 
 from app.storage.s3.client import S3Config
@@ -8,7 +10,7 @@ from app.storage.s3.storage import S3Storage
 
 
 class FakeS3Client:
-    async def __aenter__(self) -> FakeS3Client:
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *_args: object) -> None:

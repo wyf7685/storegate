@@ -113,7 +113,7 @@ class DavStorage(AbstractStorage):
                     self._client = None
             if cleanup_error is not None:
                 self._client = client
-                raise BaseExceptionGroup("WebDAV connection rollback failed", [primary, cleanup_error])
+                raise BaseExceptionGroup("WebDAV connection rollback failed", [primary, cleanup_error]) from None
             raise
         self.log.info(f"Connected to <c>{escape_tag(self._config.base_url)}</c>")
 
@@ -388,6 +388,7 @@ class DavStorage(AbstractStorage):
         backup_rel: str,
     ) -> None:
         """Restore both paths after an ambiguous fallback MOVE result."""
+
         async def _exists(path: str) -> bool:
             try:
                 await self.stat(path)
@@ -413,15 +414,15 @@ class DavStorage(AbstractStorage):
                     if not source_exists and destination_exists:
                         try:
                             await client.move(dst_rel, src_rel, overwrite=True)
-                        except BaseException:
-                            # A response may be lost after the server committed; re-probe.
+                        except BaseException as error:
+                            self.log.warning(f"Failed to restore move source; re-probing: {error!r}")
                             continue
                         continue
                     if backup_exists and not destination_exists:
                         try:
                             await client.move(backup_rel, dst_rel, overwrite=True)
-                        except BaseException:
-                            # A response may be lost after the server committed; re-probe.
+                        except BaseException as error:
+                            self.log.warning(f"Failed to restore move destination; re-probing: {error!r}")
                             continue
                         continue
                     return

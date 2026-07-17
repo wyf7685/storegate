@@ -1,11 +1,15 @@
+import contextlib
+from typing import Self, cast
+
 import anyio
 import anyio.lowlevel
 import pytest
 
+from app.storage.abstract import LifecycleImplementation
 from app.storage.memory import MemoryStorage
 
 
-class CountingStorage(MemoryStorage):
+class CountingStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
     def __init__(self) -> None:
         super().__init__("/")
         self.connect_calls = 0
@@ -53,10 +57,8 @@ async def test_connect_failure_can_retry() -> None:
                 raise RuntimeError("boom")
 
     storage = FailingStorage()
-    try:
+    with contextlib.suppress(RuntimeError):
         await storage.__aenter__()
-    except RuntimeError:
-        pass
     await storage.__aenter__()
     await storage.__aexit__(None, None, None)
     assert storage.connect_calls == 2
@@ -192,7 +194,7 @@ async def test_repeated_and_concurrent_close_are_idempotent() -> None:
 
 
 async def test_superclass_lifecycle_delegation_is_preserved() -> None:
-    class Parent(MemoryStorage):
+    class Parent(MemoryStorage):  # ty: ignore[subclass-of-final-class]
         def __init__(self) -> None:
             super().__init__("/")
             self.parent_connects = 0
@@ -247,7 +249,7 @@ async def test_cancellation_after_connect_before_context_registration_is_safe() 
             self.inner = inner
             self.scope = scope
 
-        async def __aenter__(self) -> CancellingLock:
+        async def __aenter__(self) -> Self:
             await self.inner.acquire()
             self.scope.cancel()
             return self
@@ -261,10 +263,10 @@ async def test_cancellation_after_connect_before_context_registration_is_safe() 
             super().__init__()
             self.cancel_scope: anyio.CancelScope | None = None
 
-        async def _connect_lifecycle(self, implementation: object) -> None:
+        async def _connect_lifecycle(self, implementation: LifecycleImplementation) -> None:
             await super()._connect_lifecycle(implementation)
             assert self.cancel_scope is not None
-            self._lifecycle_lock = CancellingLock(self, self._lifecycle_lock, self.cancel_scope)  # type: ignore[assignment]
+            self._lifecycle_lock = CancellingLock(self, cast("anyio.Lock", self._lifecycle_lock), self.cancel_scope)
 
     storage = RegistrationStorage()
     with anyio.CancelScope() as cancel_scope:
@@ -282,7 +284,7 @@ async def test_cancellation_before_context_registration_rolls_back_connection() 
             super().__init__()
             self.cancel_scope: anyio.CancelScope | None = None
 
-        async def _connect_lifecycle(self, implementation: object) -> None:
+        async def _connect_lifecycle(self, implementation: LifecycleImplementation) -> None:
             await super()._connect_lifecycle(implementation)
             assert self.cancel_scope is not None
             self.cancel_scope.cancel()

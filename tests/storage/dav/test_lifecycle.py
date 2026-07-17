@@ -1,6 +1,8 @@
+from typing import Self
 from unittest.mock import AsyncMock
 
 import anyio
+import anyio.lowlevel
 import pytest
 
 from app.storage.dav.client import DavConfig
@@ -8,7 +10,7 @@ from app.storage.dav.storage import DavStorage
 
 
 class FakeDavClient:
-    async def __aenter__(self) -> FakeDavClient:
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *_args: object) -> None:

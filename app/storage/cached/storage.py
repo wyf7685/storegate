@@ -120,7 +120,9 @@ class CachedStorage(AbstractStorage):
                 except BaseException as secondary:
                     cleanup_error = secondary
             if cleanup_error is not None:
-                raise BaseExceptionGroup("Cached storage connection rollback failed", [primary, cleanup_error]) from None
+                raise BaseExceptionGroup(
+                    "Cached storage connection rollback failed", [primary, cleanup_error]
+                ) from None
             raise
         self.log.info(
             f"Connected (backend=<le>{type(self._cache).__name__}</>, "

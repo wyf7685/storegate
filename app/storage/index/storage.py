@@ -162,7 +162,9 @@ class IndexStorage(AbstractStorage):
                         failed_cleanup.append(index)
             self._pending_rollback.extend(failed_cleanup)
             if cleanup_errors:
-                raise BaseExceptionGroup("Index storage connection rollback failed", [primary, *cleanup_errors]) from None
+                raise BaseExceptionGroup(
+                    "Index storage connection rollback failed", [primary, *cleanup_errors]
+                ) from None
             raise
 
     async def _retry_pending_rollback(self) -> None:

@@ -1,11 +1,11 @@
 import functools
 import json
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, AsyncIterable
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
-from typing import Self
+from typing import Self, cast
 
 import anyio
 import anyio.lowlevel
@@ -28,6 +28,8 @@ class FileInfo:
 type BytesLike = bytes | bytearray | memoryview
 type PathLike = str | PurePath
 
+type LifecycleImplementation = Callable[["AbstractStorage"], Awaitable[None]]
+
 
 def make_cache_identity(kind: str, **fields: object) -> str:
     """Build a canonical, non-secret identity for a persistent cache scope.
@@ -38,6 +40,9 @@ def make_cache_identity(kind: str, **fields: object) -> str:
     return json.dumps({"kind": kind, **fields}, separators=(",", ":"), sort_keys=True)
 
 
+_LIFECYCLE_WRAPPED_ATTRIBUTE = "__storegate_lifecycle_wrapped__"
+
+
 class AbstractStorage(ABC):
     """Abstract storage interface with a concurrency-safe lifecycle."""
 
@@ -45,28 +50,30 @@ class AbstractStorage(ABC):
         super().__init_subclass__(**kwargs)
         connect_impl = cls.__dict__.get("connect")
         close_impl = cls.__dict__.get("close")
-        if connect_impl is not None and not getattr(connect_impl, "_lifecycle_wrapped", False):
+        if connect_impl is not None and not getattr(connect_impl, _LIFECYCLE_WRAPPED_ATTRIBUTE, False):
+            connect_callable = cast("LifecycleImplementation", connect_impl)
 
-            @functools.wraps(connect_impl)
+            @functools.wraps(connect_callable)
             async def connect(self: AbstractStorage) -> None:
                 if self._lifecycle_owner == anyio.get_current_task().id:
-                    await connect_impl(self)  # type: ignore[operator]
+                    await connect_callable(self)
                     return
-                await self._connect_lifecycle(connect_impl)
+                await self._connect_lifecycle(connect_callable)
 
-            connect._lifecycle_wrapped = True  # type: ignore[attr-defined]
-            cls.connect = connect  # type: ignore[assignment]
-        if close_impl is not None and not getattr(close_impl, "_lifecycle_wrapped", False):
+            setattr(connect, _LIFECYCLE_WRAPPED_ATTRIBUTE, True)
+            type.__setattr__(cls, "connect", connect)
+        if close_impl is not None and not getattr(close_impl, _LIFECYCLE_WRAPPED_ATTRIBUTE, False):
+            close_callable = cast("LifecycleImplementation", close_impl)
 
-            @functools.wraps(close_impl)
+            @functools.wraps(close_callable)
             async def close(self: AbstractStorage) -> None:
                 if self._lifecycle_owner == anyio.get_current_task().id:
-                    await close_impl(self)  # type: ignore[operator]
+                    await close_callable(self)
                     return
-                await self._close_lifecycle(close_impl)
+                await self._close_lifecycle(close_callable)
 
-            close._lifecycle_wrapped = True  # type: ignore[attr-defined]
-            cls.close = close  # type: ignore[assignment]
+            setattr(close, _LIFECYCLE_WRAPPED_ATTRIBUTE, True)
+            type.__setattr__(cls, "close", close)
 
     def __init__(self) -> None:
         self.__ctx = 0
@@ -105,14 +112,16 @@ class AbstractStorage(ABC):
     async def ping(self) -> bool:
         raise NotImplementedError
 
-    def _lifecycle_impl(self, name: str) -> object | None:
+    def _lifecycle_impl(self, name: str) -> LifecycleImplementation | None:
         for base in type(self).__mro__:
             implementation = base.__dict__.get(name)
             if implementation is not None:
-                return getattr(implementation, "__wrapped__", implementation)
+                unwrapped = getattr(implementation, "__wrapped__", implementation)
+                if callable(unwrapped):
+                    return cast("LifecycleImplementation", unwrapped)
         return None
 
-    async def _connect_lifecycle(self, implementation: object) -> None:
+    async def _connect_lifecycle(self, implementation: LifecycleImplementation) -> None:
         while True:
             async with self._lifecycle_lock:
                 if self._lifecycle_state == "CONNECTED":
@@ -128,7 +137,7 @@ class AbstractStorage(ABC):
             assert event is not None
             await event.wait()
         try:
-            await implementation(self)  # type: ignore[operator]
+            await implementation(self)
         except BaseException:
             with anyio.CancelScope(shield=True):
                 async with self._lifecycle_lock:
@@ -144,7 +153,7 @@ class AbstractStorage(ABC):
                 event.set()
                 self._lifecycle_event = None
 
-    async def _close_lifecycle(self, implementation: object) -> None:
+    async def _close_lifecycle(self, implementation: LifecycleImplementation) -> None:
         while True:
             async with self._lifecycle_lock:
                 if self._lifecycle_state == "CLOSED":
@@ -161,7 +170,7 @@ class AbstractStorage(ABC):
             assert event is not None
             await event.wait()
         try:
-            await implementation(self)  # type: ignore[operator]
+            await implementation(self)
         except BaseException:
             with anyio.CancelScope(shield=True):
                 async with self._lifecycle_lock:
@@ -210,7 +219,7 @@ class AbstractStorage(ABC):
                                 self._lifecycle_owner = anyio.get_current_task().id
                         if close_event is not None:
                             try:
-                                await close_impl(self)  # type: ignore[operator]
+                                await close_impl(self)
                             except BaseException as secondary:
                                 cleanup_error = secondary
                             with anyio.CancelScope(shield=True):
@@ -221,7 +230,9 @@ class AbstractStorage(ABC):
                                     close_event.set()
                                     self._lifecycle_event = None
                     if cleanup_error is not None:
-                        raise BaseExceptionGroup("Context registration rollback failed", [primary, cleanup_error])
+                        raise BaseExceptionGroup(
+                            "Context registration rollback failed", [primary, cleanup_error]
+                        ) from None
             raise
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
@@ -239,7 +250,7 @@ class AbstractStorage(ABC):
             impl = self._lifecycle_impl("close")
             try:
                 if impl is not None:
-                    await impl(self)  # type: ignore[operator]
+                    await impl(self)
             except BaseException:
                 async with self._lifecycle_lock:
                     self._lifecycle_state = "CONNECTED"

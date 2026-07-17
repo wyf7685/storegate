@@ -8,12 +8,13 @@ from datetime import UTC, datetime, timedelta
 import anyio
 import pytest
 
+from app.storage.abstract import BytesLike, PathLike
 from app.storage.index import IndexStorage
 from app.storage.index.storage import hash_to_path
 from app.storage.memory import MemoryStorage
 
 
-class _CommitThenBlockStorage(MemoryStorage):
+class _CommitThenBlockStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
     def __init__(self, blocked_path: str):
         super().__init__("/")
         self._blocked_path = blocked_path
@@ -21,7 +22,7 @@ class _CommitThenBlockStorage(MemoryStorage):
         self.resume = anyio.Event()
         self._blocked = False
 
-    async def upload_bytes(self, data, remote_path, *, overwrite=True):
+    async def upload_bytes(self, data: BytesLike, remote_path: PathLike, *, overwrite: bool = True) -> None:
         await super().upload_bytes(data, remote_path, overwrite=overwrite)
         if not self._blocked and self.normalize_path(remote_path).as_posix() == self._blocked_path:
             self._blocked = True
@@ -29,18 +30,18 @@ class _CommitThenBlockStorage(MemoryStorage):
             await self.resume.wait()
 
 
-class _FailLaterLockStorage(MemoryStorage):
+class _FailLaterLockStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
     def __init__(self, failed_path: str):
         super().__init__("/")
         self._failed_path = failed_path
 
-    async def upload_bytes(self, data, remote_path, *, overwrite=True):
+    async def upload_bytes(self, data: BytesLike, remote_path: PathLike, *, overwrite: bool = True) -> None:
         if self.normalize_path(remote_path).as_posix() == self._failed_path:
             raise RuntimeError("injected later lock failure")
         await super().upload_bytes(data, remote_path, overwrite=overwrite)
 
 
-class _ReplaceAfterReadStorage(MemoryStorage):
+class _ReplaceAfterReadStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
     def __init__(self):
         super().__init__("/")
         self._replacement_path: str | None = None
@@ -50,7 +51,7 @@ class _ReplaceAfterReadStorage(MemoryStorage):
         self._replacement_path = self.normalize_path(remote_path).as_posix()
         self._replacement = data
 
-    async def download_bytes(self, remote_path):
+    async def download_bytes(self, remote_path: PathLike) -> bytes:
         data = await super().download_bytes(remote_path)
         if self.normalize_path(remote_path).as_posix() == self._replacement_path:
             replacement = self._replacement
@@ -61,12 +62,14 @@ class _ReplaceAfterReadStorage(MemoryStorage):
         return data
 
 
-class _BlockingExistsStorage(MemoryStorage):  # type: ignore[subclass-of-final-class]
-    async def exists(self, path):
+class _BlockingExistsStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
+    async def exists(self, path: PathLike) -> bool:
+        _ = path
         await anyio.sleep_forever()
+        return False
 
 
-class _BlockingLockStorage(MemoryStorage):  # type: ignore[subclass-of-final-class]
+class _BlockingLockStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
     def __init__(self, blocked_path: str, *, failed_path: str | None = None):
         super().__init__("/")
         self._blocked_path = blocked_path
@@ -88,7 +91,7 @@ class _BlockingLockStorage(MemoryStorage):  # type: ignore[subclass-of-final-cla
         self._block_download_call = None
         self._download_calls = 0
 
-    async def upload_bytes(self, data, remote_path, *, overwrite=True):
+    async def upload_bytes(self, data: BytesLike, remote_path: PathLike, *, overwrite: bool = True) -> None:
         path = self.normalize_path(remote_path).as_posix()
         if path == self._failed_path:
             raise RuntimeError("injected later lock failure")
@@ -98,14 +101,14 @@ class _BlockingLockStorage(MemoryStorage):  # type: ignore[subclass-of-final-cla
         if path == self._blocked_path and self.block_upload:
             await anyio.sleep_forever()
 
-    async def download_bytes(self, remote_path):
+    async def download_bytes(self, remote_path: PathLike) -> bytes:
         if self.normalize_path(remote_path).as_posix() == self._blocked_path:
             self._download_calls += 1
             if self._download_calls == self._block_download_call:
                 await anyio.sleep_forever()
         return await super().download_bytes(remote_path)
 
-    async def unlink(self, path, *, missing_ok=False):
+    async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
         if self.normalize_path(path).as_posix() == self._blocked_path and self.block_unlink:
             await anyio.sleep_forever()
         await super().unlink(path, missing_ok=missing_ok)
@@ -116,7 +119,7 @@ def test_invalid_block_size(block_size: int | float) -> None:
     index = MemoryStorage("/")
     chunks = MemoryStorage("/")
     with pytest.raises(ValueError, match="block_size"):
-        IndexStorage(index, chunks, block_size=block_size)
+        IndexStorage(index, chunks, block_size=block_size)  # ty: ignore[invalid-argument-type]
 
 
 @pytest.mark.parametrize("workers", [0, -1, 0.5, math.nan, math.inf, -math.inf])
@@ -124,7 +127,7 @@ def test_invalid_upload_concurrency(workers: int | float) -> None:
     index = MemoryStorage("/")
     chunks = MemoryStorage("/")
     with pytest.raises(ValueError, match="max_concurrent_uploads"):
-        IndexStorage(index, chunks, max_concurrent_uploads=workers)
+        IndexStorage(index, chunks, max_concurrent_uploads=workers)  # ty: ignore[invalid-argument-type]
 
 
 @pytest.mark.parametrize("duration", [math.nan, math.inf, -math.inf])
@@ -359,7 +362,8 @@ async def test_concurrent_paths_preserve_shared_chunk_refs() -> None:
             tg.start_soon(storage.upload_bytes, b"shared", "/b")
         meta_a = await storage._get_file_meta("/a")
         meta_b = await storage._get_file_meta("/b")
-        assert meta_a is not None and meta_b is not None
+        assert meta_a is not None
+        assert meta_b is not None
         assert meta_a.chunks == meta_b.chunks
         refs = await storage._chunk_load_refs(meta_a.chunks[0])
         assert refs == {"/a", "/b"}
@@ -415,7 +419,11 @@ async def test_handoff_upload_respects_acquisition_deadline_and_cleans_lock() ->
 @pytest.mark.parametrize("blocked_operation", ["first_download", "second_download", "unlink"])
 async def test_release_backend_operations_respect_cleanup_deadline(blocked_operation: str) -> None:
     index = _BlockingLockStorage("/release-timeout.lock")
-    async with index, MemoryStorage("/") as chunks, IndexStorage(index, chunks, lock_timeout=0.03) as storage:
+    async with (
+        index,
+        MemoryStorage("/") as chunks,
+        IndexStorage(index, chunks, lock_timeout=0.03) as storage,
+    ):
         lease = await storage._acquire_storage_file_lock(index, "/release-timeout.lock")
         assert lease is not None
         if blocked_operation == "first_download":

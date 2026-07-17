@@ -183,28 +183,27 @@ tests/
 
 ### 各后端行为差异
 
-`AbstractStorage` 的文档（docstring）是各方法的权威契约。以下为已知的跨后端差异：
+`AbstractStorage` 的文档（docstring）是各方法的权威契约。以下为已知的跨后端一致行为和实现差异：
 
-| 方法 / 场景 | MemoryStorage | LocalStorage | S3Storage | IndexStorage | DavStorage | FTPStorage |
-|---|---|---|---|---|---|---|
-| `rmdir` nonexistent | `FileNotFoundError` | `FileNotFoundError` | 静默成功 | `FileNotFoundError` | 静默成功（对齐 S3） | `FileNotFoundError` |
-| `rmtree` 文件路径 | `NotADirectoryError` | `NotADirectoryError` | `NotADirectoryError` | 委托内部后端 | `NotADirectoryError` | `NotADirectoryError` |
-| `move` 目标为文件 | `FileExistsError` | 覆盖（POSIX rename） | 覆盖（copy+unlink） | `FileExistsError` | 覆盖（MOVE Overwrite:T，412 时先删目标再重试） | `FileExistsError` |
-| `copy` 目标存在 | `FileExistsError` | 覆盖（shutil） | 覆盖（CopyObject） | `FileExistsError` | 覆盖（COPY Overwrite:T） | 覆盖（RETR→STOR 中继） |
-| `delete_many` | fail-fast（基类默认） | fail-fast（基类默认） | fail-fast（S3 批量优化） | fail-fast（基类默认） | fail-fast（基类默认） | fail-fast（基类默认） |
-| `upload_stream` 重复路径 | stat → IsADirectoryError/FileExistsError | ← 同 | ← 同 | ← 同 | ← 同 | ← 同 |
-
-所有后端的 `upload_stream` 入口统一通过 `stat()` 网关检查：目录 → `IsADirectoryError`，文件 + overwrite=False → `FileExistsError`。
+| 方法 / 场景 | 最终契约 / 后端说明 |
+|---|---|
+| `unlink` / `rmdir` | 严格删除：缺失路径均抛出 `FileNotFoundError`（`unlink(..., missing_ok=True)` 除外）；`unlink` 遇目录抛 `IsADirectoryError`，`rmdir` 遇文件抛 `NotADirectoryError`、非空目录抛 `OSError`。 |
+| `delete` / `delete_many` | `delete` 仅删除文件或空目录；`delete_many` 按顺序跳过缺失路径，并对其他错误 fail-fast，之前已删除的路径不回滚。 |
+| `move` / `copy` | 默认 `overwrite=True`；源或目标目录抛 `IsADirectoryError`，缺失源抛 `FileNotFoundError`，已有目标文件在 `overwrite=False` 时抛 `FileExistsError`。同路径仅在 `overwrite=True` 时是无操作。 |
+| `copytree` / `movetree` | 默认 `overwrite=True`；`overwrite=False` 且目标已存在时抛 `FileExistsError`。失败时各事务性后端恢复被覆盖的目标内容，并保留原操作与回滚错误。 |
+| `upload_stream` 重复路径 | 所有后端先经 `stat()` 网关检查：目录 → `IsADirectoryError`，文件 + `overwrite=False` → `FileExistsError`。 |
+| 生命周期 | `connect` / `close` 可重入且并发调用共享单一转换；失败恢复到可重试状态，context 注册取消时对已连接后端执行受保护回滚。 |
 
 ### 关键实现细节
 
-- **S3 目录模拟**: 以 `<key>/` 标记对象表示目录，其内容为序列化的 `FileInfo`。`client/` 是手写的 S3 API 封装（基于 httpx，AWS SigV4 签名），支持 AWS S3 及所有 S3 兼容服务（MinIO、腾讯云 COS 等），通过 `S3Config.endpoint_url` + `path_style` 配置端点寻址（virtual-hosted / path-style）。大文件分片上传（`MultipartUploadTask`，支持重试和并发），大文件服务端拷贝自动切换为 multipart copy（>4MiB），`delete`/`delete_many` 内联分支减少请求（`delete_many` 复用已获取的 `dir_key` 而非通过 `is_dir()` 再次 `head_object`），`rmtree` 批量删除（每次 100 个），`copytree` 并发复制。**回滚支持**: `move`、`copytree`、`_copy_multipart` 失败时自动回滚（删除已复制的目标或 abort multipart upload）。
-- **DavStorage**: WebDAV 客户端后端，与 `S3Storage` 对称（自研 `client/` SDK + `storage.py` 适配器，基于 httpx）。支持 Basic / Bearer / 匿名认证与 HTTPS/TLS（含自定义 CA `ca_cert_path`）。`root_prefix` 在 `base_url` 下隔离多实例（类比 S3 bucket）。方法映射：`PROPFIND`（Depth:0/1）→ stat/iterdir，`PUT`（httpx 流式 body）→ upload_stream，`GET`（Range）→ download_stream，`MKCOL` → mkdir，`DELETE` → unlink/rmdir/rmtree，`COPY`/`MOVE`（Overwrite 头）→ copy/move/copytree/movetree。`rmdir` 需 DELETE 前用 `iterdir` 预检空（WebDAV DELETE 天然递归）；`rmtree` 单次 DELETE 递归删集合；`walk` 用递归 Depth:1（避开被 Nextcloud/mod_dav 默认禁用的 infinity）；`copytree`/`movetree` 优先服务端 `COPY`/`MOVE` Depth:infinity，服务器返回 403/405/409/501 时回退 walk+逐文件 copy（回退失败 `rmtree(dst)` 回滚）。`move` 对 412（服务器拒覆盖）先删目标再重试以维持覆盖语义。`ExceptionTranslator` 映射 404→FileNotFoundError、403/423→PermissionError、412→FileExistsError；405 语义重载（MKCOL 已存在 / PUT 到集合）在各方法内联处理。multistatus XML 用 `xml.etree` + `{*}tag` 通配解析（与 S3 client 同法）。
-- **IndexStorage**: 大文件按 `BLOCK_SIZE (64MB)` 拆分分块，SHA-256 去重，引用计数管理。使用基于文件锁的乐观并发控制（`_acquire_storage_file_lock`）。分块存储在 `hash[:2]/hash[2:6]/hash[6:].{bin,ref,lock}` 路径下。`upload_stream` 使用 worker pool 并发上传分块，失败时回滚已写入分块的引用计数。覆盖写入时自动 decref 旧文件不再引用的分块。**所有公开入口方法统一调用 `_to_abs_path()` 规范化路径为绝对路径**，确保 `FileMeta` 和 chunk ref 文件中存储的路径一致。`copytree`/`movetree` 批量操作 chunk refs（`incref`/`transref`），`list_()`/`walk()` 并发获取文件元数据。`move` 和 `copy` 使用 `PurePosixPath` 而非 `Path`（跨平台一致性）。
+- **S3 目录模拟**: 以 `<key>/` 标记对象表示目录，其内容为序列化的 `FileInfo`。`client/` 是手写的 S3 API 封装（基于 httpx，AWS SigV4 签名），支持 AWS S3 及所有 S3 兼容服务（MinIO、腾讯云 COS 等），通过 `S3Config.endpoint_url` + `path_style` 配置端点寻址（virtual-hosted / path-style）。大文件分片上传（`MultipartUploadTask`，支持重试和并发），大文件服务端拷贝自动切换为 multipart copy（>4MiB）。`move`、`copytree`、`_copy_multipart` 失败时自动回滚；overwrite 操作先暂存目标备份，回滚失败与主错误共同保留。
+- **DavStorage**: WebDAV 客户端后端，与 `S3Storage` 对称（自研 `client/` SDK + `storage.py` 适配器，基于 httpx）。支持 Basic / Bearer / 匿名认证与 HTTPS/TLS（含自定义 CA `ca_cert_path`）。方法映射：`PROPFIND`（Depth:0/1）→ stat/iterdir，`PUT`（httpx 流式 body）→ upload_stream，`GET`（Range）→ download_stream，`MKCOL` → mkdir，`DELETE` → unlink/rmdir/rmtree，`COPY`/`MOVE`（Overwrite 头）→ copy/move/copytree/movetree。`rmdir` 需 DELETE 前用 `iterdir` 预检空（WebDAV DELETE 天然递归）；`rmtree` 单次 DELETE 递归删集合；`walk` 用递归 Depth:1（避开被 Nextcloud/mod_dav 默认禁用的 infinity）；`copytree`/`movetree` 优先服务端 `COPY`/`MOVE` Depth:infinity，服务器返回 403/405/409/501 时回退 walk+逐文件 copy（回退失败恢复目标）。`move` 对 412（服务器拒覆盖）先删目标再重试以维持覆盖语义。
+- **IndexStorage**: 大文件按 `BLOCK_SIZE (64MB)` 拆分分块，SHA-256 去重，引用计数管理。文件锁带 owner、lease 和绝对 acquisition deadline：持锁期间自动续租，慢速 handoff、取消和清理均受 deadline/guard 约束，释放只删除自己仍持有的锁。索引和 chunk 子后端连接失败时关闭已启动子项；回滚关闭失败会保存并在下一次 `connect()` 前重试。覆盖写、copy、move 和树操作对 refs 采用事务性 guard/rollback。所有公开入口方法统一调用 `_to_abs_path()` 规范化路径为绝对路径，确保 `FileMeta` 和 chunk ref 文件中存储的路径一致。
 - **CachedStorage**: 6 个命名空间缓存 (`exists/is_file/is_dir/stat/iterdir/download`)。正结果交叉后填（如 `is_file=True` → 同时缓存 `exists=True, is_dir=False`）。写入操作回填已知状态。`CacheBackend` 抽象接口支持批量操作（`mget`/`mset`/`mdelete`），内置 `MemoryCacheBackend` 和 `RedisCacheBackend`。**`snapshot()` / `dump_cache()`** 内省 API 暴露缓存内部状态供测试验证命中/未命中/回填/失效行为。`list_()` 永远绕过 `iterdir` 缓存直接查询底层存储但回填逐条目元数据缓存。
-- **FTPStorage**: plain FTP 客户端后端，`root_prefix` 将逻辑根隔离到远端绝对 POSIX 子目录；路径拒绝 NUL/`..` 越界。`FTPClientPool` 通过 `max_connections`（默认 1）按需创建 client，每个 lease 独占控制通道，transfer 在 EOF/`aclose()` 前持续持有 lease；取消、timeout 或控制通道失步会 invalidate 并淘汰连接。listing/walk 在 lease 内完整物化并排序，释放后才 yield。FTP 无服务端 COPY，`copy`/`copytree` 使用一个 pool source client + 一个操作级临时 destination client 流式中继；copytree 失败仅回滚本次创建内容。当前仅支持 plain FTP，不支持 FTPS/FTPES。
+- **FTPStorage**: plain FTP 客户端后端，`root_prefix` 将逻辑根隔离到远端绝对 POSIX 子目录；路径拒绝 NUL/`..` 越界。`FTPClientPool` 通过 `max_connections`（默认 1）按需创建 client，每个 lease 独占控制通道，transfer 在 EOF/`aclose()` 前持续持有 lease；取消、timeout 或控制通道失步会 invalidate 并淘汰连接。listing/walk 在 lease 内完整物化并排序，释放后才 yield。FTP 无服务端 COPY，`copy`/`copytree` 使用一个 pool source client + 一个操作级临时 destination client 流式中继；overwrite 和失败回滚遵从公共契约。当前仅支持 plain FTP，不支持 FTPS/FTPES。
+- **LocalStorage**: root 在构造时 canonicalize；每个逻辑路径及递归树操作拒绝现有 symlink、junction 和 Windows reparse-point 组件，避免通过链接逃逸。该检查不防御检查与系统调用之间的并发替换（TOCTOU）。
+- **WebDAV 服务**: 基于 wsgidav，通过 `run_async()` 桥接同步 wsgidav 到异步 `AbstractStorage`。`ResourceReader` 只允许首次读取前设置 offset，首次读取后拒绝 seek，确保 Range 边界稳定；`ResourceWriter` 使用独立线程 + memory object stream 处理异步上传；close/abort 通过事件循环执行 stream 关闭和 CancelScope 取消，避免从 wsgidav 工作线程直接操作 AnyIO 对象。
 - **FTP 服务端**: 基于 `aioftp`，`StoragePathIO` 将协议文件操作映射到 `AbstractStorage`，`ReadHandle` / `WriteHandle` 保持下载和上传流式传输。仅支持 `rb` / `wb`，禁用 APPE；REST 仅用于 RETR 下载 offset，非零 REST + STOR 返回 504 且不修改目标文件。
-- **WebDAV**: 基于 wsgidav，通过 `run_async()` 桥接同步 wsgidav 到异步 `AbstractStorage`。`ResourceWriter` 使用独立线程 + memory object stream 处理异步上传；close/abort 通过事件循环执行 stream 关闭和 CancelScope 取消，避免从 wsgidav 工作线程直接操作 AnyIO 对象。
 - **日志**: 使用 loguru，`LoggerWrapper` 为每个类提供带色彩标签的实例日志器。支持 `LoguruOpts` 灵活配置日志选项（exception/record/lazy/colors/raw/capture/depth/ansi）。`LoguruHandler` 将标准库 logging 桥接到 loguru。
 - **异常处理**: `ExceptionTranslator` 提供统一的异常翻译装饰器，支持 `bypass`、`catch`、`default` 异常分类和自定义异常映射。同时支持 `wrap`（普通异步函数）和 `wrap_agen`（异步生成器）。
 

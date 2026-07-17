@@ -96,7 +96,7 @@ class S3Storage(AbstractStorage):
                     self._client = None
             if cleanup_error is not None:
                 self._client = client
-                raise BaseExceptionGroup("S3 connection rollback failed", [primary, cleanup_error])
+                raise BaseExceptionGroup("S3 connection rollback failed", [primary, cleanup_error]) from None
             raise
         self.log.info(f"Connected to bucket <c>{self._config.bucket}</c> in region <c>{self._config.region}</c>")
 
@@ -639,10 +639,10 @@ class S3Storage(AbstractStorage):
                     raise BaseExceptionGroup(
                         f"Failed to copy tree: {src} → {dst}; rollback also failed",
                         [exc, rollback_exc],
-                    )
+                    ) from None
                 if isinstance(rollback_exc, anyio.get_cancelled_exc_class()):
-                    raise rollback_exc
-                raise exc
+                    raise
+                raise exc from None
             if isinstance(exc, Exception):
                 raise OSError(f"Failed to copy tree: {src} → {dst}") from exc
             raise

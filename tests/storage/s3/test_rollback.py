@@ -12,7 +12,7 @@ import pytest
 from pydantic import SecretStr
 from pytest_mock import MockerFixture
 
-from app.storage.abstract import FileInfo
+from app.storage.abstract import FileInfo, PathLike
 from app.storage.s3.client import CopyPartResult, S3Config, S3HttpStatusError
 from app.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
 from app.utils import flatten_exception_group
@@ -124,7 +124,6 @@ class TestMoveRollback:
         assert mock_delete.call_count == 2
 
 
-
 # ---------------------------------------------------------------------------
 # copytree() overwrite rollback
 # ---------------------------------------------------------------------------
@@ -164,7 +163,7 @@ class TestCopytreeRollback:
                     deleted.append(key)
             return deleted
 
-        async def _walk(_path: object) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+        async def _walk(_path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
             yield (
                 "/src",
                 [FileInfo(path="/src/sub", name="sub", is_dir=True)],
@@ -174,7 +173,7 @@ class TestCopytreeRollback:
                 ],
             )
 
-        async def _copy(src: object, dst: object, *, overwrite: bool = True) -> None:
+        async def _copy(src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
             _ = overwrite
             src_key = storage._remote_path_to_key(src)
             dst_key = storage._remote_path_to_key(dst)
@@ -182,12 +181,14 @@ class TestCopytreeRollback:
                 raise OSError("injected second copy failure")
             objects[dst_key] = objects[src_key]
 
-        storage._client.head_object = _head
-        storage._client.put_object = _put
-        storage._client.put_object_copy = _put_copy
-        storage._client.delete_objects = _delete_objects
-        storage.walk = _walk
-        storage.copy = _copy
+        client = storage._client
+        assert client is not None
+        client.head_object = _head  # ty: ignore[invalid-assignment]
+        client.put_object = _put  # ty: ignore[invalid-assignment]
+        client.put_object_copy = _put_copy  # ty: ignore[invalid-assignment]
+        client.delete_objects = _delete_objects  # ty: ignore[invalid-assignment]
+        storage.walk = _walk  # ty: ignore[invalid-assignment]
+        storage.copy = _copy  # ty: ignore[invalid-assignment]
 
         if restore_fails:
             with pytest.raises(BaseExceptionGroup) as exc_info:
@@ -245,25 +246,28 @@ class TestCopytreeRollback:
                 objects.pop(key, None)
             return pending
 
-        async def _walk(_path: object) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+        async def _walk(_path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
             yield "/src", [], [FileInfo(path="/src/a.txt", name="a.txt", is_dir=False)]
 
-        async def _copy(src: object, dst: object, *, overwrite: bool = True) -> None:
+        async def _copy(src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
             _ = overwrite
             objects[storage._remote_path_to_key(dst)] = objects[storage._remote_path_to_key(src)]
 
-        storage._client.head_object = _head
-        storage._client.put_object = _put
-        storage._client.put_object_copy = _put_copy
-        storage._client.delete_objects = _delete_objects
-        storage.walk = _walk
-        storage.copy = _copy
+        client = storage._client
+        assert client is not None
+        client.head_object = _head  # ty: ignore[invalid-assignment]
+        client.put_object = _put  # ty: ignore[invalid-assignment]
+        client.put_object_copy = _put_copy  # ty: ignore[invalid-assignment]
+        client.delete_objects = _delete_objects  # ty: ignore[invalid-assignment]
+        storage.walk = _walk  # ty: ignore[invalid-assignment]
+        storage.copy = _copy  # ty: ignore[invalid-assignment]
 
         await storage.copytree("/src", "/dst", overwrite=True)
 
         assert objects["dst/a.txt"] == b"new a"
         assert not any(".storegate-copytree-backup-" in key for key in objects)
         assert delete_attempts == (1 if delete_after_mutation else 2)
+
 
 # ---------------------------------------------------------------------------
 # _copy_multipart rollback

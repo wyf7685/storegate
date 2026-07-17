@@ -2,13 +2,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.storage.abstract import BytesLike, PathLike
 from app.storage.ftp import FTPConfig, FTPStorage
 from app.storage.index import IndexStorage
 from app.storage.index.storage import CHUNKS_INDEX_FILE
 from app.storage.memory import MemoryStorage
 
 
-class FailingDownloadStorage(MemoryStorage):
+class FailingDownloadStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
     def __init__(self) -> None:
         super().__init__("/")
         self.fail_download = True
@@ -21,14 +22,14 @@ class FailingDownloadStorage(MemoryStorage):
     async def close(self) -> None:
         self.close_calls += 1
 
-    async def download_bytes(self, remote_path: str) -> bytes:
+    async def download_bytes(self, remote_path: PathLike) -> bytes:
         if self.fail_download:
             self.fail_download = False
             raise RuntimeError("download failed")
         return await super().download_bytes(remote_path)
 
 
-class FailingBindingStorage(MemoryStorage):
+class FailingBindingStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
     def __init__(self) -> None:
         super().__init__("/")
         self.fail_upload = True
@@ -41,14 +42,14 @@ class FailingBindingStorage(MemoryStorage):
     async def close(self) -> None:
         self.close_calls += 1
 
-    async def upload_bytes(self, data: bytes, remote_path: str, *, overwrite: bool = True) -> None:
+    async def upload_bytes(self, data: BytesLike, remote_path: PathLike, *, overwrite: bool = True) -> None:
         if self.fail_upload:
             self.fail_upload = False
             raise RuntimeError("binding failed")
         await super().upload_bytes(data, remote_path, overwrite=overwrite)
 
 
-class RollbackStorage(MemoryStorage):
+class RollbackStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
     def __init__(
         self,
         label: str = "storage",
@@ -78,7 +79,7 @@ class RollbackStorage(MemoryStorage):
             self.close_failures -= 1
             raise OSError(f"{self.label} rollback close failed")
 
-    async def download_bytes(self, remote_path: str) -> bytes:
+    async def download_bytes(self, remote_path: PathLike) -> bytes:
         if self.read_error is not None:
             error = self.read_error
             self.read_error = None
@@ -136,7 +137,7 @@ async def test_ftp_chunks_pool_is_recreated_after_index_binding_rollback(monkeyp
     ftp = FTPStorage(FTPConfig(host="127.0.0.1", username="u", password="p"))
     first_pool = FakePool()
     replacement_pool = FakePool()
-    ftp._pool = first_pool  # type: ignore[assignment]
+    ftp._pool = first_pool  # ty: ignore[invalid-assignment]
     monkeypatch.setattr(ftp, "_new_pool", lambda: replacement_pool)
     monkeypatch.setattr(
         ftp,
