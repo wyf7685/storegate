@@ -7,11 +7,11 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
-    Coroutine,
     Generator,
     Iterable,
 )
-from typing import TYPE_CHECKING, Any, Concatenate, Literal, TypedDict, Unpack
+from types import CoroutineType
+from typing import TYPE_CHECKING, Any, Concatenate, Literal, TypedDict, Unpack, cast
 
 from pydantic import TypeAdapter
 
@@ -53,7 +53,8 @@ class LoggerWrapper:
         message: str,
         **opts: Unpack[LoguruOpts],
     ) -> None:
-        self.logger.opt(**{**opts, "colors": True}).log(level, f"<m>{self.logger_name}</m> | {message}")
+        opts["colors"] = True
+        self.logger.opt(**opts).log(level, f"<m>{self.logger_name}</m> | {message}")
 
     __call__ = log
 
@@ -80,7 +81,8 @@ class LoggerWrapper:
             return method
 
     def exception(self, message: str, **opts: Unpack[LoguruOpts]) -> None:
-        self.log("ERROR", message, **{**opts, "exception": True})
+        opts["exception"] = True
+        self.log("ERROR", message, **opts)
 
 
 def logger_wrapper(logger_name: str, /) -> LoggerWrapper:
@@ -205,13 +207,13 @@ class ExceptionTranslator:
         default_message: str,
     ) -> Callable[
         [Callable[Concatenate[S, P], Awaitable[R]]],
-        Callable[Concatenate[S, P], Coroutine[None, None, R]],
+        Callable[Concatenate[S, P], CoroutineType[Any, Any, R]],
     ]:
         translator = self
 
         def decorator(
             func: Callable[Concatenate[S, P], Awaitable[R]],
-        ) -> Callable[Concatenate[S, P], Coroutine[None, None, R]]:
+        ) -> Callable[Concatenate[S, P], CoroutineType[Any, Any, R]]:
             @functools.wraps(func)
             async def wrapper(self: S, *args: P.args, **kwargs: P.kwargs) -> R:
                 try:
@@ -272,7 +274,7 @@ class ExceptionTranslator:
         def decorator(
             handler: Callable[[ExceptionGroup[E], str], Exception],
         ) -> Callable[[ExceptionGroup[E], str], Exception]:
-            self.exception_map[exc_type] = handler  # ty:ignore[invalid-assignment]
+            self.exception_map[exc_type] = cast("Callable[[ExceptionGroup, str], Exception]", handler)
             return handler
 
         return decorator

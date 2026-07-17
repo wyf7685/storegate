@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from pytest_mock import MockerFixture
 
 from app.storage.s3.client import AsyncS3Client, S3Config
@@ -15,8 +16,8 @@ from app.storage.s3.utils import MultipartUploadTask
 
 def _config() -> S3Config:
     return S3Config(
-        access_key_id="test-access-key",
-        secret_access_key="test-secret-key",
+        access_key_id=SecretStr("test-access-key"),
+        secret_access_key=SecretStr("test-secret-key"),
         region="us-east-1",
         bucket="test-bucket",
     )

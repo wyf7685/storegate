@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from app.storage.dav.client.models import DavConfig
 
@@ -46,7 +47,7 @@ class TestDavConfigValidation:
             base_url="https://host/dav",
             auth_mode="basic",
             username="user",
-            password="secret",
+            password=SecretStr("secret"),
         )
         assert cfg.username == "user"
         assert cfg.password is not None

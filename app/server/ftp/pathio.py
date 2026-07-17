@@ -2,8 +2,8 @@ import builtins
 import os
 import stat
 from collections.abc import AsyncGenerator, AsyncIterable
-from pathlib import PurePath, PurePosixPath
-from typing import TYPE_CHECKING, final, override
+from pathlib import Path, PurePath, PurePosixPath
+from typing import TYPE_CHECKING, cast, final, override
 
 from aioftp import AbstractAsyncLister, with_timeout
 from aioftp.common import Connection
@@ -17,8 +17,6 @@ from .handle import FileHandle, ReadHandle, WriteHandle
 
 if TYPE_CHECKING:
     from _typeshed import OpenBinaryMode, ReadableBuffer
-
-PathType = PurePosixPath
 
 
 def _file_info_to_stat(
@@ -61,19 +59,21 @@ def _file_info_to_stat(
 
 
 @final
-class StoragePathIO(AbstractPathIO[PathType]):
+class StoragePathIO(AbstractPathIO[Path]):
+    storage: AbstractStorage
+
     @override
     def __init__(
         self,
-        storage: AbstractStorage,
         *,
         timeout: float | int | None = None,
         connection: Connection | None = None,
         state: builtins.list[object] | None = None,
     ):
-        super().__init__(timeout=timeout, connection=connection)
-        self.storage = storage
+        if not hasattr(self, "storage"):
+            raise TypeError("StoragePathIO should bound to a storage instance before instantiation.")
 
+        super().__init__(timeout=timeout, connection=connection)
         if connection is not None:
             host, port = connection.client_host, connection.client_port
             name = f"StoragePathIO <c><i>{escape_tag(host)}</>:<i>{port}</></>"
@@ -81,121 +81,128 @@ class StoragePathIO(AbstractPathIO[PathType]):
             name = "StoragePathIO <c><i>Unknown</></>"
         self.log = logger_wrapper(name)
 
+    @classmethod
+    def with_storage(cls, storage: AbstractStorage) -> type[StoragePathIO]:
+        new_cls = type("StoragePathIO", (cls,), {"storage": storage})
+        return cast("type[StoragePathIO]", new_cls)
+
     @staticmethod
-    def _normalize_path(path: PurePath) -> PathType:
+    def _normalize_path(path: PurePath) -> PurePosixPath:
         return AbstractStorage.normalize_path(PurePosixPath(path))
 
     @override
     @universal_exception
-    async def exists(self, path: PathType) -> bool:
-        path = self._normalize_path(path)
-        self.log.debug(f"<le>exists</>(<y><u>{escape_tag(path)}</></>)")
-        return await self.storage.exists(path)
+    async def exists(self, path: Path) -> bool:
+        np = self._normalize_path(path)
+        self.log.debug(f"<le>exists</>(<y><u>{escape_tag(np)}</></>)")
+        return await self.storage.exists(np)
 
     @override
     @universal_exception
-    async def is_dir(self, path: PathType) -> bool:
-        path = self._normalize_path(path)
-        self.log.debug(f"<le>is_dir</>(<y><u>{escape_tag(path)}</></>)")
-        return await self.storage.is_dir(path)
+    async def is_dir(self, path: Path) -> bool:
+        np = self._normalize_path(path)
+        self.log.debug(f"<le>is_dir</>(<y><u>{escape_tag(np)}</></>)")
+        return await self.storage.is_dir(np)
 
     @override
     @universal_exception
-    async def is_file(self, path: PathType) -> bool:
-        path = self._normalize_path(path)
-        self.log.debug(f"<le>is_file</>(<y><u>{escape_tag(path)}</></>)")
-        return await self.storage.is_file(path)
+    async def is_file(self, path: Path) -> bool:
+        np = self._normalize_path(path)
+        self.log.debug(f"<le>is_file</>(<y><u>{escape_tag(np)}</></>)")
+        return await self.storage.is_file(np)
 
     @override
     @universal_exception
-    async def mkdir(self, path: PathType, *, parents: bool = False, exist_ok: bool = False) -> None:
-        path = self._normalize_path(path)
+    async def mkdir(self, path: Path, *, parents: bool = False, exist_ok: bool = False) -> None:
+        np = self._normalize_path(path)
         self.log.debug(
-            f"<le>mkdir</>(<y><u>{escape_tag(path)}</></>, parents=<c>{parents}</>, exist_ok=<c>{exist_ok}</>)"
+            f"<le>mkdir</>(<y><u>{escape_tag(np)}</></>, parents=<c>{parents}</>, exist_ok=<c>{exist_ok}</>)"
         )
-        await self.storage.mkdir(path, parents=parents, exist_ok=exist_ok)
+        await self.storage.mkdir(np, parents=parents, exist_ok=exist_ok)
 
     @override
     @universal_exception
-    async def rmdir(self, path: PathType) -> None:
-        path = self._normalize_path(path)
-        self.log.debug(f"<le>rmdir</>(<y><u>{escape_tag(path)}</></>)")
-        if path == PurePosixPath("/"):
+    async def rmdir(self, path: Path) -> None:
+        np = self._normalize_path(path)
+        self.log.debug(f"<le>rmdir</>(<y><u>{escape_tag(np)}</></>)")
+        if np == PurePosixPath("/"):
             raise OSError("Cannot remove root directory")
-        await self.storage.rmdir(path)
+        await self.storage.rmdir(np)
 
     @override
     @universal_exception
-    async def unlink(self, path: PathType) -> None:
-        path = self._normalize_path(path)
-        self.log.debug(f"<le>unlink</>(<y><u>{escape_tag(path)}</></>)")
-        await self.storage.unlink(path)
+    async def unlink(self, path: Path) -> None:
+        np = self._normalize_path(path)
+        self.log.debug(f"<le>unlink</>(<y><u>{escape_tag(np)}</></>)")
+        await self.storage.unlink(np)
 
     @override
-    def list(self, path: PathType) -> AsyncIterable[PathType]:
-        path = self._normalize_path(path)
-        self.log.debug(f"<le>list</>(<y><u>{escape_tag(path)}</></>)")
+    def list(self, path: Path) -> AsyncIterable[Path]:
+        np = self._normalize_path(path)
+        self.log.debug(f"<le>list</>(<y><u>{escape_tag(np)}</></>)")
 
-        async def generator() -> AsyncGenerator[PathType]:
-            async for item in self.storage.iterdir(self._normalize_path(path)):
+        async def generator() -> AsyncGenerator[PurePosixPath]:
+            async for item in self.storage.iterdir(self._normalize_path(np)):
                 yield PurePosixPath(item.path)
 
-        class Lister(AbstractAsyncLister):
+        class Lister(AbstractAsyncLister[Path]):
             @override
             def __init__(self, timeout: float | int | None = None) -> None:
                 super().__init__(timeout=timeout)
-                self._agen = None
+                self.agen: AsyncGenerator[PurePosixPath] | None = None
 
             @override
             @universal_exception
             @with_timeout
-            async def __anext__(self) -> PathType:
-                if self._agen is None:
-                    self._agen = generator()
-                return await anext(self._agen)
+            async def __anext__(self) -> Path:
+                if self.agen is None:
+                    self.agen = generator()
+                return Path(await anext(self.agen))
 
         return Lister(timeout=self.timeout)
 
     @override
     @universal_exception
-    async def stat(self, path: PathType) -> os.stat_result:
-        path = self._normalize_path(path)
-        self.log.debug(f"<le>stat</>(<y><u>{escape_tag(path)}</></>)")
-        info = await self.storage.stat(path)
+    async def stat(self, path: Path) -> os.stat_result:
+        np = self._normalize_path(path)
+        self.log.debug(f"<le>stat</>(<y><u>{escape_tag(np)}</></>)")
+        info = await self.storage.stat(np)
         return _file_info_to_stat(info)
 
     @override
     @universal_exception
-    async def rename(self, src: PathType, dst: PathType) -> None:
-        source = self._normalize_path(src)
-        destination = self._normalize_path(dst)
-        self.log.debug(f"<le>rename</>(<y><u>{escape_tag(source)}</></>, <y><u>{escape_tag(destination)}</></>)")
+    async def rename(self, source: Path, destination: Path) -> Path:
+        src = self._normalize_path(source)
+        dst = self._normalize_path(destination)
+        self.log.debug(f"<le>rename</>(<y><u>{escape_tag(src)}</></>, <y><u>{escape_tag(dst)}</></>)")
 
-        if await self.storage.is_dir(source):
-            await self.storage.movetree(source, destination)
+        if await self.storage.is_dir(src):
+            await self.storage.movetree(src, dst)
         else:
-            await self.storage.move(source, destination)
+            await self.storage.move(src, dst)
+
+        return destination
 
     @override
     @universal_exception
     async def _open(
         self,
-        path: PathType,
+        path: Path,
         mode: OpenBinaryMode = "rb",
         buffering: int = -1,
         encoding: str | None = None,
         errors: str | None = None,
         newline: str | None = None,
     ) -> FileHandle:
-        path = self._normalize_path(path)
-        self.log.debug(f"<le>open</>(<y><u>{escape_tag(path)}</></>, mode=<c>{mode}</>)")
+        np = self._normalize_path(path)
+        self.log.debug(f"<le>open</>(<y><u>{escape_tag(np)}</></>, mode=<c>{mode}</>)")
         handle = {
             "rb": ReadHandle,
             "wb": WriteHandle,
         }.get(mode)
         if handle is None:
             raise OSError(f"Unsupported mode: {mode}. Only 'rb' and 'wb' are supported.")
-        return handle(self.storage, self._normalize_path(path))
+        return handle(self.storage, self._normalize_path(np))
 
     @override
     @universal_exception

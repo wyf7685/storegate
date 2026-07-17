@@ -2,6 +2,7 @@
 
 import aioftp
 import pytest
+from pydantic import SecretStr
 
 from app.storage.ftp import FTPConfig, FTPStorage
 from tests.support.ids import uid
@@ -11,12 +12,29 @@ pytestmark = pytest.mark.integration
 
 class TestIdentityAndPaths:
     def test_identity_is_account_scoped_and_secret_free(self) -> None:
-        first = FTPStorage(FTPConfig(host="ftp.example.test", username="alice", password="first", root_prefix="/files"))
+        first = FTPStorage(
+            FTPConfig(
+                host="ftp.example.test",
+                username="alice",
+                password=SecretStr("first"),
+                root_prefix="/files",
+            )
+        )
         rotated = FTPStorage(
-            FTPConfig(host="ftp.example.test", username="alice", password="second", root_prefix="/files")
+            FTPConfig(
+                host="ftp.example.test",
+                username="alice",
+                password=SecretStr("second"),
+                root_prefix="/files",
+            )
         )
         other_user = FTPStorage(
-            FTPConfig(host="ftp.example.test", username="bob", password="first", root_prefix="/files")
+            FTPConfig(
+                host="ftp.example.test",
+                username="bob",
+                password=SecretStr("first"),
+                root_prefix="/files",
+            )
         )
 
         assert first.cache_identity == rotated.cache_identity
@@ -29,7 +47,7 @@ class TestIdentityAndPaths:
             FTPConfig(
                 host="ftp.example.test",
                 username="alice",
-                password="first",
+                password=SecretStr("first"),
                 root_prefix="/files",
                 max_connections=4,
             )

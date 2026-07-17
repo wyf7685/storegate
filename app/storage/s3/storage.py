@@ -478,6 +478,7 @@ class S3Storage(AbstractStorage):
 
         dir_created = datetime.now(UTC)
         dir_create_done: set[str] = set()
+        d = None
         try:
             for d in sorted(all_dst_dirs, key=lambda p: len(p.parts)):
                 if dir_key := self._dir_key(d):

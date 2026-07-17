@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Callable
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from app.storage.s3.client import (
     AsyncS3Client,
@@ -19,8 +20,8 @@ from app.storage.s3.client import (
 
 def _config() -> S3Config:
     return S3Config(
-        access_key_id="test-access-key",
-        secret_access_key="test-secret-key",
+        access_key_id=SecretStr("test-access-key"),
+        secret_access_key=SecretStr("test-secret-key"),
         region="us-east-1",
         bucket="test-bucket",
     )

@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from app.storage.abstract import AbstractStorage
 
@@ -43,8 +44,8 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
 
             endpoint, bucket = request.getfixturevalue("_s3_server")
             config = S3Config(
-                access_key_id="test",
-                secret_access_key="test",
+                access_key_id=SecretStr("test"),
+                secret_access_key=SecretStr("test"),
                 region="us-east-1",
                 bucket=bucket,
                 endpoint_url=endpoint.removeprefix("http://"),

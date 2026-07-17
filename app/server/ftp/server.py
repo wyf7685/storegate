@@ -1,4 +1,3 @@
-import functools
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import final, override
@@ -58,10 +57,7 @@ class FTPServer(AbstractServer):
         self.port = port
         self.server = StorageFTPProtocolServer(
             users=[aioftp.User(login=None, password=None, base_path=str(Path()), home_path="/")],
-            path_io_factory=functools.partial(
-                StoragePathIO,
-                storage=self.storage,
-            ),
+            path_io_factory=StoragePathIO.with_storage(storage),
         )
         self.server.commands_mapping.pop("appe")
 

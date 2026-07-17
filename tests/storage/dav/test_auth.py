@@ -1,6 +1,7 @@
 """WebDAV client configuration tests."""
 
 import httpx
+from pydantic import SecretStr
 
 from app.storage.dav.client import build_auth
 from app.storage.dav.client.auth import _BearerAuth
@@ -13,13 +14,13 @@ class TestBuildAuth:
             base_url="https://host/dav",
             auth_mode="basic",
             username="user",
-            password="secret",
+            password=SecretStr("secret"),
         )
         auth = build_auth(cfg)
         assert isinstance(auth, httpx.BasicAuth)
 
     def test_bearer_auth(self) -> None:
-        cfg = DavConfig(base_url="https://host/dav", auth_mode="bearer", token="abc123")
+        cfg = DavConfig(base_url="https://host/dav", auth_mode="bearer", token=SecretStr("abc123"))
         auth = build_auth(cfg)
         assert isinstance(auth, _BearerAuth)
         request = httpx.Request("GET", "https://host/dav/")

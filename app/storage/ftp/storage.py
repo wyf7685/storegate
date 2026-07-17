@@ -34,9 +34,10 @@ def _(exc_group: ExceptionGroup[aioftp.StatusCodeError], msg: str) -> OSError:
     return OSError(f"{msg}: {first}")
 
 
-def _parse_mlsx_datetime(value: str | None) -> datetime | None:
+def _parse_mlsx_datetime(value: object) -> datetime | None:
     if not value:
         return None
+    value = str(value)
     format_string = "%Y%m%d%H%M%S.%f" if "." in value else "%Y%m%d%H%M%S"
     try:
         return datetime.strptime(value, format_string).replace(tzinfo=UTC)

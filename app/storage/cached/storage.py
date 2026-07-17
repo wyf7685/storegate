@@ -78,11 +78,7 @@ class CachedStorage(AbstractStorage):
         if download_cache_threshold is not None and download_cache_threshold < 0:
             raise ValueError("download_cache_threshold must be None or >= 0")
 
-        if cache == "memory":
-            self._cache = MemoryCacheBackend(capacity=capacity)
-        else:
-            self._cache = cache
-
+        self._cache: CacheBackend = MemoryCacheBackend(capacity=capacity) if cache == "memory" else cache
         self._cache.bind_storage(self._storage.cache_identity)
         self._cache.configure_namespace("exists", ttl)
         self._cache.configure_namespace("is_file", ttl)

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import SecretStr
 from pytest_mock import MockerFixture
 
 from app.storage.s3.client import CopyPartResult, S3Config, S3HttpStatusError
@@ -18,8 +19,8 @@ from app.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
 def s3_mocked() -> S3Storage:
     """S3Storage with a fake config and mocked connect / close / client."""
     cfg = S3Config(
-        access_key_id="test-id",
-        secret_access_key="test-key",
+        access_key_id=SecretStr("test-id"),
+        secret_access_key=SecretStr("test-key"),
         region="ap-guangzhou",
         bucket="test-bucket",
     )

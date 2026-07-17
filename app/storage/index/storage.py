@@ -319,7 +319,7 @@ class IndexStorage(AbstractStorage):
 
     async def _save_chunk_worker(
         self,
-        recv: MemoryObjectReceiveStream[tuple[str, bytes, str]],
+        recv: MemoryObjectReceiveStream[tuple[str, bytes, PathLike]],
         incref_done: set[str],
     ) -> None:
         """Worker：从 channel 拉取 block，保存或复用已有分块。"""
@@ -821,7 +821,7 @@ class IndexStorage(AbstractStorage):
             await self._index.mkdir(dst.joinpath(rel), parents=True, exist_ok=True)
 
         # 并发更新 chunk refs
-        async def batch_incref(chunk_hash: str, dst_paths: set[PurePosixPath]) -> None:
+        async def batch_incref(chunk_hash: str, dst_paths: set[PathLike]) -> None:
             async with self._lock_chunk(chunk_hash):
                 await self._chunk_incref(chunk_hash, *dst_paths)
 

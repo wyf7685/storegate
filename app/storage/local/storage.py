@@ -178,7 +178,7 @@ class LocalStorage(AbstractStorage):
     @override
     async def rmtree(self, path: PathLike) -> None:
         target = self._resolve(path)
-        await anyio.to_thread.run_sync(shutil.rmtree, target)
+        await anyio.to_thread.run_sync(functools.partial(shutil.rmtree, target))
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
