@@ -27,6 +27,10 @@ DEFAULT_LOCK_TIMEOUT = 30.0
 DEFAULT_LOCK_LEASE = 300.0
 
 
+class LockLeaseLostError(RuntimeError):
+    """Raised when an active IndexStorage lock can no longer prove ownership."""
+
+
 @dataclasses.dataclass(slots=True)
 class _LocalLockGuard:
     lock: anyio.Lock
@@ -234,38 +238,40 @@ class IndexStorage(AbstractStorage):
         except FileNotFoundError, KeyError, TypeError, ValueError, UnicodeDecodeError:
             return
 
+    def _renewal_validity(self) -> float:
+        """Leave a scheduler-safe validity window for one bounded renewal probe."""
+        return max(self._lock_lease + (2 * self._lock_timeout), 0.5)
+
     async def _renew_storage_file_lock(self, lease: _LockLease) -> None:
         interval = self._lock_lease / 3
-        margin = min(interval / 2, self._lock_lease / 10)
         key = f"{lease.storage.id}:{lease.storage.normalize_path(lease.path)}"
         while True:
+            try:
+                with anyio.fail_after(self._lock_timeout):
+                    async with self._local_lock_guard(key):
+                        current = await lease.storage.download_bytes(lease.path)
+                        data = json.loads(current.decode())
+                        if data.get("owner") != lease.owner:
+                            raise LockLeaseLostError(f"Storage lock ownership lost during renewal: {lease.path}")
+                        now = datetime.now(UTC)
+                        if now >= lease.expires:
+                            raise LockLeaseLostError(f"Storage lock lease expired before renewal: {lease.path}")
+                        expires = now + timedelta(seconds=self._renewal_validity())
+                        data["expires"] = expires.isoformat()
+                        payload = json.dumps(data, separators=(",", ":")).encode()
+                        # A second read is the best ownership proof available without CAS.
+                        if await lease.storage.download_bytes(lease.path) != current:
+                            raise LockLeaseLostError(f"Storage lock ownership changed during renewal: {lease.path}")
+                        await lease.storage.upload_bytes(payload, lease.path, overwrite=True)
+                        lease = dataclasses.replace(lease, expires=expires)
+            except TimeoutError:
+                if datetime.now(UTC) >= lease.expires:
+                    raise LockLeaseLostError(f"Storage lock renewal probe timed out: {lease.path}") from None
+                await anyio.lowlevel.checkpoint()
+                continue
+            except (FileNotFoundError, KeyError, TypeError, ValueError, UnicodeDecodeError) as error:
+                raise LockLeaseLostError(f"Storage lock ownership lost during renewal: {lease.path}") from error
             await anyio.sleep(interval)
-            while True:
-                remaining = (lease.expires - datetime.now(UTC)).total_seconds()
-                if remaining <= margin:
-                    return
-                try:
-                    with anyio.fail_after(remaining - margin):
-                        async with self._local_lock_guard(key):
-                            try:
-                                current = await lease.storage.download_bytes(lease.path)
-                                data = json.loads(current.decode())
-                                if data.get("owner") != lease.owner:
-                                    return
-                                expires = datetime.now(UTC) + timedelta(seconds=self._lock_lease)
-                                data["expires"] = expires.isoformat()
-                                payload = json.dumps(data, separators=(",", ":")).encode()
-                                # Re-read before overwrite: without CAS, a cross-process
-                                # replacement can still happen after this comparison.
-                                if await lease.storage.download_bytes(lease.path) != current:
-                                    return
-                                await lease.storage.upload_bytes(payload, lease.path, overwrite=True)
-                                lease = dataclasses.replace(lease, expires=expires)
-                            except FileNotFoundError, KeyError, TypeError, ValueError, UnicodeDecodeError:
-                                return
-                    break
-                except TimeoutError:
-                    await anyio.lowlevel.checkpoint()
 
     @contextlib.asynccontextmanager
     async def _renewing_locks(self, leases: Iterable[_LockLease | None]) -> AsyncGenerator[None]:
@@ -308,10 +314,9 @@ class IndexStorage(AbstractStorage):
                             if handoff_timeout <= 0:
                                 raise TimeoutError
                             now = datetime.now(UTC)
-                            # A backend may commit before its upload call returns. Cover the
-                            # entire bounded handoff plus one lease so a slow successful
-                            # handoff cannot return an already-stale record.
-                            expires = now + timedelta(seconds=handoff_timeout + self._lock_lease)
+                            # A backend may commit before its upload call returns. Cover its
+                            # bounded handoff plus one lease and renewal probe budget.
+                            expires = now + timedelta(seconds=handoff_timeout + self._renewal_validity())
                             lease = _LockLease(owner, expires, storage, lock_path)
                             payload = json.dumps(
                                 {"owner": owner, "created": now.isoformat(), "expires": expires.isoformat()},
@@ -347,9 +352,8 @@ class IndexStorage(AbstractStorage):
                                     except FileNotFoundError:
                                         stale = False
                                 if stale:
-                                    # The local guard serializes same-process recovery. The
-                                    # equality check narrows, but cannot eliminate, the final
-                                    # cross-process replace-before-unlink race without CAS.
+                                    # The equality check narrows, but cannot eliminate, the
+                                    # final cross-process replace-before-unlink race without CAS.
                                     try:
                                         if await storage.download_bytes(lock_path) == lock_bytes:
                                             await storage.unlink(lock_path, missing_ok=True)

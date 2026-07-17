@@ -10,7 +10,7 @@ import pytest
 
 from app.storage.abstract import BytesLike, PathLike
 from app.storage.index import IndexStorage
-from app.storage.index.storage import hash_to_path
+from app.storage.index.storage import LockLeaseLostError, hash_to_path
 from app.storage.memory import MemoryStorage
 
 
@@ -152,6 +152,41 @@ async def test_active_lease_is_renewed() -> None:
             await storage._acquire_storage_file_lock(index, "/renew.lock")
 
 
+async def test_delayed_renewal_keeps_active_holder_exclusive() -> None:
+    async with (
+        MemoryStorage("/") as index,
+        MemoryStorage("/") as chunks,
+        IndexStorage(index, chunks, lock_timeout=0.08, lock_lease=0.03) as storage,
+        storage._lock_index("/delayed-renew"),
+    ):
+        await anyio.sleep(0.11)
+        contender = IndexStorage(index, chunks, lock_timeout=0.03, lock_lease=0.03)
+        with pytest.raises(TimeoutError):
+            await contender._acquire_storage_file_lock(index, "/delayed-renew.lock")
+
+
+async def test_renewal_owner_loss_cancels_holder() -> None:
+    async with (
+        MemoryStorage("/") as index,
+        MemoryStorage("/") as chunks,
+        IndexStorage(index, chunks, lock_timeout=0.05, lock_lease=0.03) as storage,
+    ):
+
+        async def lose_owner() -> None:
+            await anyio.sleep(0.01)
+            await index.upload_bytes(
+                b'{"owner":"other","created":"2000-01-01T00:00:00+00:00","expires":"2099-01-01T00:00:00+00:00"}',
+                "/owner-loss.lock",
+                overwrite=True,
+            )
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(lose_owner)
+            with pytest.raises(LockLeaseLostError, match="ownership lost"):
+                async with storage._lock_index("/owner-loss"):
+                    await anyio.sleep(0.08)
+
+
 async def test_renewal_does_not_overwrite_replaced_lock_record() -> None:
     index = _ReplaceAfterReadStorage()
     replacement = b'{"owner":"new-owner","created":"2099-01-01T00:00:00+00:00","expires":"2099-01-01T01:00:00+00:00"}'
@@ -163,7 +198,8 @@ async def test_renewal_does_not_overwrite_replaced_lock_record() -> None:
         lease = await storage._acquire_storage_file_lock(index, "/renew-replaced.lock")
         assert lease is not None
         index.replace_after_next_read("/renew-replaced.lock", replacement)
-        await storage._renew_storage_file_lock(lease)
+        with pytest.raises(LockLeaseLostError, match="ownership changed"):
+            await storage._renew_storage_file_lock(lease)
         assert await index.download_bytes("/renew-replaced.lock") == replacement
 
 
