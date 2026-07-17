@@ -57,7 +57,10 @@ class FTPStorage(AbstractStorage):
         super().__init__()
         self._config = config if isinstance(config, FTPConfig) else FTPConfig.from_file(config)
         self._root_prefix = PurePosixPath(self._config.root_prefix)
-        self._pool = FTPClientPool(
+        self._pool = self._new_pool()
+
+    def _new_pool(self) -> FTPClientPool:
+        return FTPClientPool(
             max_connections=self._config.max_connections,
             close_timeout=self._config.timeout,
             factory=self._connect_client,
@@ -180,6 +183,8 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to connect to FTP server")
     async def connect(self) -> None:
+        if self._pool.is_closed:
+            self._pool = self._new_pool()
         await self._pool.start()
         self.log.info(f"Connected to <c>{escape_tag(self._config.host)}</c>:<c>{self._config.port}</c>")
 

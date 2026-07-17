@@ -39,10 +39,42 @@ def make_cache_identity(kind: str, **fields: object) -> str:
 
 
 class AbstractStorage(ABC):
-    """Abstract storage interface."""
+    """Abstract storage interface with a concurrency-safe lifecycle."""
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        connect_impl = cls.__dict__.get("connect")
+        close_impl = cls.__dict__.get("close")
+        if connect_impl is not None and not getattr(connect_impl, "_lifecycle_wrapped", False):
+
+            @functools.wraps(connect_impl)
+            async def connect(self: AbstractStorage) -> None:
+                if self._lifecycle_owner == anyio.get_current_task().id:
+                    await connect_impl(self)  # type: ignore[operator]
+                    return
+                await self._connect_lifecycle(connect_impl)
+
+            connect._lifecycle_wrapped = True  # type: ignore[attr-defined]
+            cls.connect = connect  # type: ignore[assignment]
+        if close_impl is not None and not getattr(close_impl, "_lifecycle_wrapped", False):
+
+            @functools.wraps(close_impl)
+            async def close(self: AbstractStorage) -> None:
+                if self._lifecycle_owner == anyio.get_current_task().id:
+                    await close_impl(self)  # type: ignore[operator]
+                    return
+                await self._close_lifecycle(close_impl)
+
+            close._lifecycle_wrapped = True  # type: ignore[attr-defined]
+            cls.close = close  # type: ignore[assignment]
 
     def __init__(self) -> None:
         self.__ctx = 0
+        self._lifecycle_lock = anyio.Lock()
+        self._lifecycle_state = "NEW"
+        self._lifecycle_event: anyio.Event | None = None
+        self._lifecycle_owner: int | None = None
+        self._lifecycle_closed = False
 
     @functools.cached_property
     def log(self) -> LoggerWrapper:
@@ -51,54 +83,175 @@ class AbstractStorage(ABC):
     @property
     @abstractmethod
     def id(self) -> str:
-        """Return a unique identifier for this storage instance."""
         raise NotImplementedError
 
     @property
     def cache_identity(self) -> str | None:
-        """Return a stable, non-secret identity for persistent cache scoping.
-
-        ``None`` means this storage cannot safely reuse a persistent cache
-        across process restarts.  Implementations must not include credentials
-        or other secrets in the returned value.
-        """
         return None
 
     @staticmethod
     def normalize_path(path: PathLike) -> PurePosixPath:
-        """Normalize a path to a POSIX-style absolute path."""
         return "/" / PurePosixPath(path)
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     @abstractmethod
     async def connect(self) -> None:
-        """Establish connection."""
         raise NotImplementedError
 
     @abstractmethod
     async def close(self) -> None:
-        """Close connection."""
         raise NotImplementedError
 
     @abstractmethod
     async def ping(self) -> bool:
-        """Check whether the connection is alive."""
         raise NotImplementedError
 
+    def _lifecycle_impl(self, name: str) -> object | None:
+        for base in type(self).__mro__:
+            implementation = base.__dict__.get(name)
+            if implementation is not None:
+                return getattr(implementation, "__wrapped__", implementation)
+        return None
+
+    async def _connect_lifecycle(self, implementation: object) -> None:
+        while True:
+            async with self._lifecycle_lock:
+                if self._lifecycle_state == "CONNECTED":
+                    return
+                if self._lifecycle_state in {"CONNECTING", "CLOSING"}:
+                    event = self._lifecycle_event
+                else:
+                    event = anyio.Event()
+                    self._lifecycle_event = event
+                    self._lifecycle_state = "CONNECTING"
+                    self._lifecycle_owner = anyio.get_current_task().id
+                    break
+            assert event is not None
+            await event.wait()
+        try:
+            await implementation(self)  # type: ignore[operator]
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                async with self._lifecycle_lock:
+                    self._lifecycle_state = "NEW"
+                    self._lifecycle_owner = None
+                    event.set()
+                    self._lifecycle_event = None
+            raise
+        with anyio.CancelScope(shield=True):
+            async with self._lifecycle_lock:
+                self._lifecycle_state = "CONNECTED"
+                self._lifecycle_owner = None
+                event.set()
+                self._lifecycle_event = None
+
+    async def _close_lifecycle(self, implementation: object) -> None:
+        while True:
+            async with self._lifecycle_lock:
+                if self._lifecycle_state == "CLOSED":
+                    self.__ctx = 0
+                    return
+                if self._lifecycle_state in {"CONNECTING", "CLOSING"}:
+                    event = self._lifecycle_event
+                else:
+                    event = anyio.Event()
+                    self._lifecycle_event = event
+                    self._lifecycle_state = "CLOSING"
+                    self._lifecycle_owner = anyio.get_current_task().id
+                    break
+            assert event is not None
+            await event.wait()
+        try:
+            await implementation(self)  # type: ignore[operator]
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                async with self._lifecycle_lock:
+                    self._lifecycle_state = "CONNECTED"
+                    self._lifecycle_owner = None
+                    event.set()
+                    self._lifecycle_event = None
+            raise
+        with anyio.CancelScope(shield=True):
+            async with self._lifecycle_lock:
+                self._lifecycle_state = "CLOSED"
+                self.__ctx = 0
+                self._lifecycle_owner = None
+                event.set()
+                self._lifecycle_event = None
+
     async def __aenter__(self) -> Self:
-        self.__ctx += 1
-        await self.connect()
-        return self
+        impl = self._lifecycle_impl("connect")
+        if impl is None:
+            raise RuntimeError("Storage has no connect implementation")
+        connected = False
+        try:
+            while True:
+                await self._connect_lifecycle(impl)
+                connected = True
+                with anyio.CancelScope(shield=True):
+                    async with self._lifecycle_lock:
+                        if self._lifecycle_state == "CONNECTED":
+                            self.__ctx += 1
+                            return self
+                        event = self._lifecycle_event
+                if event is not None:
+                    await event.wait()
+        except BaseException as primary:
+            if connected:
+                close_impl = self._lifecycle_impl("close")
+                if close_impl is not None:
+                    cleanup_error: BaseException | None = None
+                    close_event: anyio.Event | None = None
+                    with anyio.CancelScope(shield=True):
+                        async with self._lifecycle_lock:
+                            if self._lifecycle_state == "CONNECTED" and self.__ctx == 0:
+                                close_event = anyio.Event()
+                                self._lifecycle_event = close_event
+                                self._lifecycle_state = "CLOSING"
+                                self._lifecycle_owner = anyio.get_current_task().id
+                        if close_event is not None:
+                            try:
+                                await close_impl(self)  # type: ignore[operator]
+                            except BaseException as secondary:
+                                cleanup_error = secondary
+                            with anyio.CancelScope(shield=True):
+                                async with self._lifecycle_lock:
+                                    self._lifecycle_state = "CONNECTED" if cleanup_error is not None else "CLOSED"
+                                    self.__ctx = 0
+                                    self._lifecycle_owner = None
+                                    close_event.set()
+                                    self._lifecycle_event = None
+                    if cleanup_error is not None:
+                        raise BaseExceptionGroup("Context registration rollback failed", [primary, cleanup_error])
+            raise
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
-        self.__ctx = max(0, self.__ctx - 1)
-        if self.__ctx:
-            return
         with anyio.CancelScope(shield=True):
-            await self.close()
+            async with self._lifecycle_lock:
+                if self.__ctx == 0:
+                    return
+                self.__ctx -= 1
+                if self.__ctx:
+                    return
+                event = anyio.Event()
+                self._lifecycle_event = event
+                self._lifecycle_state = "CLOSING"
+                self._lifecycle_owner = anyio.get_current_task().id
+            impl = self._lifecycle_impl("close")
+            try:
+                if impl is not None:
+                    await impl(self)  # type: ignore[operator]
+            except BaseException:
+                async with self._lifecycle_lock:
+                    self._lifecycle_state = "CONNECTED"
+                    self._lifecycle_owner = None
+                    event.set()
+                    self._lifecycle_event = None
+                raise
+            async with self._lifecycle_lock:
+                self._lifecycle_state = "CLOSED"
+                self._lifecycle_owner = None
+                event.set()
+                self._lifecycle_event = None
 
     # ------------------------------------------------------------------
     # Upload

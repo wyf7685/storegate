@@ -3,6 +3,8 @@ from collections.abc import AsyncGenerator, AsyncIterable
 from pathlib import PurePosixPath
 from typing import Literal, final, override
 
+import anyio
+
 from app.log import escape_tag
 
 from ..abstract import AbstractStorage, BytesLike, FileInfo, PathLike
@@ -108,7 +110,18 @@ class CachedStorage(AbstractStorage):
     @override
     async def connect(self) -> None:
         await self._cache.connect()
-        await self._storage.connect()
+        try:
+            await self._storage.connect()
+        except BaseException as primary:
+            cleanup_error: BaseException | None = None
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self._cache.close()
+                except BaseException as secondary:
+                    cleanup_error = secondary
+            if cleanup_error is not None:
+                raise BaseExceptionGroup("Cached storage connection rollback failed", [primary, cleanup_error]) from None
+            raise
         self.log.info(
             f"Connected (backend=<le>{type(self._cache).__name__}</>, "
             f"ttl=<g>{self._ttl}s</g>, capacity=<g>{self._capacity}</g>)"
@@ -116,8 +129,10 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def close(self) -> None:
-        await self._storage.close()
-        await self._cache.close()
+        try:
+            await self._storage.close()
+        finally:
+            await self._cache.close()
         self.log.debug("Disconnected")
 
     @override

@@ -157,6 +157,20 @@ async def test_factory_failure_rolls_back_reserved_slot() -> None:
     await pool.close()
 
 
+async def test_start_failure_can_retry_without_replacing_pool() -> None:
+    harness = PoolHarness()
+    pool = harness.pool()
+    harness.fail_next = True
+
+    with pytest.raises(OSError, match="injected factory failure"):
+        await pool.start()
+    assert pool._state is PoolState.NEW
+    await pool.start()
+    assert pool.is_open
+    assert len(harness.created) == 1
+    await pool.close()
+
+
 async def test_invalidated_lease_is_closed_and_replaced() -> None:
     harness = PoolHarness()
     pool = harness.pool(max_connections=1)

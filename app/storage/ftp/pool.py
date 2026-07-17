@@ -78,6 +78,10 @@ class FTPClientPool:
     def is_open(self) -> bool:
         return self._state is PoolState.OPEN
 
+    @property
+    def is_closed(self) -> bool:
+        return self._state is PoolState.CLOSED
+
     async def start(self) -> None:
         async with self._lifecycle_lock:
             async with self._state_lock:

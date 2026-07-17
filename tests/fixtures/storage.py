@@ -59,7 +59,7 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
             from app.storage.cached import CachedStorage
             from app.storage.memory import MemoryStorage
 
-            async with MemoryStorage("/") as inner, CachedStorage(inner) as instance:
+            async with CachedStorage(MemoryStorage("/")) as instance:
                 yield instance
 
         case "index":

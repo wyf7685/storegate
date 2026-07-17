@@ -95,6 +95,7 @@ class IndexStorage(AbstractStorage):
         self._skip_locking = skip_locking
         self._lock_timeout = lock_timeout
         self._lock_lease = lock_lease
+        self._pending_rollback: list[AbstractStorage] = []
 
     @property
     @override
@@ -120,32 +121,73 @@ class IndexStorage(AbstractStorage):
         index = self._index
         chunks = self._chunks
         self.log.info(f"Connecting IndexStorage (index=<c>{index.id}</c>, chunks=<c>{self._chunks.id}</c>)")
-        await index.connect()
-        await chunks.connect()
-
+        await self._retry_pending_rollback()
+        index_started = False
+        chunks_started = False
         try:
-            existing = (await chunks.download_bytes(CHUNKS_INDEX_FILE)).decode()
-        except FileNotFoundError:
-            existing = None
+            index_started = True
+            await index.connect()
+            chunks_started = True
+            await chunks.connect()
+            try:
+                existing = (await chunks.download_bytes(CHUNKS_INDEX_FILE)).decode()
+            except FileNotFoundError:
+                existing = None
+            if existing is None:
+                await chunks.upload_bytes(index.id.encode(), CHUNKS_INDEX_FILE, overwrite=False)
+                self.log.debug(f"Registered chunks storage <c>{chunks.id}</c> → index <c>{index.id}</c>")
+            elif existing != index.id:
+                self.log.error(
+                    f"Chunks storage <c>{chunks.id}</c> is already associated with "
+                    f"index <r>{escape_tag(existing)}</r>, rejecting index <c>{index.id}</c>"
+                )
+                raise RuntimeError(f"Chunks storage is already associated with a different index storage: {existing}")
+            else:
+                self.log.debug(f"Chunks storage <c>{chunks.id}</c> already bound to index <c>{existing}</c>")
+        except BaseException as primary:
+            cleanup_errors: list[BaseException] = []
+            failed_cleanup: list[AbstractStorage] = []
+            with anyio.CancelScope(shield=True):
+                if chunks_started:
+                    try:
+                        await chunks.close()
+                    except BaseException as secondary:
+                        cleanup_errors.append(secondary)
+                        failed_cleanup.append(chunks)
+                if index_started:
+                    try:
+                        await index.close()
+                    except BaseException as secondary:
+                        cleanup_errors.append(secondary)
+                        failed_cleanup.append(index)
+            self._pending_rollback.extend(failed_cleanup)
+            if cleanup_errors:
+                raise BaseExceptionGroup("Index storage connection rollback failed", [primary, *cleanup_errors]) from None
+            raise
 
-        if existing is None:
-            await chunks.upload_bytes(index.id.encode(), CHUNKS_INDEX_FILE, overwrite=False)
-            self.log.debug(f"Registered chunks storage <c>{chunks.id}</c> → index <c>{index.id}</c>")
-        elif existing != index.id:
-            self.log.error(
-                f"Chunks storage <c>{chunks.id}</c> is already associated with "
-                f"index <r>{escape_tag(existing)}</r>, "
-                f"rejecting index <c>{index.id}</c>"
-            )
-            raise RuntimeError(f"Chunks storage is already associated with a different index storage: {existing}")
-        else:
-            self.log.debug(f"Chunks storage <c>{chunks.id}</c> already bound to index <c>{existing}</c>")
+    async def _retry_pending_rollback(self) -> None:
+        if not self._pending_rollback:
+            return
+        pending = self._pending_rollback
+        self._pending_rollback = []
+        cleanup_errors: list[BaseException] = []
+        with anyio.CancelScope(shield=True):
+            for storage in pending:
+                try:
+                    await storage.close()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+                    self._pending_rollback.append(storage)
+        if cleanup_errors:
+            raise BaseExceptionGroup("Index storage pending rollback failed", cleanup_errors) from None
 
     @override
     async def close(self) -> None:
         self.log.debug("Closing IndexStorage")
-        await self._index.close()
-        await self._chunks.close()
+        try:
+            await self._chunks.close()
+        finally:
+            await self._index.close()
 
     @override
     async def ping(self) -> bool:

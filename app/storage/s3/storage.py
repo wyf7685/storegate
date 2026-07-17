@@ -72,10 +72,31 @@ class S3Storage(AbstractStorage):
 
     @override
     async def connect(self) -> None:
-        self._client = AsyncS3Client(self._config)
-        await self._client.__aenter__()
-        if not await self.ping():
-            raise RuntimeError("Failed to connect to S3 bucket. Please check your configuration.")
+        if self._client is not None:
+            retained = self._client
+            with anyio.CancelScope(shield=True):
+                await retained.__aexit__(None, None, None)
+                if self._client is retained:
+                    self._client = None
+        client = AsyncS3Client(self._config)
+        self._client = client
+        try:
+            await client.__aenter__()
+            if not await self.ping():
+                raise RuntimeError("Failed to connect to S3 bucket. Please check your configuration.")
+        except BaseException as primary:
+            cleanup_error: BaseException | None = None
+            with anyio.CancelScope(shield=True):
+                try:
+                    await client.__aexit__(None, None, None)
+                except BaseException as secondary:
+                    cleanup_error = secondary
+                else:
+                    self._client = None
+            if cleanup_error is not None:
+                self._client = client
+                raise BaseExceptionGroup("S3 connection rollback failed", [primary, cleanup_error])
+            raise
         self.log.info(f"Connected to bucket <c>{self._config.bucket}</c> in region <c>{self._config.region}</c>")
 
     @override
