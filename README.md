@@ -1,19 +1,19 @@
 # Storegate
 
-Storegate 是一个异步、多后端文件存储服务。项目以 `AbstractStorage` 作为统一接口，可直接操作内存、本地文件系统、S3、WebDAV 和 FTP，也可以叠加缓存与分块索引层；同一套存储实现还能通过 WebDAV 或 FTP 协议对外提供服务。
+Storegate 是一个异步、多后端文件存储服务。项目以 `AbstractStorage` 作为统一接口，可直接操作内存、本地文件系统、S3、WebDAV、FTP 和 SFTP，也可以叠加缓存与分块索引层；同一套存储实现还能通过 WebDAV 或 FTP 协议对外提供服务。
 
 > 当前版本：`0.1.0`。项目仍处于开发阶段，接口与配置格式可能调整。
 
 ## 主要能力
 
 - 统一的异步文件接口：上传、下载、复制、移动、删除、目录遍历和元数据查询。
-- 多种存储后端：Memory、Local、S3-compatible、WebDAV、FTP。
+- 多种存储后端：Memory、Local、S3-compatible、WebDAV、FTP、SFTP。
 - 可组合中间层：
   - `CachedStorage`：缓存元数据、目录列表和小文件下载，支持内存与 Redis 缓存。
   - `IndexStorage`：将大文件切分为内容寻址分块，支持 SHA-256 去重和引用计数。
 - 双协议服务端：将任意 `AbstractStorage` 暴露为 WebDAV 或 FTP 服务。
 - JSON 对象工厂：通过嵌套配置组合存储和服务，无需在代码中手动组装对象图。
-- 异步 I/O：基于 AnyIO、HTTPX、aioftp、Uvicorn 和 WsgiDAV。
+- 异步 I/O：基于 AnyIO、HTTPX、aioftp、AsyncSSH、Uvicorn 和 WsgiDAV。
 
 ## 架构概览
 
@@ -30,6 +30,7 @@ flowchart LR
     Storage --> S3[S3Storage]
     Storage --> DAV[DavStorage]
     Storage --> FTP[FTPStorage]
+    Storage --> SFTP[SFTPStorage]
     Storage --> Cached[CachedStorage]
     Storage --> Index[IndexStorage]
 
@@ -52,6 +53,7 @@ flowchart LR
 | `S3Storage` | AWS S3 与兼容服务 | SigV4、目录标记、分片上传、并发复制与失败回滚 |
 | `DavStorage` | 远程 WebDAV | Basic/Bearer/匿名认证、流式传输、服务端 COPY/MOVE |
 | `FTPStorage` | 远程普通 FTP | 连接池、流式传输、逻辑根目录隔离 |
+| `SFTPStorage` | 远程 SFTP | SSH host key 校验、多 channel 复用、流式传输与事务式覆盖 |
 | `CachedStorage` | 装饰其他后端 | 元数据交叉回填、写后回填、内存/Redis 缓存 |
 | `IndexStorage` | 大文件分块与去重 | SHA-256 内容寻址、引用计数、并发上传、文件锁 |
 
@@ -246,6 +248,25 @@ storage = S3Storage("s3.json")
 
 当前仅支持普通 FTP，不支持 FTPS/FTPES。
 
+### SFTP 客户端
+
+```json
+{
+  "$factory": "~sftp",
+  "config": {
+    "host": "sftp.example.com",
+    "port": 22,
+    "username": "user",
+    "password": "password",
+    "known_hosts": "/home/user/.ssh/known_hosts",
+    "root_prefix": "/storegate",
+    "max_channels": 4
+  }
+}
+```
+
+SFTP 默认执行 SSH host key 校验。测试或受控环境中只有显式设置 `disable_host_key_check=true` 才会关闭校验；生产配置应使用系统或指定的 `known_hosts` 文件。首版支持密码和显式私钥认证，不使用远程 shell、SCP、SSH agent、ProxyJump 或符号链接。
+
 ### 分块索引存储
 
 `IndexStorage` 需要两个不同的存储实例：`index` 保存文件元数据，`chunks` 保存去重后的内容分块。
@@ -298,7 +319,7 @@ uv run pytest
 # 排除需要外部 S3 凭据的测试
 uv run pytest -m "not s3"
 
-# 本地 WebDAV / FTP 协议集成测试
+# 本地 WebDAV / FTP / SFTP 协议集成测试
 uv run pytest -m integration
 
 # 仅运行 MemoryStorage 公共契约
@@ -313,7 +334,7 @@ uv run ty check
 uv run prek install
 ```
 
-测试以 `tests/contract/storage/` 中的公共契约为核心，同一组行为会针对多个后端参数化执行。DAV 与 FTP 集成测试会在本地启动临时协议服务；外部 S3 测试需要单独提供凭据。
+测试以 `tests/contract/storage/` 中的公共契约为核心，同一组行为会针对多个后端参数化执行。DAV、FTP 与 SFTP 集成测试会在本地启动临时协议服务；外部 S3 测试需要单独提供凭据。
 
 ## 目录结构
 
@@ -327,6 +348,7 @@ app/
 │   ├── s3/               # S3-compatible 客户端与存储适配
 │   ├── dav/              # WebDAV 客户端与存储适配
 │   ├── ftp/              # FTP 客户端、连接池与存储适配
+│   ├── sftp/             # AsyncSSH SFTP 客户端、channel pool 与存储适配
 │   ├── cached/           # 缓存装饰层及缓存后端
 │   └── index/            # 分块索引与引用计数
 ├── server/
@@ -344,9 +366,10 @@ tests/
 ```
 
 ## 安全说明与当前限制
-- S3、WebDAV 和 FTP 通过适配层将服务端状态翻译为统一异常；服务端仍可能拒绝不支持的原子操作，此时保留为 `OSError`，不会改变 `overwrite` 或删除契约。
+- S3、WebDAV、FTP 和 SFTP 通过适配层将服务端状态翻译为统一异常；服务端仍可能拒绝不支持的原子操作，此时保留为 `OSError`，不会改变 `overwrite` 或删除契约。
 - 当前 WebDAV 服务端允许匿名访问，FTP 服务端同样使用匿名用户；请仅绑定到可信网络或在前置代理/网络层增加认证与访问控制。
 - FTP 后端目前不支持加密传输；跨不可信网络应优先使用 WebDAV over HTTPS 或在受保护网络中部署。
-- 配置文件可能包含 S3、WebDAV、FTP 或 Redis 凭据。不要提交真实密钥；项目已忽略根目录下的 `data/`。
-- S3、WebDAV 和 FTP 的复制、覆盖及目录删除语义可能受远端服务实现影响。接入新的服务端时应先运行对应契约和集成测试。
+- 配置文件可能包含 S3、WebDAV、FTP、SFTP 或 Redis 凭据。不要提交真实密钥；项目已忽略根目录下的 `data/`。
+- S3、WebDAV、FTP 和 SFTP 的复制、覆盖及目录删除语义可能受远端服务实现影响。接入新的服务端时应先运行对应契约和集成测试。
+- SFTP 的 `root_prefix` 和客户端 symlink 检查不是恶意远端或并发攻击者下的完整沙箱；租户隔离应由服务端 chroot/jail 保证。覆盖式 `movetree` 在 source tombstone 删除开始后无法提供文件系统事务级原子性。
 - `IndexStorage` 的索引与分块存储存在绑定关系；迁移或清理任一侧前应先确认引用数据的一致性。

@@ -1,9 +1,12 @@
 import asyncio
+import os
 import queue
 import socket
 import threading
 import time
 from collections.abc import Generator
+from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -131,3 +134,109 @@ def _ftp_server() -> Generator[tuple[str, int]]:
 def ftp_endpoint(_ftp_server: tuple[str, int]) -> tuple[str, int]:
     """Return the shared local FTP endpoint."""
     return _ftp_server
+
+
+@dataclass(frozen=True, slots=True)
+class SFTPServerInfo:
+    host: str
+    port: int
+    username: str
+    password: str
+    known_hosts: Path
+    root: Path
+
+
+@pytest.fixture(scope="session")
+def _sftp_server(tmp_path_factory: pytest.TempPathFactory) -> Generator[SFTPServerInfo]:
+    """Start a password-authenticated AsyncSSH SFTP server in a chroot."""
+    import asyncssh
+
+    host = "127.0.0.1"
+    test_username = "storegate"
+    test_password = "sftp-test-password"
+    root = tmp_path_factory.mktemp("sftp-server-root")
+    known_hosts = tmp_path_factory.mktemp("sftp-known-hosts") / "known_hosts"
+    host_key = asyncssh.generate_private_key("ssh-ed25519")
+    stop_event = threading.Event()
+    startup: queue.Queue[int | BaseException] = queue.Queue(maxsize=1)
+    errors: list[BaseException] = []
+    connections: set[asyncssh.SSHServerConnection] = set()
+
+    class TestSSHServer(asyncssh.SSHServer):
+        def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
+            self._connection = conn
+            connections.add(conn)
+
+        def connection_lost(self, exc: Exception | None) -> None:
+            del exc
+            connections.discard(self._connection)
+
+        def begin_auth(self, username: str) -> bool:
+            return username == test_username
+
+        def password_auth_supported(self) -> bool:
+            return True
+
+        def validate_password(self, username: str, password: str) -> bool:
+            return username == test_username and password == test_password
+
+    async def _runner() -> None:
+        acceptor = await asyncssh.create_server(
+            TestSSHServer,
+            host,
+            0,
+            config=None,
+            server_host_keys=[host_key],
+            sftp_factory=lambda channel: asyncssh.SFTPServer(channel, chroot=os.fsencode(root)),
+        )
+        startup.put(acceptor.get_port())
+        try:
+            await asyncio.to_thread(stop_event.wait)
+        finally:
+            active_connections = list(connections)
+            for connection in active_connections:
+                connection.close()
+            if active_connections:
+                await asyncio.gather(
+                    *(connection.wait_closed() for connection in active_connections),
+                    return_exceptions=True,
+                )
+            acceptor.close()
+            await acceptor.wait_closed()
+
+    def _thread_main() -> None:
+        try:
+            asyncio.run(_runner())
+        except BaseException as exc:
+            if startup.empty():
+                startup.put(exc)
+            else:
+                errors.append(exc)
+
+    thread = threading.Thread(target=_thread_main, daemon=True)
+    thread.start()
+    try:
+        result = startup.get(timeout=5)
+    except queue.Empty as exc:
+        raise RuntimeError("SFTP server did not start within 5 seconds") from exc
+    if isinstance(result, BaseException):
+        raise RuntimeError("SFTP server failed to start") from result  # noqa: TRY004
+
+    public_key = host_key.export_public_key().decode().strip()
+    known_hosts.write_text(f"[{host}]:{result} {public_key}\n")
+    info = SFTPServerInfo(host, result, test_username, test_password, known_hosts, root)
+    try:
+        yield info
+    finally:
+        stop_event.set()
+        thread.join(timeout=5)
+        if thread.is_alive():
+            raise RuntimeError("SFTP server did not stop within 5 seconds")
+        if errors:
+            raise RuntimeError("SFTP server thread failed") from errors[0]
+
+
+@pytest.fixture(scope="session")
+def sftp_server(_sftp_server: SFTPServerInfo) -> SFTPServerInfo:
+    """Return the shared local SFTP server details."""
+    return _sftp_server

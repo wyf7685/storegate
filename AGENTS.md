@@ -63,8 +63,8 @@ Agent 编写代码时须遵守以下纪律：
 tests/
 ├── conftest.py                    # 全局日志配置 + fixture plugin 注册
 ├── fixtures/
-│   ├── storage.py                 # 7 后端参数化 storage fixture
-│   └── protocol_servers.py        # session 级 Moto S3 / DAV / FTP 本地协议服务
+│   ├── storage.py                 # 8 后端参数化 storage fixture
+│   └── protocol_servers.py        # session 级 Moto S3 / DAV / FTP / SFTP 本地协议服务
 ├── support/
 │   ├── ids.py                     # uid() 隔离标识；测试禁止从 conftest.py 直接导入
 │   └── factory_targets.py         # resolve_object 动态导入测试目标
@@ -81,6 +81,7 @@ tests/
 │   ├── dav/                       # 配置、认证、multistatus、错误映射
 │   │   └── integration/           # 本地 wsgidav 上的 DavStorage 集成测试
 │   ├── ftp/                       # FTPStorage 配置、连接池、流式与树操作
+│   ├── sftp/                      # SFTPStorage 配置、channel pool、流式与树事务
 │   └── s3/                        # SigV4、client 协议、multipart 与 mocked rollback
 │       └── integration/           # 需要 credentials 的目录标记测试
 └── server/
@@ -89,13 +90,13 @@ tests/
     └── test_factory.py            # resolve_server / resolve_server_from_file
 ```
 
-**参数化契约**：`tests/fixtures/storage.py` 的 `storage` fixture 将 `tests/contract/storage/` 对 7 个后端执行：`memory` / `local` / `s3` / `cached` / `index` / `ftp` / `dav`。S3 契约通过 `tests/fixtures/protocol_servers.py` 启动 session 级 Moto Server，使用随机端口、预创建 bucket 和 path-style `http://127.0.0.1:<port>` endpoint，无需外部 credentials；必须使用 IPv4 地址而非 `localhost`，避免 Windows 上 IPv6 连接回退造成逐请求延迟。`cached` 和 `index` 使用 `MemoryStorage` 保证可重现；DAV 和 FTP 同样通过本地随机端口服务执行。
+**参数化契约**：`tests/fixtures/storage.py` 的 `storage` fixture 将 `tests/contract/storage/` 对 8 个后端执行：`memory` / `local` / `s3` / `cached` / `index` / `ftp` / `dav` / `sftp`。S3 契约通过 `tests/fixtures/protocol_servers.py` 启动 session 级 Moto Server，使用随机端口、预创建 bucket 和 path-style `http://127.0.0.1:<port>` endpoint，无需外部 credentials；必须使用 IPv4 地址而非 `localhost`，避免 Windows 上 IPv6 连接回退造成逐请求延迟。`cached` 和 `index` 使用 `MemoryStorage` 保证可重现；DAV、FTP 和 SFTP 同样通过本地随机端口服务执行，SFTP fixture 使用临时 Ed25519 host key、known_hosts 和 chroot。
 
-**测试分层**：目录路径表达被测组件，marker 只表达运行性质。`integration` 表示启动本地 Moto S3 / DAV / FTP 协议服务，`s3` 仅表示需要外部 S3 credentials，`slow` 表示异常耗时测试。纯单元测试不得仅因属于某个后端而标记为 integration。
+**测试分层**：目录路径表达被测组件，marker 只表达运行性质。`integration` 表示启动本地 Moto S3 / DAV / FTP / SFTP 协议服务，`s3` 仅表示需要外部 S3 credentials，`slow` 表示异常耗时测试。纯单元测试不得仅因属于某个后端而标记为 integration。
 
 **测试辅助代码**：可导入辅助函数放在 `tests/support/`。`conftest.py` 只用于 fixture 和 pytest 配置，不作为普通 Python 模块导入。后端专属 fixture 放在对应目录的 `conftest.py`。
 
-**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出语句覆盖报告；使用 `--cov-branch` 可同时检查分支覆盖。当前测试源码收集为 665 个参数化用例；无外部 S3 配置时执行 662 个用例。
+**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出语句覆盖报告；使用 `--cov-branch` 可同时检查分支覆盖。当前测试源码收集为 1040 个参数化用例；无外部 S3 配置时执行 1037 个用例。
 
 ## 架构
 
@@ -131,6 +132,10 @@ app/
 │   │   ├── config.py      # FTPConfig: 认证、root_prefix、timeout、max_connections
 │   │   ├── pool.py        # FTPClientPool / FTPClientLease: 独占租借、淘汰、关闭
 │   │   └── storage.py     # FTPStorage: FTP → AbstractStorage 映射
+│   ├── sftp/              # SFTPStorage: AsyncSSH 客户端后端
+│   │   ├── config.py      # SFTPConfig: 认证、known_hosts、root_prefix、timeout
+│   │   ├── pool.py        # 单 SSH transport、多 SFTP channel 的有界复用
+│   │   └── storage.py     # SFTPStorage: SFTP → AbstractStorage 映射与树事务
 │   └── dav/               # WebDAV 客户端实现（访问远程 WebDAV 服务器）
 │       ├── client/        # 自研 WebDAV SDK (httpx-based)
 │       │   ├── auth.py     # build_auth: Basic / Bearer / Anonymous
@@ -154,10 +159,10 @@ app/
 │       └── handle.py     # 流式 ReadHandle / WriteHandle
 tests/
 ├── conftest.py             # 全局 pytest 配置与 fixture plugin 注册
-├── fixtures/               # 参数化 storage、DAV / FTP 本地服务
+├── fixtures/               # 参数化 storage、DAV / FTP / SFTP 本地服务
 ├── support/                # uid、动态 factory 测试目标
-├── contract/storage/       # 7 后端共享 AbstractStorage 契约
-├── storage/                # factory / cached / index / dav / ftp / s3 专属测试
+├── contract/storage/       # 8 后端共享 AbstractStorage 契约
+├── storage/                # factory / cached / index / dav / ftp / sftp / s3 专属测试
 │   ├── dav/integration/    # 本地 wsgidav 集成测试
 │   └── s3/integration/     # 外部 S3 credentials 测试
 └── server/                 # DAV Resource、FTPServer 协议与 server factory 测试
@@ -167,7 +172,7 @@ tests/
 
 **`AbstractStorage`** 是唯一存储接口，所有后端之间互相对称：
 - **简单后端**: `LocalStorage`, `MemoryStorage` — 直接实现存储
-- **网络后端**: `S3Storage`, `DavStorage`, `FTPStorage` — 使用异步网络客户端并映射为统一存储契约；S3/DAV 使用自研 httpx SDK，FTP 使用 aioftp + 独占 client pool
+- **网络后端**: `S3Storage`, `DavStorage`, `FTPStorage`, `SFTPStorage` — 使用异步网络客户端并映射为统一存储契约；S3/DAV 使用自研 httpx SDK，FTP 使用 aioftp 独占 client pool，SFTP 使用 AsyncSSH 单 transport、多 channel pool
 - **中间件模式**: `CachedStorage` 和 `IndexStorage` 都包装其他 `AbstractStorage` 实例，形成装饰器链。典型堆叠: `IndexStorage(CachedStorage(S3Storage(...), S3Storage(...)))`
 - **文件操作**: `upload/download_stream`、`unlink/rmdir/delete/delete_many`、`move/copy`
 - **目录操作**: `mkdir/rmtree`、`copytree/movetree`（`movetree` 默认实现为 copy + rmtree，后端可覆盖为更高效的实现）
@@ -201,6 +206,7 @@ tests/
 - **IndexStorage**: 大文件按 `BLOCK_SIZE (64MB)` 拆分分块，SHA-256 去重，引用计数管理。文件锁带 owner、lease 和绝对 acquisition deadline：持锁期间自动续租，慢速 handoff、取消和清理均受 deadline/guard 约束，释放只删除自己仍持有的锁。索引和 chunk 子后端连接失败时关闭已启动子项；回滚关闭失败会保存并在下一次 `connect()` 前重试。树 copy/move 持有 source/destination tree 锁；覆盖目标 chunk 保留临时 rollback ref，失败时逐文件恢复 source、目标和 refs，并保留 rollback 失败。所有公开入口方法统一调用 `_to_abs_path()` 规范化路径为绝对路径，确保 `FileMeta` 和 chunk ref 文件中存储的路径一致。
 - **CachedStorage**: 6 个命名空间缓存 (`exists/is_file/is_dir/stat/iterdir/download`)。正结果交叉后填（如 `is_file=True` → 同时缓存 `exists=True, is_dir=False`）。写入操作回填已知状态。`CacheBackend` 抽象接口支持批量操作（`mget`/`mset`/`mdelete`），内置 `MemoryCacheBackend` 和 `RedisCacheBackend`。**`snapshot()` / `dump_cache()`** 内省 API 暴露缓存内部状态供测试验证命中/未命中/回填/失效行为。`list_()` 永远绕过 `iterdir` 缓存直接查询底层存储但回填逐条目元数据缓存；tree copy/move 无论成功或失败都会在 finally 使源、目标及全局树缓存失效。
 - **FTPStorage**: plain FTP 客户端后端，`root_prefix` 将逻辑根隔离到远端绝对 POSIX 子目录；路径拒绝 NUL/`..` 越界。`FTPClientPool` 通过 `max_connections`（默认 1）按需创建 client，每个 lease 独占控制通道，transfer 在 EOF/`aclose()` 前持续持有 lease；取消、timeout 或控制通道失步会 invalidate 并淘汰连接。listing/walk 在 lease 内完整物化并排序，释放后才 yield。FTP 无服务端 COPY，`copy`/`copytree` 使用一个 pool source client + 一个操作级临时 destination client 流式中继；copytree 覆盖文件先 rename 到临时 backup，失败时删除新文件、恢复 backup，并保留 rollback failures。当前仅支持 plain FTP，不支持 FTPS/FTPES。
+- **SFTPStorage**: 基于 AsyncSSH 的 SFTP v3 客户端后端。默认验证 SSH host key，支持密码和显式私钥认证；一个 SSH transport 上有界复用多个独占 SFTP channel，generation 失效后仅恢复后续操作，不重放当前失败写入。路径拒绝 NUL、`..`、symlink 和特殊文件，每次 transport 重建都重新校验 canonical root。上传、copy 和覆盖 move 使用同目录 staged/backup rename；copytree 使用内存 journal 回滚，overwrite movetree 在 destination 完成后将 source rename 为 tombstone，并明确提交后删除断线无法完全回滚的协议限制。
 - **LocalStorage**: root 在构造时 canonicalize；每个逻辑路径及递归树操作拒绝现有 symlink、junction 和 Windows reparse-point 组件，避免通过链接逃逸。该检查不防御检查与系统调用之间的并发替换（TOCTOU）。
 - **WebDAV 服务**: 基于 wsgidav，通过 `run_async()` 桥接同步 wsgidav 到异步 `AbstractStorage`。`ResourceReader` 只允许首次读取前设置 offset，首次读取后拒绝 seek，确保 Range 边界稳定；`ResourceWriter` 使用独立线程 + memory object stream 处理异步上传；close/abort 通过事件循环执行 stream 关闭和 CancelScope 取消，避免从 wsgidav 工作线程直接操作 AnyIO 对象。
 - **FTP 服务端**: 基于 `aioftp`，`StoragePathIO` 将协议文件操作映射到 `AbstractStorage`，`ReadHandle` / `WriteHandle` 保持下载和上传流式传输。仅支持 `rb` / `wb`，禁用 APPE；REST 仅用于 RETR 下载 offset，非零 REST + STOR 返回 504 且不修改目标文件。
@@ -211,5 +217,6 @@ tests/
 
 - S3 公共契约使用本地 Moto Server；`tests/storage/s3/integration/` 的真实 S3 测试使用 `data/s3/mock.json`（不进 git），缺少配置时跳过
 - DavStorage 配置示例 `data/dav/config.json`（`base_url`/`auth_mode`/`username`/`password`/`token`/`root_prefix`/`verify_ssl`/`ca_cert_path`，不进 git）；`dav` 测试用本地 wsgidav，无需配置文件
+- SFTP 测试使用本地 AsyncSSH chroot server、随机 IPv4 端口和临时 known_hosts；生产配置默认使用 OpenSSH known_hosts，只有显式 `disable_host_key_check=true` 才关闭校验
 - 日志输出到 `logs/` 目录，按日轮转
 - 根目录的 `test*.py` 和 `run*.py` 模式已加入 `.gitignore`（真实测试在 `tests/` 目录）

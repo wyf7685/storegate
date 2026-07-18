@@ -18,6 +18,7 @@ from app.storage.abstract import AbstractStorage
         pytest.param("index", id="index"),
         pytest.param("ftp", marks=pytest.mark.integration, id="ftp"),
         pytest.param("dav", marks=pytest.mark.integration, id="dav"),
+        pytest.param("sftp", marks=pytest.mark.integration, id="sftp"),
     ]
 )
 async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStorage]:
@@ -87,4 +88,18 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
             host, port = request.getfixturevalue("_ftp_server")
             config = FTPConfig(host=host, port=port, root_prefix="/")
             async with FTPStorage(config) as instance:
+                yield instance
+
+        case "sftp":
+            from app.storage.sftp import SFTPConfig, SFTPStorage
+
+            server = request.getfixturevalue("_sftp_server")
+            config = SFTPConfig(
+                host=server.host,
+                port=server.port,
+                username=server.username,
+                password=SecretStr(server.password),
+                known_hosts=server.known_hosts,
+            )
+            async with SFTPStorage(config) as instance:
                 yield instance
