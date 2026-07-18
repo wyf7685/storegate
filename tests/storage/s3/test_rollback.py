@@ -12,9 +12,10 @@ import pytest
 from pydantic import SecretStr
 from pytest_mock import MockerFixture
 
-from app.storage.abstract import FileInfo, PathLike
+from app.storage.abstract import EntryKind, FileInfo, PathLike, WalkEntry
 from app.storage.s3.client import CopyPartResult, S3Config, S3HttpStatusError
 from app.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
+from app.storage.s3.utils import serialize_file_info
 from app.utils import flatten_exception_group
 
 
@@ -32,6 +33,11 @@ def s3_mocked() -> S3Storage:
     s.close = AsyncMock()
     s._client = MagicMock()
     return s
+
+
+def _directory_marker(path: str) -> bytes:
+    name = path.rstrip("/").rsplit("/", 1)[-1]
+    return serialize_file_info(FileInfo(path=path, name=name, kind=EntryKind.DIRECTORY))
 
 
 # ---------------------------------------------------------------------------
@@ -134,17 +140,23 @@ class TestCopytreeRollback:
         self, s3_mocked: S3Storage, restore_fails: bool
     ) -> None:
         storage = s3_mocked
+        src_marker = _directory_marker("/src")
+        dst_marker = _directory_marker("/dst")
+        dst_sub_marker = _directory_marker("/dst/sub")
         objects: dict[str, bytes] = {
-            "src/": b"src marker",
+            "src/": src_marker,
             "src/a.txt": b"new a",
             "src/b.txt": b"new b",
-            "dst/": b"old dst marker",
+            "dst/": dst_marker,
             "dst/a.txt": b"old a",
-            "dst/sub/": b"old sub marker",
+            "dst/sub/": dst_sub_marker,
         }
 
         async def _head(key: str) -> MagicMock | None:
             return MagicMock() if key in objects else None
+
+        async def _get(key: str) -> bytes:
+            return objects[key]
 
         async def _put(key: str, data: bytes) -> None:
             objects[key] = data
@@ -162,14 +174,14 @@ class TestCopytreeRollback:
                     deleted.append(key)
             return deleted
 
-        async def _walk(_path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
-            yield (
-                "/src",
-                [FileInfo(path="/src/sub", name="sub", is_dir=True)],
-                [
-                    FileInfo(path="/src/a.txt", name="a.txt", is_dir=False),
-                    FileInfo(path="/src/b.txt", name="b.txt", is_dir=False),
-                ],
+        async def _walk(_path: PathLike) -> AsyncIterator[WalkEntry]:
+            yield WalkEntry(
+                path="/src",
+                entries=(
+                    FileInfo(path="/src/sub", name="sub", kind=EntryKind.DIRECTORY),
+                    FileInfo(path="/src/a.txt", name="a.txt", kind=EntryKind.FILE),
+                    FileInfo(path="/src/b.txt", name="b.txt", kind=EntryKind.FILE),
+                ),
             )
 
         async def _copy(src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
@@ -183,6 +195,7 @@ class TestCopytreeRollback:
         client = storage._client
         assert client is not None
         client.head_object = _head  # ty: ignore[invalid-assignment]
+        client.get_object = _get  # ty: ignore[invalid-assignment]
         client.put_object = _put  # ty: ignore[invalid-assignment]
         client.put_object_copy = _put_copy  # ty: ignore[invalid-assignment]
         client.delete_objects = _delete_objects  # ty: ignore[invalid-assignment]
@@ -198,15 +211,15 @@ class TestCopytreeRollback:
             backup_key = next(key for key in objects if key.endswith("/dst/a.txt"))
             assert objects["dst/a.txt"] == b"new a"
             assert objects[backup_key] == b"old a"
-            assert objects["dst/"] == b"old dst marker"
-            assert objects["dst/sub/"] == b"old sub marker"
+            assert objects["dst/"] == dst_marker
+            assert objects["dst/sub/"] == dst_sub_marker
             assert "dst/b.txt" not in objects
         else:
             with pytest.raises(OSError, match="Failed to copy tree"):
                 await storage.copytree("/src", "/dst", overwrite=True)
             assert objects["dst/a.txt"] == b"old a"
-            assert objects["dst/"] == b"old dst marker"
-            assert objects["dst/sub/"] == b"old sub marker"
+            assert objects["dst/"] == dst_marker
+            assert objects["dst/sub/"] == dst_sub_marker
             assert "dst/b.txt" not in objects
             assert not any(".storegate-copytree-backup-" in key for key in objects)
 
@@ -215,16 +228,21 @@ class TestCopytreeRollback:
         self, s3_mocked: S3Storage, delete_after_mutation: bool
     ) -> None:
         storage = s3_mocked
+        src_marker = _directory_marker("/src")
+        dst_marker = _directory_marker("/dst")
         objects: dict[str, bytes] = {
-            "src/": b"src marker",
+            "src/": src_marker,
             "src/a.txt": b"new a",
-            "dst/": b"old dst marker",
+            "dst/": dst_marker,
             "dst/a.txt": b"old a",
         }
         delete_attempts = 0
 
         async def _head(key: str) -> MagicMock | None:
             return MagicMock() if key in objects else None
+
+        async def _get(key: str) -> bytes:
+            return objects[key]
 
         async def _put(key: str, data: bytes) -> None:
             objects[key] = data
@@ -245,8 +263,11 @@ class TestCopytreeRollback:
                 objects.pop(key, None)
             return pending
 
-        async def _walk(_path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
-            yield "/src", [], [FileInfo(path="/src/a.txt", name="a.txt", is_dir=False)]
+        async def _walk(_path: PathLike) -> AsyncIterator[WalkEntry]:
+            yield WalkEntry(
+                path="/src",
+                entries=(FileInfo(path="/src/a.txt", name="a.txt", kind=EntryKind.FILE),),
+            )
 
         async def _copy(src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
             _ = overwrite
@@ -255,6 +276,7 @@ class TestCopytreeRollback:
         client = storage._client
         assert client is not None
         client.head_object = _head  # ty: ignore[invalid-assignment]
+        client.get_object = _get  # ty: ignore[invalid-assignment]
         client.put_object = _put  # ty: ignore[invalid-assignment]
         client.put_object_copy = _put_copy  # ty: ignore[invalid-assignment]
         client.delete_objects = _delete_objects  # ty: ignore[invalid-assignment]

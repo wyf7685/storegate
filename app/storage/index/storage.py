@@ -3,19 +3,20 @@ import dataclasses
 import functools
 import hashlib
 import math
-from collections.abc import AsyncGenerator, AsyncIterable, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import NoReturn, final, override
+from typing import NoReturn, Self, final, override
 
 import anyio
 import anyio.lowlevel
 from anyio.streams.memory import MemoryObjectReceiveStream
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from app.log import escape_tag
 
-from ..abstract import AbstractStorage, BytesLike, FileInfo, PathLike, make_cache_identity
+from ..abstract import AbstractStorage, BytesLike, EntryKind, FileInfo, PathLike, WalkEntry, make_cache_identity
+from ._guard import download_private_file, lstat_private_entry, lstat_private_entry_or_none
 from .lock import LockLease, StorageFileLocker
 from .ref import ChunkRefManager, hash_to_path
 
@@ -28,8 +29,25 @@ DEFAULT_LOCK_LEASE = 300.0
 
 
 class FileMeta(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     info: FileInfo
     chunks: list[str]
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_file_info(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            info = value.get("info")
+            if isinstance(info, Mapping) and "is_dir" in info:
+                raise ValueError("Legacy FileInfo is_dir metadata is not supported")
+        return value
+
+    @model_validator(mode="after")
+    def require_file_kind(self) -> Self:
+        if self.info.kind is not EntryKind.FILE:
+            raise ValueError("Index FileMeta info must describe a regular file")
+        return self
 
 
 @final
@@ -113,7 +131,7 @@ class IndexStorage(AbstractStorage):
             chunks_started = True
             await chunks.connect()
             try:
-                existing = (await chunks.download_bytes(CHUNKS_INDEX_FILE)).decode()
+                existing = (await download_private_file(chunks, CHUNKS_INDEX_FILE, label="binding file")).decode()
             except FileNotFoundError:
                 existing = None
             if existing is None:
@@ -235,16 +253,17 @@ class IndexStorage(AbstractStorage):
             await self._locker.release_locks(self._chunks, reversed(leases), suppress_errors=False)
 
     async def _get_file_meta(self, path: PathLike) -> FileMeta | None:
+        path = self.normalize_path(path)
         try:
-            meta_bytes = await self._index.download_bytes(self.normalize_path(path))
+            meta_bytes = await download_private_file(self._index, path, label="metadata entry")
         except FileNotFoundError:
             return None
         if not meta_bytes:
             return None
         try:
             return FileMeta.model_validate_json(meta_bytes.decode())
-        except ValidationError as e:
-            raise OSError(f"Corrupted file metadata for {path}") from e
+        except (UnicodeDecodeError, ValidationError) as error:
+            raise OSError(f"Corrupted file metadata for {path}") from error
 
     async def _save_chunk_worker(
         self,
@@ -256,13 +275,16 @@ class IndexStorage(AbstractStorage):
             bin_path = hash_to_path(chunk_hash, "bin")
 
             async with self._lock_chunk(chunk_hash):
-                if not await self._chunks.exists(bin_path):
+                chunk_info = await lstat_private_entry_or_none(self._chunks, bin_path, label="chunk data")
+                if chunk_info is None:
                     start = anyio.current_time()
                     await self._chunks.upload_bytes(data, bin_path)
                     elapsed = anyio.current_time() - start
                     self.log.debug(
                         f"Chunk <c>{chunk_hash[:8]}</c> uploaded (<g>{len(data)}</g> bytes, <g>{elapsed:.2f}</g> s)"
                     )
+                elif chunk_info.kind is EntryKind.DIRECTORY:
+                    raise IsADirectoryError(f"Chunk data path is a directory: {bin_path}")
                 else:
                     self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> already exists, skipping upload")
                 await self._refs.incref(chunk_hash, remote_path)
@@ -284,7 +306,7 @@ class IndexStorage(AbstractStorage):
         except FileNotFoundError:
             pass
         else:
-            if info.is_dir:
+            if info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Is a directory: {remote_path}")
             if not overwrite:
                 raise FileExistsError(f"File already exists: {remote_path}")
@@ -373,7 +395,7 @@ class IndexStorage(AbstractStorage):
                     info=FileInfo(
                         path=remote_path.as_posix(),
                         name=remote_path.name,
-                        is_dir=False,
+                        kind=EntryKind.FILE,
                         size=total_size,
                         modified=now,
                         created=now,
@@ -431,9 +453,12 @@ class IndexStorage(AbstractStorage):
                 target_idx = -1
                 for idx, chunk_hash in enumerate(meta.chunks):
                     bin_path = hash_to_path(chunk_hash, "bin")
-                    if not await self._chunks.exists(bin_path):
+                    chunk_info = await lstat_private_entry_or_none(self._chunks, bin_path, label="chunk data")
+                    if chunk_info is None:
                         raise FileNotFoundError(f"Chunk #{idx + 1} {chunk_hash} not found for file {remote_path}")
-                    chunk_size = (await self._chunks.stat(bin_path)).size
+                    if chunk_info.kind is EntryKind.DIRECTORY:
+                        raise IsADirectoryError(f"Chunk #{idx + 1} {chunk_hash} is a directory for file {remote_path}")
+                    chunk_size = chunk_info.size
                     if chunk_offset + chunk_size > offset:
                         target_idx = idx
                         within_offset = offset - chunk_offset
@@ -459,8 +484,11 @@ class IndexStorage(AbstractStorage):
                 )
                 bin_path = hash_to_path(chunk_hash, "bin")
                 async with self._refs.temp_ref(chunk_hash):
-                    if not await self._chunks.exists(bin_path):
+                    chunk_info = await lstat_private_entry_or_none(self._chunks, bin_path, label="chunk data")
+                    if chunk_info is None:
                         raise FileNotFoundError(f"Chunk #{idx + 1} {chunk_hash} not found for file {remote_path}")
+                    if chunk_info.kind is EntryKind.DIRECTORY:
+                        raise IsADirectoryError(f"Chunk #{idx + 1} {chunk_hash} is a directory for file {remote_path}")
                     hasher = hashlib.sha256()
                     chunk_size = 0
                     local_skip = within_offset if is_target_chunk else 0
@@ -515,7 +543,8 @@ class IndexStorage(AbstractStorage):
         path = self.normalize_path(path)
         _colored_path = f"<y>{escape_tag(path)}</y>"
 
-        if await self._index.is_dir(path):
+        info = await lstat_private_entry_or_none(self._index, path, label="metadata entry")
+        if info is not None and info.kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {path}")
 
         async with self._lock_index(path):
@@ -533,11 +562,12 @@ class IndexStorage(AbstractStorage):
 
     @override
     async def rmdir(self, path: PathLike) -> None:
+        path = self.normalize_path(path)
         try:
-            info = await self._index.stat(path)
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"Directory not found: {path}") from e
-        if not info.is_dir:
+            info = await lstat_private_entry(self._index, path, label="index directory")
+        except FileNotFoundError as error:
+            raise FileNotFoundError(f"Directory not found: {path}") from error
+        if info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {path}")
         if not await self._is_dir_empty(path):
             raise OSError(f"Directory not empty: {path}")
@@ -555,8 +585,6 @@ class IndexStorage(AbstractStorage):
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
         if src == dst:
-            if await self._index.is_dir(src):
-                raise IsADirectoryError(f"Is a directory: {src}")
             if await self._get_file_meta(src) is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
             if not overwrite:
@@ -566,8 +594,6 @@ class IndexStorage(AbstractStorage):
         _colored_src = f"<y>{escape_tag(src)}</y>"
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
         async with self._lock_indexes(src, dst):
-            if await self._index.is_dir(src):
-                raise IsADirectoryError(f"Is a directory: {src}")
             src_meta = await self._get_file_meta(src)
             if src_meta is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
@@ -642,8 +668,6 @@ class IndexStorage(AbstractStorage):
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
         if src == dst:
-            if await self._index.is_dir(src):
-                raise IsADirectoryError(f"Is a directory: {src}")
             if await self._get_file_meta(src) is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
             if not overwrite:
@@ -652,8 +676,6 @@ class IndexStorage(AbstractStorage):
 
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
         async with self._lock_indexes(src, dst):
-            if await self._index.is_dir(src):
-                raise IsADirectoryError(f"Is a directory: {src}")
             src_meta = await self._get_file_meta(src)
             if src_meta is None:
                 raise FileNotFoundError(f"Source file not found: {src}")
@@ -715,33 +737,46 @@ class IndexStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
-        return await self._index.mkdir(self.normalize_path(path), parents=parents, exist_ok=exist_ok)
+        path = self.normalize_path(path)
+        await lstat_private_entry_or_none(self._index, path, label="index entry")
+        await self._index.mkdir(path, parents=parents, exist_ok=exist_ok)
 
     @override
     async def rmtree(self, path: PathLike) -> None:
         path = self.normalize_path(path)
+        root_info = await lstat_private_entry(self._index, path, label="tree root")
+        if root_info.kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {path}")
         _colored_path = f"<y>{escape_tag(path)}</y>"
         self.log.info(f"RmTree: {_colored_path}")
 
-        count = 0
+        metas, relative_directories = await self._collect_tree(path)
         async with anyio.create_task_group() as tg:
-            async for info in self._index.iterdir(path):
-                count += 1
-                tg.start_soon(self.rmtree if info.is_dir else self.unlink, self.normalize_path(info.path))
+            for file_path in metas:
+                tg.start_soon(self.unlink, file_path)
+        for relative in sorted(relative_directories, key=lambda item: len(item.parts), reverse=True):
+            await self._index.rmdir(path / relative)
         await self._index.rmdir(path)
-        self.log.info(f"RmTree complete: {_colored_path} (<g>{count}</g> entries removed)")
+        self.log.info(
+            f"RmTree complete: {_colored_path} (<g>{len(metas) + len(relative_directories)}</g> entries removed)"
+        )
 
     async def _collect_tree(self, root: PurePosixPath) -> tuple[dict[PurePosixPath, FileMeta], list[PurePosixPath]]:
         metas: dict[PurePosixPath, FileMeta] = {}
         relatives: list[PurePosixPath] = []
-        async for _, directories, files in self._index.walk(root):
-            relatives.extend(self.normalize_path(directory.path).relative_to(root) for directory in directories)
-            for file in files:
-                path = self.normalize_path(file.path)
-                meta = await self._get_file_meta(path)
-                if meta is None:
-                    raise FileNotFoundError(f"File not found: {path}")
-                metas[path] = meta
+        async for walk_entry in self._index.walk(root):
+            for entry in walk_entry.entries:
+                entry_path = self.normalize_path(entry.path)
+                match entry.kind:
+                    case EntryKind.DIRECTORY:
+                        relatives.append(entry_path.relative_to(root))
+                    case EntryKind.FILE:
+                        meta = await self._get_file_meta(entry_path)
+                        if meta is None:
+                            raise FileNotFoundError(f"File not found: {entry_path}")
+                        metas[entry_path] = meta
+                    case EntryKind.SYMLINK:
+                        await lstat_private_entry(self._index, entry_path, label="tree entry")
         return metas, relatives
 
     @staticmethod
@@ -757,8 +792,9 @@ class IndexStorage(AbstractStorage):
     async def _ensure_tree_directory(self, directory: PurePosixPath, created: set[PurePosixPath]) -> None:
         if directory == PurePosixPath("/"):
             return
-        if await self._index.exists(directory):
-            if not await self._index.is_dir(directory):
+        info = await lstat_private_entry_or_none(self._index, directory, label="tree directory")
+        if info is not None:
+            if info.kind is not EntryKind.DIRECTORY:
                 raise FileExistsError(f"Path is a file: {directory}")
             return
         await self._ensure_tree_directory(directory.parent, created)
@@ -823,7 +859,8 @@ class IndexStorage(AbstractStorage):
         destination_paths = {dst.joinpath(path.relative_to(src)) for path in source_metas}
         destination_metas: dict[PurePosixPath, FileMeta] = {}
         for path in destination_paths:
-            if await self._index.is_dir(path):
+            info = await lstat_private_entry_or_none(self._index, path, label="tree destination")
+            if info is not None and info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Destination is a directory: {path}")
             if meta := await self._get_file_meta(path):
                 destination_metas[path] = meta
@@ -875,9 +912,14 @@ class IndexStorage(AbstractStorage):
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
-        if not await self._index.is_dir(src):
+        try:
+            src_info = await lstat_private_entry(self._index, src, label="tree root")
+        except FileNotFoundError as error:
+            raise NotADirectoryError(f"Not a directory: {src}") from error
+        if src_info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
-        if not overwrite and await self._index.exists(dst):
+        dst_info = await lstat_private_entry_or_none(self._index, dst, label="tree destination")
+        if not overwrite and dst_info is not None:
             raise FileExistsError(f"Destination already exists: {dst}")
         if dst == src or dst.is_relative_to(src):
             raise ValueError("Destination must not be inside the source tree")
@@ -892,9 +934,14 @@ class IndexStorage(AbstractStorage):
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
-        if not await self._index.is_dir(src):
+        try:
+            src_info = await lstat_private_entry(self._index, src, label="tree root")
+        except FileNotFoundError as error:
+            raise NotADirectoryError(f"Not a directory: {src}") from error
+        if src_info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
-        if not overwrite and await self._index.exists(dst):
+        dst_info = await lstat_private_entry_or_none(self._index, dst, label="tree destination")
+        if not overwrite and dst_info is not None:
             raise FileExistsError(f"Destination already exists: {dst}")
         if dst == src or dst.is_relative_to(src):
             raise ValueError("Destination must not be inside the source tree")
@@ -907,109 +954,99 @@ class IndexStorage(AbstractStorage):
 
     @override
     async def exists(self, path: PathLike) -> bool:
-        return await self._index.exists(self.normalize_path(path))
+        try:
+            await self.stat(path)
+        except FileNotFoundError:
+            return False
+        return True
 
     @override
     async def is_file(self, path: PathLike) -> bool:
-        return await self._index.is_file(self.normalize_path(path))
+        try:
+            return (await self.stat(path)).kind is EntryKind.FILE
+        except FileNotFoundError:
+            return False
 
     @override
     async def is_dir(self, path: PathLike) -> bool:
-        return await self._index.is_dir(self.normalize_path(path))
+        try:
+            return (await self.stat(path)).kind is EntryKind.DIRECTORY
+        except FileNotFoundError:
+            return False
+
+    @override
+    async def is_symlink(self, path: PathLike) -> bool:
+        try:
+            await self.lstat(path)
+        except FileNotFoundError:
+            return False
+        return False
+
+    @override
+    async def lstat(self, path: PathLike) -> FileInfo:
+        return await self.stat(path)
 
     @override
     async def stat(self, path: PathLike) -> FileInfo:
         path = self.normalize_path(path)
         try:
-            info = await self._index.stat(path)
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
-        if info.is_dir:
-            return info
-        meta_bytes = await self._index.download_bytes(path)
-        try:
-            meta = FileMeta.model_validate_json(meta_bytes.decode())
-        except ValidationError as e:
-            raise OSError(f"Corrupted file metadata for {path}") from e
-        return meta.info
+            info = await lstat_private_entry(self._index, path, label="index entry")
+        except FileNotFoundError as error:
+            raise FileNotFoundError(f"File not found: {path}") from error
+        if info.kind is EntryKind.DIRECTORY:
+            return dataclasses.replace(info, path=path.as_posix(), name=path.name)
+        meta = await self._get_file_meta(path)
+        if meta is None:
+            raise FileNotFoundError(f"File not found: {path}")
+        return dataclasses.replace(meta.info, path=path.as_posix(), name=path.name)
 
     @override
     async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
         path = self.normalize_path(path)
-        if not await self._index.is_dir(path):
+        root_info = await lstat_private_entry(self._index, path, label="directory root")
+        if root_info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {path}")
         async for entry in self._index.iterdir(path):
-            if entry.is_dir:
-                yield FileInfo(
-                    path=self.normalize_path(entry.path).as_posix(),
-                    name=entry.name,
-                    is_dir=True,
-                    size=entry.size,
-                    modified=entry.modified,
-                    created=entry.created,
-                )
-            else:
-                meta = await self._get_file_meta(entry.path)
-                if meta is not None:
-                    yield meta.info
+            entry_path = self.normalize_path(entry.path)
+            match entry.kind:
+                case EntryKind.DIRECTORY:
+                    yield dataclasses.replace(entry, path=entry_path.as_posix(), name=entry_path.name)
+                case EntryKind.FILE:
+                    meta = await self._get_file_meta(entry_path)
+                    if meta is not None:
+                        yield dataclasses.replace(meta.info, path=entry_path.as_posix(), name=entry_path.name)
+                case EntryKind.SYMLINK:
+                    await lstat_private_entry(self._index, entry_path, label="directory entry")
 
     @override
-    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:
         path = self.normalize_path(path)
-        if not await self._index.is_dir(path):
+        root_info = await lstat_private_entry(self._index, path, label="walk root")
+        if root_info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {path}")
 
-        async def _fetch_meta(path: PathLike, files: list[FileInfo]) -> None:
-            meta = await self._get_file_meta(path)
+        async def _fetch_meta(entry_path: PurePosixPath, entries: list[FileInfo]) -> None:
+            meta = await self._get_file_meta(entry_path)
             if meta is not None:
-                files.append(meta.info)
+                entries.append(dataclasses.replace(meta.info, path=entry_path.as_posix(), name=entry_path.name))
 
-        async for sp, sd, sf in self._index.walk(path):
-            files: list[FileInfo] = []
+        async for underlying_entry in self._index.walk(path):
+            entries: list[FileInfo] = []
             async with anyio.create_task_group() as tg:
-                for entry in sf:
-                    tg.start_soon(_fetch_meta, entry.path, files)
-            files.sort(key=lambda x: x.name)
-            dirs = [
-                FileInfo(
-                    path=self.normalize_path(d.path).as_posix(),
-                    name=d.name,
-                    is_dir=True,
-                    size=d.size,
-                    modified=d.modified,
-                    created=d.created,
-                )
-                for d in sd
-            ]
-            yield (self.normalize_path(sp).as_posix(), dirs, files)
+                for entry in underlying_entry.entries:
+                    entry_path = self.normalize_path(entry.path)
+                    match entry.kind:
+                        case EntryKind.DIRECTORY:
+                            entries.append(dataclasses.replace(entry, path=entry_path.as_posix(), name=entry_path.name))
+                        case EntryKind.FILE:
+                            tg.start_soon(_fetch_meta, entry_path, entries)
+                        case EntryKind.SYMLINK:
+                            await lstat_private_entry(self._index, entry_path, label="walk entry")
+            entries.sort(key=lambda entry: entry.path)
+            yield WalkEntry(path=self.normalize_path(underlying_entry.path).as_posix(), entries=tuple(entries))
 
     @override
     async def list_(self, path: PathLike) -> list[FileInfo]:
-        path = self.normalize_path(path)
-        if not await self._index.is_dir(path):
-            raise NotADirectoryError(f"Not a directory: {path}")
-
-        async def _fetch_meta(path: PathLike) -> None:
-            meta = await self._get_file_meta(path)
-            if meta is not None:
-                files.append(meta.info)
-
-        files: list[FileInfo] = []
-        async with anyio.create_task_group() as tg:
-            async for entry in self._index.iterdir(path):
-                if entry.is_dir:
-                    files.append(
-                        FileInfo(
-                            path=self.normalize_path(entry.path).as_posix(),
-                            name=entry.name,
-                            is_dir=True,
-                            size=entry.size,
-                            modified=entry.modified,
-                            created=entry.created,
-                        )
-                    )
-                else:
-                    tg.start_soon(_fetch_meta, entry.path)
-
-        files.sort(key=lambda x: x.name)
-        return files
+        entries = [entry async for entry in self.iterdir(path)]
+        entries.sort(key=lambda entry: entry.path)
+        return entries

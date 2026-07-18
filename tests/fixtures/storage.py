@@ -9,6 +9,14 @@ from pydantic import SecretStr
 from app.storage.abstract import AbstractStorage
 
 
+@pytest.fixture(scope="session")
+def host_symlink_create() -> bool:
+    """Whether this process can create OS symbolic links on the host filesystem."""
+    from tests.support.host_symlinks import probe_host_symlink_create
+
+    return probe_host_symlink_create()
+
+
 @pytest.fixture(
     params=[
         pytest.param("memory", id="memory"),
@@ -27,7 +35,7 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
         case "memory":
             from app.storage.memory import MemoryStorage
 
-            async with MemoryStorage("/") as instance:
+            async with MemoryStorage("/shared-contract-root") as instance:
                 yield instance
 
         case "local":
@@ -60,7 +68,7 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
             from app.storage.cached import CachedStorage
             from app.storage.memory import MemoryStorage
 
-            async with CachedStorage(MemoryStorage("/")) as instance:
+            async with CachedStorage(MemoryStorage("/shared-contract-root")) as instance:
                 yield instance
 
         case "index":
@@ -100,6 +108,7 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
                 username=server.username,
                 password=SecretStr(server.password),
                 known_hosts=server.known_hosts,
+                root_prefix=server.root_prefix,
             )
             async with SFTPStorage(config) as instance:
                 yield instance

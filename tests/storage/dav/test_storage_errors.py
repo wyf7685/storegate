@@ -7,8 +7,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pytest_mock import MockerFixture
 
-from app.storage.abstract import FileInfo
+from app.storage.abstract import EntryKind, FileInfo, UnsupportedOperationError, WalkEntry
 from app.storage.dav import DavStorage
+from app.storage.dav.client import DavResource
 from app.storage.dav.client.errors import DavHttpStatusError
 from app.utils import flatten_exception_group
 
@@ -28,6 +29,17 @@ def dav_mocked(mocker: MockerFixture) -> DavStorage:
 async def _stream(*chunks: bytes) -> AsyncIterator[bytes]:
     for chunk in chunks:
         yield chunk
+
+
+def _resource(href: str, *resource_types: str) -> DavResource:
+    return DavResource(
+        href=href,
+        resource_types=resource_types,
+        content_length=None,
+        last_modified=None,
+        creation_date=None,
+        display_name=None,
+    )
 
 
 class TestStatErrorMapping:
@@ -50,12 +62,125 @@ class TestStatErrorMapping:
             await dav_mocked.stat("x")
 
 
+class TestUnsupportedResources:
+    async def test_capabilities_and_symlink_primitives_are_unsupported(self, dav_mocked: DavStorage) -> None:
+        assert dav_mocked.capabilities.symlink_metadata is False
+        assert dav_mocked.capabilities.readlink is False
+        assert dav_mocked.capabilities.symlink_create is False
+
+        with pytest.raises(UnsupportedOperationError):
+            await dav_mocked.readlink("link")
+        with pytest.raises(UnsupportedOperationError):
+            await dav_mocked.symlink("target", "link")
+
+    async def test_direct_stat_rejects_nonstandard_resource_type(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        mocker.patch.object(
+            dav_mocked._client,
+            "propfind",
+            new=AsyncMock(return_value=[_resource("/dav/link", "{urn:example:links}symlink")]),
+        )
+
+        with pytest.raises(UnsupportedOperationError):
+            await dav_mocked.stat("link")
+
+    async def test_discovery_skips_nonstandard_resource_type(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        mocker.patch.object(
+            dav_mocked._client,
+            "propfind",
+            new=AsyncMock(
+                return_value=[
+                    _resource("/dav/", "{DAV:}collection"),
+                    _resource("/dav/file.txt"),
+                    _resource("/dav/link", "{urn:example:links}symlink"),
+                ]
+            ),
+        )
+
+        entries = [entry async for entry in dav_mocked.iterdir("/")]
+        assert [(entry.path, entry.kind) for entry in entries] == [("/file.txt", EntryKind.FILE)]
+
+    async def test_walk_returns_structured_discovery_snapshot(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        mocker.patch.object(
+            dav_mocked._client,
+            "propfind",
+            new=AsyncMock(
+                return_value=[
+                    _resource("/dav/", "{DAV:}collection"),
+                    _resource("/dav/z.txt"),
+                    _resource("/dav/a.txt"),
+                    _resource("/dav/link", "{urn:example:links}symlink"),
+                ]
+            ),
+        )
+
+        walked = [entry async for entry in dav_mocked.walk("/")]
+        assert walked == [
+            WalkEntry(
+                path="/",
+                entries=(
+                    FileInfo(path="/a.txt", name="a.txt", kind=EntryKind.FILE),
+                    FileInfo(path="/z.txt", name="z.txt", kind=EntryKind.FILE),
+                ),
+            )
+        ]
+
+    async def test_rmdir_counts_hidden_special_resource_as_nonempty(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        directory = FileInfo(path="/dir", name="dir", kind=EntryKind.DIRECTORY)
+        mocker.patch.object(dav_mocked, "stat", new=AsyncMock(return_value=directory))
+        mocker.patch.object(
+            dav_mocked._client,
+            "propfind",
+            new=AsyncMock(
+                return_value=[
+                    _resource("/dav/dir/", "{DAV:}collection"),
+                    _resource("/dav/dir/link", "{urn:example:links}symlink"),
+                ]
+            ),
+        )
+        delete_mock = mocker.patch.object(dav_mocked._client, "delete", new=AsyncMock())
+
+        with pytest.raises(OSError, match="Directory not empty"):
+            await dav_mocked.rmdir("dir")
+
+        delete_mock.assert_not_awaited()
+
+    async def test_strict_snapshot_rejects_special_before_tree_mutation(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        directory = FileInfo(path="/src", name="src", kind=EntryKind.DIRECTORY)
+        mocker.patch.object(dav_mocked, "stat", new=AsyncMock(return_value=directory))
+        mocker.patch.object(
+            dav_mocked._client,
+            "propfind",
+            new=AsyncMock(
+                return_value=[
+                    _resource("/dav/src/", "{DAV:}collection"),
+                    _resource("/dav/src/link", "{urn:example:links}symlink"),
+                ]
+            ),
+        )
+        copy_mock = mocker.patch.object(dav_mocked._client, "copy", new=AsyncMock())
+
+        with pytest.raises(UnsupportedOperationError):
+            await dav_mocked.copytree("src", "dst")
+
+        copy_mock.assert_not_awaited()
+
+
 class TestUploadStatGateway:
     async def test_upload_to_directory_raises(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(return_value=FileInfo(path="/d", name="d", is_dir=True)),
+            new=AsyncMock(return_value=FileInfo(path="/d", name="d", kind=EntryKind.DIRECTORY)),
         )
         put_mock = mocker.patch.object(dav_mocked._client, "put", AsyncMock())
         with pytest.raises(IsADirectoryError):
@@ -66,7 +191,7 @@ class TestUploadStatGateway:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(return_value=FileInfo(path="/f", name="f", is_dir=False, size=3)),
+            new=AsyncMock(return_value=FileInfo(path="/f", name="f", kind=EntryKind.FILE, size=3)),
         )
         put_mock = mocker.patch.object(dav_mocked._client, "put", AsyncMock())
         with pytest.raises(FileExistsError):
@@ -88,7 +213,7 @@ class TestRmdir:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(return_value=FileInfo(path="/d", name="d", is_dir=True)),
+            new=AsyncMock(return_value=FileInfo(path="/d", name="d", kind=EntryKind.DIRECTORY)),
         )
         mocker.patch.object(dav_mocked, "_is_dir_empty", new=AsyncMock(return_value=False))
         delete_mock = mocker.patch.object(dav_mocked._client, "delete", AsyncMock())
@@ -100,7 +225,7 @@ class TestRmdir:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(return_value=FileInfo(path="/f", name="f", is_dir=False, size=1)),
+            new=AsyncMock(return_value=FileInfo(path="/f", name="f", kind=EntryKind.FILE, size=1)),
         )
         delete_mock = mocker.patch.object(dav_mocked._client, "delete", AsyncMock())
         with pytest.raises(NotADirectoryError):
@@ -137,7 +262,9 @@ class TestMoveOverwrite:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(side_effect=[FileInfo(path="/src", name="src", is_dir=False), FileNotFoundError("dst")]),
+            new=AsyncMock(
+                side_effect=[FileInfo(path="/src", name="src", kind=EntryKind.FILE), FileNotFoundError("dst")]
+            ),
         )
         mocker.patch.object(dav_mocked, "is_dir", new=AsyncMock(return_value=False))
         mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
@@ -171,7 +298,9 @@ class TestMoveOverwrite:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(side_effect=[FileInfo(path="/src", name="src", is_dir=False), FileNotFoundError("dst")]),
+            new=AsyncMock(
+                side_effect=[FileInfo(path="/src", name="src", kind=EntryKind.FILE), FileNotFoundError("dst")]
+            ),
         )
         mocker.patch.object(dav_mocked, "is_dir", new=AsyncMock(return_value=False))
         mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
@@ -201,7 +330,9 @@ class TestMoveOverwrite:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(side_effect=[FileInfo(path="/src", name="src", is_dir=False), FileNotFoundError("dst")]),
+            new=AsyncMock(
+                side_effect=[FileInfo(path="/src", name="src", kind=EntryKind.FILE), FileNotFoundError("dst")]
+            ),
         )
         mocker.patch.object(dav_mocked, "is_dir", new=AsyncMock(return_value=False))
         mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
@@ -231,7 +362,9 @@ class TestMoveOverwrite:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(side_effect=[FileInfo(path="/src", name="src", is_dir=False), FileNotFoundError("dst")]),
+            new=AsyncMock(
+                side_effect=[FileInfo(path="/src", name="src", kind=EntryKind.FILE), FileNotFoundError("dst")]
+            ),
         )
         mocker.patch.object(dav_mocked, "is_dir", new=AsyncMock(return_value=False))
         mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
@@ -265,7 +398,7 @@ class TestMoveOverwrite:
         async def _stat(path: str) -> FileInfo:
             if path not in state:
                 raise FileNotFoundError(path)
-            return FileInfo(path=f"/{path}", name=path, is_dir=False)
+            return FileInfo(path=f"/{path}", name=path, kind=EntryKind.FILE)
 
         async def _move(old: str, new: str, *, overwrite: bool) -> None:
             nonlocal move_count
@@ -303,7 +436,7 @@ class TestMoveOverwrite:
         async def _stat(path: str) -> FileInfo:
             if path not in state:
                 raise FileNotFoundError(path)
-            return FileInfo(path=f"/{path}", name=path, is_dir=False)
+            return FileInfo(path=f"/{path}", name=path, kind=EntryKind.FILE)
 
         async def _move(old: str, new: str, *, overwrite: bool) -> None:
             nonlocal move_count
@@ -340,7 +473,7 @@ class TestMoveOverwrite:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(return_value=FileInfo(path="/src", name="src", is_dir=True)),
+            new=AsyncMock(return_value=FileInfo(path="/src", name="src", kind=EntryKind.DIRECTORY)),
         )
         move_mock = mocker.patch.object(dav_mocked._client, "move", AsyncMock())
 
@@ -352,9 +485,11 @@ class TestMoveOverwrite:
 
 class TestCopytreeFallback:
     async def test_server_copy_501_triggers_fallback(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
-        src_info = FileInfo(path="/src", name="src", is_dir=True)
+        src_info = FileInfo(path="/src", name="src", kind=EntryKind.DIRECTORY)
         mocker.patch.object(dav_mocked, "stat", new=AsyncMock(return_value=src_info))
         mocker.patch.object(dav_mocked, "exists", new=AsyncMock(return_value=False))
+        snapshot = (WalkEntry(path="/src", entries=()),)
+        mocker.patch.object(dav_mocked, "_strict_walk_snapshot", new=AsyncMock(return_value=snapshot))
         mocker.patch.object(
             dav_mocked._client,
             "copy",
@@ -366,13 +501,79 @@ class TestCopytreeFallback:
         fallback_mock.assert_awaited_once()
 
     async def test_server_copy_success_skips_fallback(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
-        src_info = FileInfo(path="/src", name="src", is_dir=True)
+        src_info = FileInfo(path="/src", name="src", kind=EntryKind.DIRECTORY)
         mocker.patch.object(dav_mocked, "stat", new=AsyncMock(return_value=src_info))
         mocker.patch.object(dav_mocked, "exists", new=AsyncMock(return_value=False))
+        mocker.patch.object(
+            dav_mocked,
+            "_strict_walk_snapshot",
+            new=AsyncMock(return_value=(WalkEntry(path="/src", entries=()),)),
+        )
         mocker.patch.object(dav_mocked._client, "copy", AsyncMock())
         fallback_mock = mocker.patch.object(dav_mocked, "_copytree_fallback", AsyncMock())
         await dav_mocked.copytree("src", "dst")
         fallback_mock.assert_not_awaited()
+
+    async def test_special_snapshot_fails_before_destination_mutation(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        snapshot = (
+            WalkEntry(
+                path="/src",
+                entries=(FileInfo(path="/src/link", name="link", kind=EntryKind.SYMLINK),),
+            ),
+        )
+        exists_mock = mocker.patch.object(dav_mocked, "exists", new=AsyncMock())
+        mkdir_mock = mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+
+        with pytest.raises(UnsupportedOperationError):
+            await dav_mocked._copytree_fallback(
+                PurePosixPath("/src"), PurePosixPath("/dst"), overwrite=True, snapshot=snapshot
+            )
+
+        exists_mock.assert_not_awaited()
+        mkdir_mock.assert_not_awaited()
+
+    async def test_fallback_creates_directories_before_copying_sibling_files(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        snapshot = (
+            WalkEntry(
+                path="/src",
+                entries=(
+                    FileInfo(path="/src/a.txt", name="a.txt", kind=EntryKind.FILE),
+                    FileInfo(path="/src/z", name="z", kind=EntryKind.DIRECTORY),
+                ),
+            ),
+        )
+        events: list[str] = []
+
+        async def exists(path: str | PurePosixPath) -> bool:
+            events.append(f"exists:{path}")
+            return str(path) == "/dst"
+
+        async def mkdir(path: str, *, parents: bool = False, exist_ok: bool = False) -> None:
+            _ = parents, exist_ok
+            events.append(f"mkdir:{path}")
+
+        async def stat(path: str | PurePosixPath) -> FileInfo:
+            events.append(f"stat:{path}")
+            raise FileNotFoundError(str(path))
+
+        async def copy(source: str, destination: str, *, overwrite: bool = True) -> None:
+            _ = overwrite
+            events.append(f"copy:{source}->{destination}")
+
+        mocker.patch.object(dav_mocked, "exists", new=exists)
+        mocker.patch.object(dav_mocked, "mkdir", new=mkdir)
+        mocker.patch.object(dav_mocked, "stat", new=stat)
+        mocker.patch.object(dav_mocked, "copy", new=copy)
+
+        await dav_mocked._copytree_fallback(
+            PurePosixPath("/src"), PurePosixPath("/dst"), overwrite=True, snapshot=snapshot
+        )
+
+        assert events.index("mkdir:/dst/z") < events.index("copy:/src/a.txt->/dst/a.txt")
 
 
 class TestMovetreeFallback:
@@ -386,9 +587,14 @@ class TestMovetreeFallback:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(return_value=FileInfo(path="/src", name="src", is_dir=True)),
+            new=AsyncMock(return_value=FileInfo(path="/src", name="src", kind=EntryKind.DIRECTORY)),
         )
         mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        mocker.patch.object(
+            dav_mocked,
+            "_strict_walk_snapshot",
+            new=AsyncMock(return_value=(WalkEntry(path="/src", entries=()),)),
+        )
         mocker.patch.object(
             dav_mocked._client,
             "move",
@@ -406,9 +612,14 @@ class TestMovetreeFallback:
         mocker.patch.object(
             dav_mocked,
             "stat",
-            new=AsyncMock(return_value=FileInfo(path="/src", name="src", is_dir=True)),
+            new=AsyncMock(return_value=FileInfo(path="/src", name="src", kind=EntryKind.DIRECTORY)),
         )
         mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        mocker.patch.object(
+            dav_mocked,
+            "_strict_walk_snapshot",
+            new=AsyncMock(return_value=(WalkEntry(path="/src", entries=()),)),
+        )
         mocker.patch.object(
             dav_mocked._client,
             "move",
@@ -425,15 +636,22 @@ class TestCopytreeFallbackRollback:
     ) -> None:
         state = {"src/a.txt": b"new", "dst/a.txt": b"old", "dst/keep.txt": b"keep"}
 
-        async def walk(_path: PurePosixPath) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
-            yield "/src", [], [FileInfo(path="/src/a.txt", name="a.txt", is_dir=False)]
-            yield "/src/sub", [], [FileInfo(path="/src/sub/b.txt", name="b.txt", is_dir=False)]
+        snapshot = (
+            WalkEntry(
+                path="/src",
+                entries=(FileInfo(path="/src/a.txt", name="a.txt", kind=EntryKind.FILE),),
+            ),
+            WalkEntry(
+                path="/src/sub",
+                entries=(FileInfo(path="/src/sub/b.txt", name="b.txt", kind=EntryKind.FILE),),
+            ),
+        )
 
         async def stat(path: str | PurePosixPath) -> FileInfo:
             key = str(path).lstrip("/")
             if key not in state:
                 raise FileNotFoundError(key)
-            return FileInfo(path=f"/{key}", name=PurePosixPath(key).name, is_dir=False)
+            return FileInfo(path=f"/{key}", name=PurePosixPath(key).name, kind=EntryKind.FILE)
 
         async def exists(path: str | PurePosixPath) -> bool:
             return str(path).lstrip("/") in state or str(path).rstrip("/") in {"/dst", "dst"}
@@ -457,7 +675,6 @@ class TestCopytreeFallbackRollback:
             _ = overwrite
             state[destination] = state.pop(source)
 
-        mocker.patch.object(dav_mocked, "walk", new=walk)
         mocker.patch.object(dav_mocked, "stat", new=stat)
         mocker.patch.object(dav_mocked, "exists", new=exists)
         mocker.patch.object(dav_mocked, "mkdir", new=mkdir)
@@ -466,21 +683,28 @@ class TestCopytreeFallbackRollback:
         mocker.patch.object(dav_mocked._client, "move", new=AsyncMock(side_effect=move))
 
         with pytest.raises(OSError, match="Failed to copy tree"):
-            await dav_mocked._copytree_fallback(PurePosixPath("/src"), PurePosixPath("/dst"), overwrite=True)
+            await dav_mocked._copytree_fallback(
+                PurePosixPath("/src"), PurePosixPath("/dst"), overwrite=True, snapshot=snapshot
+            )
 
         assert state["dst/a.txt"] == b"old"
         assert state["dst/keep.txt"] == b"keep"
 
     async def test_restore_failure_is_grouped(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
-        async def walk(_path: PurePosixPath) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
-            yield "/src", [], [FileInfo(path="/src/a.txt", name="a.txt", is_dir=False)]
-            yield "/src/sub", [], [FileInfo(path="/src/sub/b.txt", name="b.txt", is_dir=False)]
-
-        mocker.patch.object(dav_mocked, "walk", new=walk)
+        snapshot = (
+            WalkEntry(
+                path="/src",
+                entries=(FileInfo(path="/src/a.txt", name="a.txt", kind=EntryKind.FILE),),
+            ),
+            WalkEntry(
+                path="/src/sub",
+                entries=(FileInfo(path="/src/sub/b.txt", name="b.txt", kind=EntryKind.FILE),),
+            ),
+        )
 
         async def stat(path: str | PurePosixPath) -> FileInfo:
             if str(path).endswith("a.txt"):
-                return FileInfo(path="/dst/a.txt", name="a.txt", is_dir=False)
+                return FileInfo(path="/dst/a.txt", name="a.txt", kind=EntryKind.FILE)
             raise FileNotFoundError(str(path))
 
         mocker.patch.object(dav_mocked, "stat", new=stat)
@@ -491,7 +715,9 @@ class TestCopytreeFallbackRollback:
         mocker.patch.object(dav_mocked._client, "move", new=AsyncMock(side_effect=[None, OSError("restore failed")]))
 
         with pytest.raises(BaseExceptionGroup) as caught:
-            await dav_mocked._copytree_fallback(PurePosixPath("/src"), PurePosixPath("/dst"), overwrite=True)
+            await dav_mocked._copytree_fallback(
+                PurePosixPath("/src"), PurePosixPath("/dst"), overwrite=True, snapshot=snapshot
+            )
         flattened = list(flatten_exception_group(caught.value))
         assert "copy failed" in str(flattened[0])
         assert "restore failed" in str(flattened[1])

@@ -16,7 +16,7 @@ async def test_sftp_end_to_end_smoke(sftp_server: SFTPServerInfo) -> None:
         info = await storage.stat(f"{root}/files/source.bin")
         assert info.size == 8
         assert [item.name async for item in storage.iterdir(f"{root}/files")] == ["source.bin"]
-        assert [current async for current, _, _ in storage.walk(root)] == [root, f"{root}/files"]
+        assert [walk_entry.path async for walk_entry in storage.walk(root)] == [root, f"{root}/files"]
 
         offset_data = b"".join([chunk async for chunk in storage.download_stream(f"{root}/files/source.bin", offset=3)])
         assert offset_data == b"defgh"
@@ -39,8 +39,8 @@ async def test_sftp_end_to_end_smoke(sftp_server: SFTPServerInfo) -> None:
 
         temporary_names = [
             entry.name
-            async for _, directories, files in storage.walk(root)
-            for entry in [*directories, *files]
+            async for walk_entry in storage.walk(root)
+            for entry in walk_entry.entries
             if ".storegate-" in entry.name
         ]
         assert temporary_names == []

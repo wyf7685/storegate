@@ -10,10 +10,10 @@ from aioftp.common import Connection
 from aioftp.pathio import AbstractPathIO, defend_file_methods, universal_exception
 
 from app.log import escape_tag
-from app.storage import AbstractStorage, FileInfo
+from app.storage import AbstractStorage, EntryKind, FileInfo
 from app.utils import logger_wrapper
 
-from .handle import FileHandle, ReadHandle, WriteHandle
+from .handle import FileHandle, ReadHandle, WriteHandle, _guard_not_symlink
 
 if TYPE_CHECKING:
     from _typeshed import OpenBinaryMode, ReadableBuffer
@@ -32,9 +32,12 @@ def _file_info_to_stat(
     - st_atime 优先使用 modified，其次使用 created
     - inode、设备号、链接数、UID、GID 使用默认值
     """
-    permissions = dir_permissions if info.is_dir else file_permissions
-    file_type = stat.S_IFDIR if info.is_dir else stat.S_IFREG
-    mode = file_type | permissions
+    if info.kind is EntryKind.FILE:
+        mode = stat.S_IFREG | file_permissions
+    elif info.kind is EntryKind.DIRECTORY:
+        mode = stat.S_IFDIR | dir_permissions
+    else:
+        raise FileNotFoundError(f"File unavailable: {info.path}")
 
     created = info.created.timestamp() if info.created else 0
     modified = info.modified.timestamp() if info.modified else 0
@@ -90,26 +93,40 @@ class StoragePathIO(AbstractPathIO[Path]):
     def _normalize_path(path: PurePath) -> PurePosixPath:
         return AbstractStorage.normalize_path(PurePosixPath(path))
 
+    async def _lstat_or_none(self, path: PurePosixPath) -> FileInfo | None:
+        try:
+            return await self.storage.lstat(path)
+        except FileNotFoundError:
+            return None
+
+    @universal_exception
+    async def is_hidden_symlink(self, path: PurePath) -> bool:
+        info = await self._lstat_or_none(self._normalize_path(path))
+        return info is not None and info.kind is EntryKind.SYMLINK
+
     @override
     @universal_exception
     async def exists(self, path: Path) -> bool:
         np = self._normalize_path(path)
         self.log.debug(f"<le>exists</>(<y><u>{escape_tag(np)}</></>)")
-        return await self.storage.exists(np)
+        info = await self._lstat_or_none(np)
+        return info is not None and info.kind in (EntryKind.FILE, EntryKind.DIRECTORY)
 
     @override
     @universal_exception
     async def is_dir(self, path: Path) -> bool:
         np = self._normalize_path(path)
         self.log.debug(f"<le>is_dir</>(<y><u>{escape_tag(np)}</></>)")
-        return await self.storage.is_dir(np)
+        info = await self._lstat_or_none(np)
+        return info is not None and info.kind is EntryKind.DIRECTORY
 
     @override
     @universal_exception
     async def is_file(self, path: Path) -> bool:
         np = self._normalize_path(path)
         self.log.debug(f"<le>is_file</>(<y><u>{escape_tag(np)}</></>)")
-        return await self.storage.is_file(np)
+        info = await self._lstat_or_none(np)
+        return info is not None and info.kind is EntryKind.FILE
 
     @override
     @universal_exception
@@ -142,8 +159,9 @@ class StoragePathIO(AbstractPathIO[Path]):
         self.log.debug(f"<le>list</>(<y><u>{escape_tag(np)}</></>)")
 
         async def generator() -> AsyncGenerator[PurePosixPath]:
-            async for item in self.storage.iterdir(self._normalize_path(np)):
-                yield PurePosixPath(item.path)
+            async for item in self.storage.iterdir(np):
+                if item.kind in (EntryKind.FILE, EntryKind.DIRECTORY):
+                    yield PurePosixPath(item.path)
 
         class Lister(AbstractAsyncLister[Path]):
             @override
@@ -166,7 +184,7 @@ class StoragePathIO(AbstractPathIO[Path]):
     async def stat(self, path: Path) -> os.stat_result:
         np = self._normalize_path(path)
         self.log.debug(f"<le>stat</>(<y><u>{escape_tag(np)}</></>)")
-        info = await self.storage.stat(np)
+        info = await self.storage.lstat(np)
         return _file_info_to_stat(info)
 
     @override
@@ -176,10 +194,17 @@ class StoragePathIO(AbstractPathIO[Path]):
         dst = self._normalize_path(destination)
         self.log.debug(f"<le>rename</>(<y><u>{escape_tag(src)}</></>, <y><u>{escape_tag(dst)}</></>)")
 
-        if await self.storage.is_dir(src):
+        source_info = await self.storage.lstat(src)
+        destination_info = await self._lstat_or_none(dst)
+        if destination_info is not None and destination_info.kind is EntryKind.SYMLINK:
+            raise FileNotFoundError(f"File unavailable: {dst}")
+
+        if source_info.kind is EntryKind.DIRECTORY:
             await self.storage.movetree(src, dst)
-        else:
+        elif source_info.kind is EntryKind.FILE:
             await self.storage.move(src, dst)
+        else:
+            raise FileNotFoundError(f"File unavailable: {src}")
 
         return destination
 
@@ -202,7 +227,8 @@ class StoragePathIO(AbstractPathIO[Path]):
         }.get(mode)
         if handle is None:
             raise OSError(f"Unsupported mode: {mode}. Only 'rb' and 'wb' are supported.")
-        return handle(self.storage, self._normalize_path(np))
+        await _guard_not_symlink(self.storage, np, missing_ok=mode == "wb")
+        return handle(self.storage, np)
 
     @override
     @universal_exception

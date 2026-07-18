@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from contextlib import asynccontextmanager
@@ -11,13 +12,24 @@ import anyio
 from aioftp.client import BasicListInfo, UnixListInfo
 
 from app.log import escape_tag
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike, make_cache_identity
+from app.storage.abstract import (
+    AbstractStorage,
+    BytesLike,
+    EntryKind,
+    FileInfo,
+    PathLike,
+    UnsupportedOperationError,
+    WalkEntry,
+    make_cache_identity,
+)
 from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
 from .config import FTPConfig
 from .pool import FTPClientLease, FTPClientPool
 
 type FTPFacts = BasicListInfo | UnixListInfo | dict[str, str]
+
+_UNSUPPORTED_ERRNO = getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)
 
 translator = ExceptionTranslator(
     bypass=OSError,
@@ -52,7 +64,14 @@ def _status_matches(exc: aioftp.StatusCodeError, pattern: str) -> bool:
 
 @final
 class FTPStorage(AbstractStorage):
-    """Plain FTP client storage backend."""
+    """Plain FTP client storage backend.
+
+    FTP has no portable no-follow metadata primitive. Explicit MLSD/MLST
+    link and special facts are rejected or hidden according to the operation,
+    but a server may instead report a followed target as a file or directory.
+    In that case this client cannot detect the link and does not provide a
+    client-side confinement guarantee.
+    """
 
     def __init__(self, config: str | Path | FTPConfig) -> None:
         super().__init__()
@@ -111,6 +130,26 @@ class FTPStorage(AbstractStorage):
             raise OSError(f"FTP server returned a path outside root_prefix: {path}") from None
         return PurePosixPath("/") if relative == PurePosixPath(".") else PurePosixPath("/", relative)
 
+    @staticmethod
+    def _entry_kind_from_facts(facts: FTPFacts) -> EntryKind | None:
+        if "link_dst" in facts:
+            return None
+        entry_type = str(facts.get("type", "")).casefold()
+        if entry_type == "file":
+            return EntryKind.FILE
+        if entry_type == "dir":
+            return EntryKind.DIRECTORY
+        return None
+
+    @staticmethod
+    def _unsupported_entry(logical_path: PurePosixPath, facts: FTPFacts) -> UnsupportedOperationError:
+        entry_type = facts.get("type")
+        link_detail = f", link_dst={facts.get("link_dst")!r}" if "link_dst" in facts else ""
+        return UnsupportedOperationError(
+            _UNSUPPORTED_ERRNO,
+            f"Unsupported FTP entry type {entry_type!r}{link_detail}: {logical_path.as_posix()}",
+        )
+
     def _new_client(self) -> aioftp.Client:
         return aioftp.Client(
             connection_timeout=self._config.timeout,
@@ -128,7 +167,10 @@ class FTPStorage(AbstractStorage):
                 self._config.password.get_secret_value(),
             )
             facts = await client.stat(self._root_prefix)
-            if facts.get("type") != "dir":
+            root_kind = self._entry_kind_from_facts(facts)
+            if root_kind is None:
+                raise self._unsupported_entry(PurePosixPath("/"), facts)
+            if root_kind is not EntryKind.DIRECTORY:
                 raise NotADirectoryError(f"FTP root_prefix is not a directory: {self._config.root_prefix}")
         except Exception:
             client.close()
@@ -162,6 +204,7 @@ class FTPStorage(AbstractStorage):
                 IsADirectoryError,
                 NotADirectoryError,
                 PermissionError,
+                UnsupportedOperationError,
                 ValueError,
                 aioftp.StatusCodeError,
             ),
@@ -201,14 +244,14 @@ class FTPStorage(AbstractStorage):
         try:
             async with self._client_lease() as lease:
                 facts = await lease.client.stat(self._root_prefix)
-                return facts.get("type") == "dir"
+                return self._entry_kind_from_facts(facts) is EntryKind.DIRECTORY
         except Exception:
             return False
 
     def _file_info_from_facts(self, logical_path: PurePosixPath, facts: FTPFacts) -> FileInfo:
-        entry_type = facts.get("type")
-        if entry_type not in {"dir", "file"}:
-            raise OSError(f"Unsupported FTP entry type {entry_type!r}: {logical_path.as_posix()}")
+        kind = self._entry_kind_from_facts(facts)
+        if kind is None:
+            raise self._unsupported_entry(logical_path, facts)
 
         try:
             size = int(facts.get("size", "0"))
@@ -218,8 +261,8 @@ class FTPStorage(AbstractStorage):
         return FileInfo(
             path=logical_path.as_posix(),
             name="" if logical_path == PurePosixPath("/") else logical_path.name,
-            is_dir=entry_type == "dir",
-            size=0 if entry_type == "dir" else max(0, size),
+            kind=kind,
+            size=0 if kind is EntryKind.DIRECTORY else max(0, size),
             modified=_parse_mlsx_datetime(facts.get("modify")),
             created=_parse_mlsx_datetime(facts.get("create")),
         )
@@ -227,7 +270,7 @@ class FTPStorage(AbstractStorage):
     async def _stat_with_facts(self, client: aioftp.Client, path: PathLike) -> tuple[FileInfo, FTPFacts]:
         logical = self._logical_path(path)
         if logical == PurePosixPath("/"):
-            return FileInfo(path="/", name="", is_dir=True), {"type": "dir"}
+            return FileInfo(path="/", name="", kind=EntryKind.DIRECTORY), {"type": "dir"}
 
         try:
             facts = await client.stat(self._remote_path(logical))
@@ -268,7 +311,7 @@ class FTPStorage(AbstractStorage):
                 info = await self._stat(lease.client, path)
             except FileNotFoundError:
                 return False
-            return not info.is_dir
+            return info.kind is EntryKind.FILE
 
     @override
     @translator.wrap("Failed to check whether {path} is a directory")
@@ -278,13 +321,19 @@ class FTPStorage(AbstractStorage):
                 info = await self._stat(lease.client, path)
             except FileNotFoundError:
                 return False
-            return info.is_dir
+            return info.kind is EntryKind.DIRECTORY
 
-    async def _list(self, client: aioftp.Client, path: PathLike, *, validate: bool = True) -> list[FileInfo]:
+    async def _list_raw(
+        self,
+        client: aioftp.Client,
+        path: PathLike,
+        *,
+        validate: bool = True,
+    ) -> list[tuple[PurePosixPath, FTPFacts]]:
         logical = self._logical_path(path)
         if validate:
             info = await self._stat(client, logical)
-            if not info.is_dir:
+            if info.kind is not EntryKind.DIRECTORY:
                 raise NotADirectoryError(f"Not a directory: {logical.as_posix()}")
 
         try:
@@ -294,9 +343,24 @@ class FTPStorage(AbstractStorage):
                 raise FileNotFoundError(f"FTP directory not found: {logical.as_posix()}") from exc
             raise
 
-        result = [
-            self._file_info_from_facts(self._logical_from_remote(remote_path), facts) for remote_path, facts in entries
-        ]
+        return [(self._logical_from_remote(remote_path), facts) for remote_path, facts in entries]
+
+    async def _list(
+        self,
+        client: aioftp.Client,
+        path: PathLike,
+        *,
+        validate: bool = True,
+        strict: bool = False,
+    ) -> list[FileInfo]:
+        result: list[FileInfo] = []
+        for logical_path, facts in await self._list_raw(client, path, validate=validate):
+            if self._entry_kind_from_facts(facts) is None:
+                if strict:
+                    raise self._unsupported_entry(logical_path, facts)
+                self.log.debug(f"Skipping unsupported FTP entry type {facts.get("type")!r}: {logical_path.as_posix()}")
+                continue
+            result.append(self._file_info_from_facts(logical_path, facts))
         result.sort(key=lambda entry: entry.path)
         return result
 
@@ -312,30 +376,31 @@ class FTPStorage(AbstractStorage):
         self,
         client: aioftp.Client,
         path: PathLike,
-    ) -> list[tuple[PurePosixPath, list[FileInfo], list[FileInfo]]]:
+        *,
+        strict: bool,
+    ) -> list[WalkEntry]:
         root = self._logical_path(path)
         info = await self._stat(client, root)
-        if not info.is_dir:
+        if info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {root.as_posix()}")
 
-        result: list[tuple[PurePosixPath, list[FileInfo], list[FileInfo]]] = []
+        result: list[WalkEntry] = []
         pending = [root]
         while pending:
             current = pending.pop()
-            entries = await self._list(client, current, validate=False)
-            dirs = [entry for entry in entries if entry.is_dir]
-            files = [entry for entry in entries if not entry.is_dir]
-            result.append((current, dirs, files))
-            pending.extend(PurePosixPath(entry.path) for entry in reversed(dirs))
+            entries = tuple(await self._list(client, current, validate=False, strict=strict))
+            result.append(WalkEntry(path=current.as_posix(), entries=entries))
+            directories = [entry for entry in entries if entry.kind is EntryKind.DIRECTORY]
+            pending.extend(PurePosixPath(entry.path) for entry in reversed(directories))
         return result
 
     @override
     @translator.wrap_agen("Failed to walk directory {path}")
-    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:
         async with self._client_lease() as lease:
-            snapshot = await self._walk_snapshot(lease.client, path)
-        for current, dirs, files in snapshot:
-            yield current.as_posix(), dirs, files
+            snapshot = await self._walk_snapshot(lease.client, path, strict=False)
+        for entry in snapshot:
+            yield entry
 
     async def _mkdir(
         self,
@@ -356,15 +421,15 @@ class FTPStorage(AbstractStorage):
         except FileNotFoundError:
             pass
         else:
-            if not existing.is_dir:
-                raise FileExistsError(f"Path is a file: {logical.as_posix()}")
+            if existing.kind is not EntryKind.DIRECTORY:
+                raise FileExistsError(f"Path is not a directory: {logical.as_posix()}")
             if exist_ok:
                 return []
             raise FileExistsError(f"Directory already exists: {logical.as_posix()}")
 
         if not parents:
             parent_info = await self._stat(client, logical.parent)
-            if not parent_info.is_dir:
+            if parent_info.kind is not EntryKind.DIRECTORY:
                 raise NotADirectoryError(f"Parent is not a directory: {logical.parent.as_posix()}")
             await client.make_directory(self._remote_path(logical), parents=False)
             return [logical]
@@ -379,8 +444,8 @@ class FTPStorage(AbstractStorage):
                 await client.make_directory(self._remote_path(directory), parents=False)
                 created.append(directory)
             else:
-                if not info.is_dir:
-                    raise FileExistsError(f"Path is a file: {directory.as_posix()}")
+                if info.kind is not EntryKind.DIRECTORY:
+                    raise FileExistsError(f"Path is not a directory: {directory.as_posix()}")
         return created
 
     @override
@@ -414,8 +479,12 @@ class FTPStorage(AbstractStorage):
                 pass
             else:
                 existed = True
-                if info.is_dir:
+                if info.kind is EntryKind.DIRECTORY:
                     raise IsADirectoryError(f"Is a directory: {logical.as_posix()}")
+                if info.kind is not EntryKind.FILE:
+                    raise UnsupportedOperationError(
+                        _UNSUPPORTED_ERRNO, f"Unsupported FTP upload destination kind: {logical.as_posix()}"
+                    )
                 if not overwrite:
                     raise FileExistsError(f"File already exists: {logical.as_posix()}")
 
@@ -445,8 +514,12 @@ class FTPStorage(AbstractStorage):
             async with self._pool.acquire() as lease:
                 try:
                     info, facts = await self._stat_with_facts(lease.client, logical)
-                    if info.is_dir:
+                    if info.kind is EntryKind.DIRECTORY:
                         raise IsADirectoryError(f"Is a directory: {logical.as_posix()}")
+                    if info.kind is not EntryKind.FILE:
+                        raise UnsupportedOperationError(
+                            _UNSUPPORTED_ERRNO, f"Unsupported FTP download source kind: {logical.as_posix()}"
+                        )
                     if "size" in facts and offset >= info.size:
                         return
 
@@ -488,24 +561,31 @@ class FTPStorage(AbstractStorage):
                 if missing_ok:
                     return
                 raise
-            if info.is_dir:
+            if info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Is a directory: {logical.as_posix()}")
+            if info.kind is not EntryKind.FILE:
+                raise UnsupportedOperationError(
+                    _UNSUPPORTED_ERRNO, f"Unsupported FTP unlink entry kind: {logical.as_posix()}"
+                )
             await lease.client.remove_file(self._remote_path(logical))
 
-    @override
-    @translator.wrap("Failed to remove directory {path}")
-    async def rmdir(self, path: PathLike) -> None:
+    async def _rmdir(self, client: aioftp.Client, path: PathLike) -> None:
         logical = self._logical_path(path)
         if logical == PurePosixPath("/"):
             raise OSError("Cannot remove root directory")
 
+        info = await self._stat(client, logical)
+        if info.kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {logical.as_posix()}")
+        if await self._list_raw(client, logical, validate=False):
+            raise OSError(f"Directory not empty: {logical.as_posix()}")
+        await client.remove_directory(self._remote_path(logical))
+
+    @override
+    @translator.wrap("Failed to remove directory {path}")
+    async def rmdir(self, path: PathLike) -> None:
         async with self._client_lease() as lease:
-            info = await self._stat(lease.client, logical)
-            if not info.is_dir:
-                raise NotADirectoryError(f"Not a directory: {logical.as_posix()}")
-            if await self._list(lease.client, logical, validate=False):
-                raise OSError(f"Directory not empty: {logical.as_posix()}")
-            await lease.client.remove_directory(self._remote_path(logical))
+            await self._rmdir(lease.client, path)
 
     async def _rmtree(self, client: aioftp.Client, path: PathLike) -> None:
         logical = self._logical_path(path)
@@ -513,15 +593,20 @@ class FTPStorage(AbstractStorage):
             raise OSError("Cannot remove root directory")
 
         info = await self._stat(client, logical)
-        if not info.is_dir:
+        if info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {logical.as_posix()}")
 
-        snapshot = await self._walk_snapshot(client, logical)
-        for _, _, files in snapshot:
-            for file in files:
-                await client.remove_file(self._remote_path(file.path))
-        for directory, _, _ in sorted(snapshot, key=lambda item: len(item[0].parts), reverse=True):
-            await client.remove_directory(self._remote_path(directory))
+        snapshot = await self._walk_snapshot(client, logical, strict=True)
+        for walk_entry in snapshot:
+            for entry in walk_entry.entries:
+                if entry.kind is EntryKind.FILE:
+                    await client.remove_file(self._remote_path(entry.path))
+                elif entry.kind is not EntryKind.DIRECTORY:
+                    raise UnsupportedOperationError(
+                        _UNSUPPORTED_ERRNO, f"Unsupported FTP tree entry kind: {entry.path}"
+                    )
+        for walk_entry in sorted(snapshot, key=lambda item: len(PurePosixPath(item.path).parts), reverse=True):
+            await client.remove_directory(self._remote_path(walk_entry.path))
 
     @override
     @translator.wrap("Failed to remove directory tree {path}")
@@ -555,8 +640,12 @@ class FTPStorage(AbstractStorage):
         overwrite: bool = True,
     ) -> bool:
         source_info = await self._stat(source_client, source)
-        if source_info.is_dir:
+        if source_info.kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {source.as_posix()}")
+        if source_info.kind is not EntryKind.FILE:
+            raise UnsupportedOperationError(
+                _UNSUPPORTED_ERRNO, f"Unsupported FTP copy source kind: {source.as_posix()}"
+            )
 
         destination_existed = False
         try:
@@ -565,8 +654,12 @@ class FTPStorage(AbstractStorage):
             pass
         else:
             destination_existed = True
-            if destination_info.is_dir:
+            if destination_info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Is a directory: {destination.as_posix()}")
+            if destination_info.kind is not EntryKind.FILE:
+                raise UnsupportedOperationError(
+                    _UNSUPPORTED_ERRNO, f"Unsupported FTP copy destination kind: {destination.as_posix()}"
+                )
             if not overwrite:
                 raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
 
@@ -633,8 +726,12 @@ class FTPStorage(AbstractStorage):
         destination_existed = False
         async with self._client_lease() as lease:
             source_info = await self._stat(lease.client, source)
-            if source_info.is_dir:
+            if source_info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Is a directory: {source.as_posix()}")
+            if source_info.kind is not EntryKind.FILE:
+                raise UnsupportedOperationError(
+                    _UNSUPPORTED_ERRNO, f"Unsupported FTP move source kind: {source.as_posix()}"
+                )
             if source == destination:
                 if not overwrite:
                     raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
@@ -645,8 +742,12 @@ class FTPStorage(AbstractStorage):
                 pass
             else:
                 destination_existed = True
-                if destination_info.is_dir:
+                if destination_info.kind is EntryKind.DIRECTORY:
                     raise IsADirectoryError(f"Destination is a directory: {destination.as_posix()}")
+                if destination_info.kind is not EntryKind.FILE:
+                    raise UnsupportedOperationError(
+                        _UNSUPPORTED_ERRNO, f"Unsupported FTP move destination kind: {destination.as_posix()}"
+                    )
                 if not overwrite:
                     raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
 
@@ -689,13 +790,28 @@ class FTPStorage(AbstractStorage):
             raise IsADirectoryError("Cannot copy root directory as a file")
         async with self._client_lease() as lease:
             source_info = await self._stat(lease.client, source)
-            if source_info.is_dir:
+            if source_info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Is a directory: {source.as_posix()}")
+            if source_info.kind is not EntryKind.FILE:
+                raise UnsupportedOperationError(
+                    _UNSUPPORTED_ERRNO, f"Unsupported FTP copy source kind: {source.as_posix()}"
+                )
             if source == destination:
                 if overwrite:
                     return
                 raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
-            destination_existed = await self._exists(lease.client, destination)
+            try:
+                destination_info = await self._stat(lease.client, destination)
+            except FileNotFoundError:
+                destination_existed = False
+            else:
+                destination_existed = True
+                if destination_info.kind is EntryKind.DIRECTORY:
+                    raise IsADirectoryError(f"Destination is a directory: {destination.as_posix()}")
+                if destination_info.kind is not EntryKind.FILE:
+                    raise UnsupportedOperationError(
+                        _UNSUPPORTED_ERRNO, f"Unsupported FTP copy destination kind: {destination.as_posix()}"
+                    )
             try:
                 async with self._temporary_client() as destination_client:
                     await self._copy_file(lease.client, destination_client, source, destination, overwrite=overwrite)
@@ -766,6 +882,44 @@ class FTPStorage(AbstractStorage):
                     raise BaseExceptionGroup("FTP copytree rollback failed", [first_error, second_error]) from None
                 raise first_error from None
 
+    async def _preflight_copytree_destination(
+        self,
+        client: aioftp.Client,
+        snapshot: list[WalkEntry],
+        source: PurePosixPath,
+        destination: PurePosixPath,
+        *,
+        overwrite: bool,
+    ) -> None:
+        for walk_entry in snapshot:
+            current = PurePosixPath(walk_entry.path)
+            relative = current.relative_to(source)
+            target_dir = destination if relative == PurePosixPath(".") else destination / relative
+            for entry in walk_entry.entries:
+                target = target_dir / entry.name
+                try:
+                    target_info = await self._stat(client, target)
+                except FileNotFoundError:
+                    continue
+                if entry.kind is EntryKind.DIRECTORY:
+                    if target_info.kind is not EntryKind.DIRECTORY:
+                        raise FileExistsError(f"Destination is not a directory: {target.as_posix()}")
+                    continue
+                if entry.kind is EntryKind.FILE:
+                    if target_info.kind is EntryKind.DIRECTORY:
+                        raise IsADirectoryError(f"Destination is a directory: {target.as_posix()}")
+                    if target_info.kind is not EntryKind.FILE:
+                        raise UnsupportedOperationError(
+                            _UNSUPPORTED_ERRNO,
+                            f"Unsupported FTP copytree destination kind: {target.as_posix()}",
+                        )
+                    if not overwrite:
+                        raise FileExistsError(f"Destination already exists: {target.as_posix()}")
+                    continue
+                raise UnsupportedOperationError(
+                    _UNSUPPORTED_ERRNO, f"Unsupported FTP copytree source kind: {entry.path}"
+                )
+
     async def _copytree(
         self,
         source_client: aioftp.Client,
@@ -779,14 +933,14 @@ class FTPStorage(AbstractStorage):
             source_info = await self._stat(source_client, source)
         except FileNotFoundError:
             raise NotADirectoryError(f"Not a directory: {source.as_posix()}") from None
-        if not source_info.is_dir:
+        if source_info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {source.as_posix()}")
         if source == destination:
             raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
         if self._is_descendant(destination, source):
             raise ValueError("Destination must not be inside the source tree")
 
-        snapshot = await self._walk_snapshot(source_client, source)
+        snapshot = await self._walk_snapshot(source_client, source, strict=True)
         try:
             destination_info = await self._stat(source_client, destination)
         except FileNotFoundError:
@@ -794,29 +948,45 @@ class FTPStorage(AbstractStorage):
         if destination_info is not None:
             if not overwrite:
                 raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
-            if not destination_info.is_dir:
+            if destination_info.kind is EntryKind.FILE:
                 raise FileExistsError(f"Destination is a file: {destination.as_posix()}")
+            if destination_info.kind is not EntryKind.DIRECTORY:
+                raise UnsupportedOperationError(
+                    _UNSUPPORTED_ERRNO, f"Unsupported FTP copytree destination kind: {destination.as_posix()}"
+                )
+        await self._preflight_copytree_destination(
+            source_client,
+            snapshot,
+            source,
+            destination,
+            overwrite=overwrite,
+        )
 
         created_files: set[PurePosixPath] = set()
         created_dirs: set[PurePosixPath] = set()
         backups: dict[PurePosixPath, PurePosixPath] = {}
         try:
             created_dirs.update(await self._mkdir(source_client, destination, parents=True, exist_ok=True))
-            for current, directories, files in snapshot:
+            for walk_entry in snapshot:
+                current = PurePosixPath(walk_entry.path)
                 relative = current.relative_to(source)
                 target_dir = destination if relative == PurePosixPath(".") else destination / relative
-                for directory in directories:
-                    target = target_dir / directory.name
-                    created_dirs.update(await self._mkdir(source_client, target, parents=False, exist_ok=True))
-                for file in files:
-                    target = target_dir / file.name
+                for entry in walk_entry.entries:
+                    target = target_dir / entry.name
+                    if entry.kind is EntryKind.DIRECTORY:
+                        created_dirs.update(await self._mkdir(source_client, target, parents=False, exist_ok=True))
+                        continue
+                    if entry.kind is not EntryKind.FILE:
+                        raise UnsupportedOperationError(
+                            _UNSUPPORTED_ERRNO, f"Unsupported FTP copytree source kind: {entry.path}"
+                        )
                     if await self._exists(source_client, target):
                         backup = target.with_name(f".storegate-copytree-{uuid.uuid4().hex}-{target.name}")
                         await source_client.rename(self._remote_path(target), self._remote_path(backup))
                         backups[target] = backup
                     else:
                         created_files.add(target)
-                    await self._copy_file(source_client, destination_client, PurePosixPath(file.path), target)
+                    await self._copy_file(source_client, destination_client, PurePosixPath(entry.path), target)
         except BaseException as primary:
             rollback_error: BaseException | None = None
             with anyio.CancelScope(shield=True):
@@ -866,7 +1036,7 @@ class FTPStorage(AbstractStorage):
                 source_info = await self._stat(lease.client, source)
             except FileNotFoundError:
                 raise NotADirectoryError(f"Not a directory: {source.as_posix()}") from None
-            if not source_info.is_dir:
+            if source_info.kind is not EntryKind.DIRECTORY:
                 raise NotADirectoryError(f"Not a directory: {source.as_posix()}")
 
             try:
@@ -875,13 +1045,18 @@ class FTPStorage(AbstractStorage):
                 destination_info = None
 
             if destination_info is None:
+                await self._walk_snapshot(lease.client, source, strict=True)
                 await self._mkdir(lease.client, destination.parent, parents=True, exist_ok=True)
                 await lease.client.rename(self._remote_path(source), self._remote_path(destination))
                 return
             if not overwrite:
                 raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
-            if not destination_info.is_dir:
+            if destination_info.kind is EntryKind.FILE:
                 raise FileExistsError(f"Destination is a file: {destination.as_posix()}")
+            if destination_info.kind is not EntryKind.DIRECTORY:
+                raise UnsupportedOperationError(
+                    _UNSUPPORTED_ERRNO, f"Unsupported FTP movetree destination kind: {destination.as_posix()}"
+                )
 
             async with self._temporary_client() as destination_client:
                 await self._copytree(lease.client, destination_client, source, destination, overwrite=True)

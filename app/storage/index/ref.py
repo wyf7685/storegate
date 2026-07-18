@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING
 import anyio
 
 from app.log import escape_tag
-from app.storage import AbstractStorage
+from app.storage import AbstractStorage, EntryKind
 from app.storage.abstract import PathLike
 from app.utils import logger_wrapper
+
+from ._guard import download_private_file, lstat_private_entry_or_none
 
 if TYPE_CHECKING:
     from .storage import IndexStorage
@@ -33,10 +35,18 @@ class ChunkRefManager:
         self.normalize_path = AbstractStorage.normalize_path
         self._lock_chunk = lock_chunk
 
+    async def _unlink_private_file(self, path: PathLike, *, label: str) -> None:
+        info = await lstat_private_entry_or_none(self.chunks, path, label=label)
+        if info is None:
+            return
+        if info.kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"IndexStorage private {label} is a directory: {self.normalize_path(path)}")
+        await self.chunks.unlink(path)
+
     async def load_refs(self, chunk_hash: str) -> set[str] | None:
         ref_path = hash_to_path(chunk_hash, "ref")
         try:
-            ref_bytes = await self.chunks.download_bytes(ref_path)
+            ref_bytes = await download_private_file(self.chunks, ref_path, label="chunk reference file")
         except FileNotFoundError:
             return None
         return set(ref_bytes.decode().splitlines())
@@ -78,8 +88,8 @@ class ChunkRefManager:
             else:
                 self.log.debug(f"Chunk {_colored_hash} -ref no change (<i>{_colored_remote_paths}</i>)")
         else:
-            await self.chunks.unlink(ref_path, missing_ok=True)
-            await self.chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
+            await self._unlink_private_file(ref_path, label="chunk reference file")
+            await self._unlink_private_file(hash_to_path(chunk_hash, "bin"), label="chunk data")
             self.log.debug(f"Chunk {_colored_hash} ref=0, deleted data (<i>{_colored_remote_paths}</i>)")
 
     async def transref(
@@ -143,8 +153,8 @@ class ChunkRefManager:
                             f"Chunk {_colored_hash} -tempref → <g>{len(refs)}</g> (<i>{escape_tag(temp_ref)}</i>)"
                         )
                     else:
-                        await self.chunks.unlink(ref_path, missing_ok=True)
-                        await self.chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
+                        await self._unlink_private_file(ref_path, label="chunk reference file")
+                        await self._unlink_private_file(hash_to_path(chunk_hash, "bin"), label="chunk data")
                         self.log.debug(f"Chunk {_colored_hash} tempref=0, deleted data (<i>{escape_tag(temp_ref)}</i>)")
 
     async def add_temp_ref_unlocked(self, chunk_hash: str, temp_ref: str) -> None:
@@ -162,8 +172,8 @@ class ChunkRefManager:
         if refs:
             await self.chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
         else:
-            await self.chunks.unlink(ref_path, missing_ok=True)
-            await self.chunks.unlink(hash_to_path(chunk_hash, "bin"), missing_ok=True)
+            await self._unlink_private_file(ref_path, label="chunk reference file")
+            await self._unlink_private_file(hash_to_path(chunk_hash, "bin"), label="chunk data")
 
     async def add_rollback_guards(self, chunk_hashes: Iterable[str]) -> dict[str, str]:
         guards: dict[str, str] = {}

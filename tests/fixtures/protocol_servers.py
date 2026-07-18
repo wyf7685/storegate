@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import queue
 import socket
@@ -144,6 +145,10 @@ class SFTPServerInfo:
     password: str
     known_hosts: Path
     root: Path
+    root_prefix: str
+    storage_root: Path
+    outside_root: Path
+    symlink_supported: bool
 
 
 @pytest.fixture(scope="session")
@@ -155,12 +160,29 @@ def _sftp_server(tmp_path_factory: pytest.TempPathFactory) -> Generator[SFTPServ
     test_username = "storegate"
     test_password = "sftp-test-password"
     root = tmp_path_factory.mktemp("sftp-server-root")
+    storage_root = root / "storage"
+    outside_root = root / "outside"
+    storage_root.mkdir()
+    outside_root.mkdir()
+    root_prefix = "/storage"
     known_hosts = tmp_path_factory.mktemp("sftp-known-hosts") / "known_hosts"
     host_key = asyncssh.generate_private_key("ssh-ed25519")
     stop_event = threading.Event()
     startup: queue.Queue[int | BaseException] = queue.Queue(maxsize=1)
     errors: list[BaseException] = []
     connections: set[asyncssh.SSHServerConnection] = set()
+
+    probe_target = storage_root / ".symlink-probe-target"
+    probe_link = storage_root / ".symlink-probe-link"
+    probe_target.write_bytes(b"")
+    try:
+        probe_link.symlink_to(probe_target.name)
+    except OSError:
+        symlink_supported = False
+    else:
+        symlink_supported = True
+        probe_link.unlink()
+    probe_target.unlink()
 
     class TestSSHServer(asyncssh.SSHServer):
         def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
@@ -180,6 +202,13 @@ def _sftp_server(tmp_path_factory: pytest.TempPathFactory) -> Generator[SFTPServ
         def validate_password(self, username: str, password: str) -> bool:
             return username == test_username and password == test_password
 
+    class TestSFTPServer(asyncssh.SFTPServer):
+        def readlink(self, path: bytes) -> bytes:
+            target = Path(os.fsdecode(self.map_path(path))).readlink()
+            if target.is_absolute():
+                return self.reverse_map_path(os.fsencode(target.as_posix()))
+            return os.fsencode(target.as_posix())
+
     async def _runner() -> None:
         acceptor = await asyncssh.create_server(
             TestSSHServer,
@@ -187,7 +216,7 @@ def _sftp_server(tmp_path_factory: pytest.TempPathFactory) -> Generator[SFTPServ
             0,
             config=None,
             server_host_keys=[host_key],
-            sftp_factory=lambda channel: asyncssh.SFTPServer(channel, chroot=os.fsencode(root)),
+            sftp_factory=lambda channel: TestSFTPServer(channel, chroot=os.fsencode(root)),
         )
         startup.put(acceptor.get_port())
         try:
@@ -197,12 +226,18 @@ def _sftp_server(tmp_path_factory: pytest.TempPathFactory) -> Generator[SFTPServ
             for connection in active_connections:
                 connection.close()
             if active_connections:
-                await asyncio.gather(
-                    *(connection.wait_closed() for connection in active_connections),
-                    return_exceptions=True,
+                done, pending = await asyncio.wait(
+                    (asyncio.create_task(connection.wait_closed()) for connection in active_connections),
+                    timeout=5,
                 )
+                del done
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
             acceptor.close()
-            await acceptor.wait_closed()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(acceptor.wait_closed(), timeout=5)
 
     def _thread_main() -> None:
         try:
@@ -224,14 +259,25 @@ def _sftp_server(tmp_path_factory: pytest.TempPathFactory) -> Generator[SFTPServ
 
     public_key = host_key.export_public_key().decode().strip()
     known_hosts.write_text(f"[{host}]:{result} {public_key}\n")
-    info = SFTPServerInfo(host, result, test_username, test_password, known_hosts, root)
+    info = SFTPServerInfo(
+        host,
+        result,
+        test_username,
+        test_password,
+        known_hosts,
+        root,
+        root_prefix,
+        storage_root,
+        outside_root,
+        symlink_supported,
+    )
     try:
         yield info
     finally:
         stop_event.set()
-        thread.join(timeout=5)
+        thread.join(timeout=15)
         if thread.is_alive():
-            raise RuntimeError("SFTP server did not stop within 5 seconds")
+            raise RuntimeError("SFTP server did not stop within 15 seconds")
         if errors:
             raise RuntimeError("SFTP server thread failed") from errors[0]
 

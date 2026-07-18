@@ -1,5 +1,8 @@
 """Unit tests for WebDAV multistatus XML parsing (no network)."""
 
+import pytest
+
+from app.storage.abstract import EntryKind, UnsupportedOperationError
 from app.storage.dav.utils import (
     dav_resource_to_file_info,
     href_to_storage_path,
@@ -61,6 +64,17 @@ ABSOLUTE_HREF = b"""<?xml version="1.0"?>
   </D:response>
 </D:multistatus>"""
 
+SPECIAL_RESOURCE = b"""<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:" xmlns:X="urn:example:links">
+  <D:response>
+    <D:href>/dav/storegate/link</D:href>
+    <D:propstat><D:prop>
+      <D:resourcetype><D:collection/><X:symlink/></D:resourcetype>
+      <D:getcontentlength>7</D:getcontentlength>
+    </D:prop></D:propstat>
+  </D:response>
+</D:multistatus>"""
+
 
 class TestParseMultistatus:
     def test_parses_files_and_collections(self) -> None:
@@ -101,6 +115,11 @@ class TestParseMultistatus:
         resources = parse_multistatus(b'<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"/>')
         assert resources == []
 
+    def test_preserves_nonstandard_resource_types(self) -> None:
+        resource = parse_multistatus(SPECIAL_RESOURCE)[0]
+        assert resource.resource_types == ("{DAV:}collection", "{urn:example:links}symlink")
+        assert resource.is_collection is True
+
 
 class TestHrefToStoragePath:
     def test_strips_url_prefix(self) -> None:
@@ -125,7 +144,7 @@ class TestDavResourceToFileInfo:
         info = dav_resource_to_file_info(resource, "foo.txt")
         assert info.path == "/foo.txt"
         assert info.name == "foo.txt"
-        assert info.is_dir is False
+        assert info.kind is EntryKind.FILE
         assert info.size == 11
         assert info.modified is not None
 
@@ -134,7 +153,7 @@ class TestDavResourceToFileInfo:
         info = dav_resource_to_file_info(resource, "sub")
         assert info.path == "/sub"
         assert info.name == "sub"
-        assert info.is_dir is True
+        assert info.kind is EntryKind.DIRECTORY
         assert info.size == 0
 
     def test_root_info(self) -> None:
@@ -142,4 +161,9 @@ class TestDavResourceToFileInfo:
         info = dav_resource_to_file_info(resource, "")
         assert info.path == "/"
         assert info.name == ""
-        assert info.is_dir is True
+        assert info.kind is EntryKind.DIRECTORY
+
+    def test_special_resource_is_not_converted_to_file_info(self) -> None:
+        resource = parse_multistatus(SPECIAL_RESOURCE)[0]
+        with pytest.raises(UnsupportedOperationError):
+            dav_resource_to_file_info(resource, "link")

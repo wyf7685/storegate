@@ -1,9 +1,11 @@
+import errno
 import functools
 import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path, PurePath, PurePosixPath
 from typing import Self, cast
 
@@ -15,14 +17,55 @@ from app.log import escape_tag
 from app.utils import LoggerWrapper, logger_wrapper
 
 
+class EntryKind(StrEnum):
+    FILE = "file"
+    DIRECTORY = "directory"
+    SYMLINK = "symlink"
+
+
 @dataclass(slots=True, frozen=True)
 class FileInfo:
     path: str
     name: str
-    is_dir: bool
+    kind: EntryKind
     size: int = 0
     modified: datetime | None = None
     created: datetime | None = None
+
+    @property
+    def is_file(self) -> bool:
+        return self.kind is EntryKind.FILE
+
+    @property
+    def is_dir(self) -> bool:
+        return self.kind is EntryKind.DIRECTORY
+
+    @property
+    def is_symlink(self) -> bool:
+        return self.kind is EntryKind.SYMLINK
+
+
+@dataclass(slots=True, frozen=True)
+class WalkEntry:
+    path: str
+    entries: tuple[FileInfo, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class StorageCapabilities:
+    symlink_metadata: bool = False
+    readlink: bool = False
+    symlink_create: bool = False
+
+
+_UNSUPPORTED_ERRNO = getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)
+
+
+class UnsupportedOperationError(OSError):
+    """An operation or storage entry is unsupported by the backend."""
+
+
+_NO_CAPABILITIES = StorageCapabilities()
 
 
 type BytesLike = bytes | bytearray | memoryview
@@ -44,7 +87,15 @@ _LIFECYCLE_WRAPPED_ATTRIBUTE = "__storegate_lifecycle_wrapped__"
 
 
 class AbstractStorage(ABC):
-    """Abstract storage interface with a concurrency-safe lifecycle."""
+    """Abstract storage interface with a concurrency-safe lifecycle.
+
+    Public paths are logical storage paths. Symlink-aware backends reject a
+    symlink in a caller-supplied intermediate path component. Follow operations
+    may resolve a final symlink chain only while every resolved target remains
+    inside the logical storage root. Metadata returned after following a link
+    keeps the queried logical ``path`` and ``name``; only kind, size, and
+    timestamps come from the resolved target.
+    """
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
@@ -95,6 +146,15 @@ class AbstractStorage(ABC):
     @property
     def cache_identity(self) -> str | None:
         return None
+
+    @property
+    def capabilities(self) -> StorageCapabilities:
+        """Return the immutable primitive capabilities implemented by this backend.
+
+        Capabilities describe backend support, not whether current credentials,
+        operating-system policy, or a remote ACL permits a particular request.
+        """
+        return _NO_CAPABILITIES
 
     @staticmethod
     def normalize_path(path: PathLike) -> PurePosixPath:
@@ -276,7 +336,14 @@ class AbstractStorage(ABC):
         *,
         overwrite: bool = True,
     ) -> None:
-        """Upload from a binary stream."""
+        """Upload from a binary stream.
+
+        A final symlink is rejected regardless of *overwrite*: upload never
+        writes through to its target and never implicitly replaces the link.
+        Replace a link only by explicitly unlinking it or by using
+        :meth:`symlink` with ``overwrite=True``. Caller-supplied intermediate
+        symlinks are rejected.
+        """
         raise NotImplementedError
 
     async def upload_bytes(
@@ -323,9 +390,17 @@ class AbstractStorage(ABC):
     ) -> AsyncGenerator[bytes]:
         """Download as an async byte stream.
 
+        A final symlink is followed through its complete target chain only when
+        the resolved target remains inside the storage root and is a regular
+        file. A dangling target raises :class:`FileNotFoundError`, a cycle raises
+        ``OSError(errno.ELOOP)``, and root escape raises
+        ``PermissionError(errno.EACCES)``. Caller-supplied intermediate symlinks
+        are rejected. Offset, stream lifetime, and cleanup follow the regular
+        file contract.
+
         Args:
             remote_path: Path to the file.
-            offset: Byte offset to start reading from.  Default 0 (start of file).
+            offset: Byte offset to start reading from. Default 0 (start of file).
         """
         raise NotImplementedError
         yield
@@ -356,35 +431,39 @@ class AbstractStorage(ABC):
 
     @abstractmethod
     async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
-        """Delete a file.
+        """Delete a regular file or symlink without following a symlink target.
 
         Args:
-            path: Path to the file.
-            missing_ok: If ``True``, silently succeed when the file does not exist.
+            path: Path to the lexical entry.
+            missing_ok: If ``True``, silently succeed when the entry does not exist.
 
         Raises:
-            IsADirectoryError: If *path* is a directory.
+            IsADirectoryError: If *path* is a lexical directory.
             FileNotFoundError: If *path* does not exist and *missing_ok* is ``False``.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def rmdir(self, path: PathLike) -> None:
-        """Delete an empty directory.
+        """Delete an empty lexical directory.
 
-        Missing paths raise ``FileNotFoundError``. ``NotADirectoryError`` is
-        raised for files and ``OSError`` for non-empty directories.
+        Missing paths raise :class:`FileNotFoundError`. Files and symlinks,
+        including symlinks to directories, raise :class:`NotADirectoryError`.
+        Every raw child kind makes a directory non-empty, including symlinks and
+        unsupported special entries.
         """
         raise NotImplementedError
 
     async def delete(self, path: PathLike) -> None:
-        """Delete a file or an empty directory.
+        """Delete a file, symlink, or empty directory without following links.
 
-        Missing paths raise :class:`FileNotFoundError`. Non-empty directories
-        raise ``OSError`` without removing the directory. Use :meth:`unlink`
-        with ``missing_ok=True`` for idempotent file cleanup.
+        Dispatch is based on :meth:`lstat`, so a symlink to a directory is
+        unlinked rather than passed to :meth:`rmdir`. Missing paths raise
+        :class:`FileNotFoundError`; non-empty directories raise :class:`OSError`
+        without removing the directory.
         """
-        if await self.is_dir(path):
+        info = await self.lstat(path)
+        if info.is_dir:
             await self.rmdir(path)
         else:
             await self.unlink(path)
@@ -409,13 +488,14 @@ class AbstractStorage(ABC):
         *,
         overwrite: bool = True,
     ) -> None:
-        """Move a file using the explicit destination conflict policy.
+        """Move a regular file or symlink entry without following it.
 
-        A missing source raises ``FileNotFoundError`` and a source or
-        destination directory raises ``IsADirectoryError``. An existing
-        destination file is replaced when ``overwrite=True`` and raises
-        ``FileExistsError`` otherwise. Moving a file onto itself is a no-op
-        only when ``overwrite=True``.
+        Native rename is preferred. Any fallback must preserve a symlink's raw
+        target string. A missing source raises :class:`FileNotFoundError`, and a
+        source or destination directory raises :class:`IsADirectoryError`.
+        Existing file or symlink destinations are replaced when
+        ``overwrite=True`` and raise :class:`FileExistsError` otherwise. Moving
+        an entry onto itself is a no-op only when ``overwrite=True``.
         """
         raise NotImplementedError
 
@@ -427,13 +507,14 @@ class AbstractStorage(ABC):
         *,
         overwrite: bool = True,
     ) -> None:
-        """Copy a file using the explicit destination conflict policy.
+        """Copy a regular file or preserve a symlink entry without following it.
 
-        A missing source raises ``FileNotFoundError`` and a source or
-        destination directory raises ``IsADirectoryError``. An existing
-        destination file is replaced when ``overwrite=True`` and raises
-        ``FileExistsError`` otherwise. Copying a file onto itself is a no-op
-        only when ``overwrite=True``.
+        Symlink copy uses its raw target string and is independent of whether
+        that target exists. A missing source raises :class:`FileNotFoundError`,
+        and a source or destination directory raises :class:`IsADirectoryError`.
+        Existing file or symlink destinations are replaced when
+        ``overwrite=True`` and raise :class:`FileExistsError` otherwise. Copying
+        an entry onto itself is a no-op only when ``overwrite=True``.
         """
         raise NotImplementedError
 
@@ -454,42 +535,47 @@ class AbstractStorage(ABC):
 
     @abstractmethod
     async def rmtree(self, path: PathLike) -> None:
-        """Recursively remove a directory."""
+        """Recursively remove a lexical directory without following symlinks.
+
+        A symlink root raises :class:`NotADirectoryError`. Symlinks inside the
+        tree are unlinked as leaves and are never traversed. Implementations
+        preflight a complete strict snapshot and raise
+        :class:`UnsupportedOperationError` for unsupported special entries
+        before making any change.
+        """
         raise NotImplementedError
 
     @abstractmethod
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        """Recursively copy a directory tree.
+        """Recursively copy a lexical directory while preserving symlinks.
+
+        A symlink root raises :class:`NotADirectoryError`. Directories recurse,
+        regular files copy content, and symlinks copy their raw target as leaf
+        entries, including dangling links. Unsupported special entries raise
+        :class:`UnsupportedOperationError` during strict preflight before any
+        change. Destination file and symlink conflicts follow *overwrite*;
+        rollback must include created or replaced symlinks.
 
         Args:
-            src: Source directory path.
+            src: Source lexical directory path.
             dst: Destination directory path.
-            overwrite: If ``True``, silently overwrite existing files at
-                destination. If ``False``, raise FileExistsError when
-                destination already exists.
-
-        Raises:
-            NotADirectoryError: If *src* is not a directory.
-            FileExistsError: If *dst* exists and *overwrite* is ``False``.
+            overwrite: Replace destination file or symlink entries when true.
         """
         raise NotImplementedError
 
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        """Recursively move a directory tree.
+        """Recursively move a lexical directory while preserving symlinks.
 
-        The default implementation copies the tree then removes the source.
-        Backends may override with a more efficient implementation when
-        available (e.g. native rename on the same filesystem).
+        Native rename is preferred. The default merge path uses
+        :meth:`copytree` preserve semantics and then removes the source tree;
+        source symlinks are deleted as leaves and are never followed. A symlink
+        root raises :class:`NotADirectoryError`, and destination conflicts follow
+        *overwrite*.
 
         Args:
-            src: Source directory path.
+            src: Source lexical directory path.
             dst: Destination directory path.
-            overwrite: If ``True``, silently overwrite existing files at
-                destination. If ``False``, raise FileExistsError.
-
-        Raises:
-            NotADirectoryError: If *src* is not a directory.
-            FileExistsError: If *dst* exists and *overwrite* is ``False``.
+            overwrite: Replace destination file or symlink entries when true.
         """
         await self.copytree(src, dst, overwrite=overwrite)
         await self.rmtree(src)
@@ -500,23 +586,100 @@ class AbstractStorage(ABC):
 
     @abstractmethod
     async def exists(self, path: PathLike) -> bool:
-        """Return whether a path exists."""
+        """Return whether the followed path exists.
+
+        A final symlink is followed: a valid target returns true and a dangling
+        target returns false. Root escape and other safety errors are propagated;
+        lexical link existence is queried with :meth:`lstat` or
+        :meth:`is_symlink`.
+        """
         raise NotImplementedError
 
     @abstractmethod
     async def is_file(self, path: PathLike) -> bool:
-        """Return whether the path is a file."""
+        """Return whether the followed path resolves to a regular file.
+
+        Symlinks to files return true, dangling links return false, and root
+        escape or other safety errors are propagated.
+        """
         raise NotImplementedError
 
     @abstractmethod
     async def is_dir(self, path: PathLike) -> bool:
-        """Return whether the path is a directory."""
+        """Return whether the followed path resolves to a directory.
+
+        Symlinks to directories return true, dangling links return false, and
+        root escape or other safety errors are propagated.
+        """
         raise NotImplementedError
 
     @abstractmethod
     async def stat(self, path: PathLike) -> FileInfo:
-        """Return metadata."""
+        """Return metadata, following a final symlink chain.
+
+        Regular files and directories describe themselves. A final symlink is
+        resolved completely while caller-supplied intermediate symlinks are
+        rejected. Dangling targets raise :class:`FileNotFoundError`, cycles raise
+        ``OSError(errno.ELOOP)``, and targets outside the logical root raise
+        ``PermissionError(errno.EACCES)``. After a successful follow, ``path``
+        and ``name`` retain the queried logical identity while kind, size, and
+        timestamps describe the resolved target.
+        """
         raise NotImplementedError
+
+    async def lstat(self, path: PathLike) -> FileInfo:
+        """Return lexical metadata without following the final symlink.
+
+        Symlink-aware backends reject caller-supplied intermediate symlinks. A
+        final symlink, including a dangling link, returns
+        :attr:`EntryKind.SYMLINK`; its ``path`` and ``name`` describe the queried
+        logical path and its remaining metadata describes the link itself.
+        Unsupported special entries raise :class:`UnsupportedOperationError`.
+        Backends without symlink metadata support reuse :meth:`stat`.
+        """
+        return await self.stat(path)
+
+    async def is_symlink(self, path: PathLike) -> bool:
+        """Return whether the lexical path is a symlink without following it."""
+        try:
+            return (await self.lstat(path)).is_symlink
+        except FileNotFoundError:
+            return False
+
+    async def readlink(self, path: PathLike) -> str:
+        """Return a symlink's raw target string without canonicalizing it.
+
+        Implementations raise ``OSError(errno.EINVAL)`` for a non-link and
+        :class:`UnsupportedOperationError` with the platform unsupported errno
+        when the backend lacks this primitive.
+        """
+        del path
+        raise UnsupportedOperationError(_UNSUPPORTED_ERRNO, "readlink is not supported")
+
+    async def symlink(
+        self,
+        target: PathLike,
+        link_path: PathLike,
+        *,
+        target_is_directory: bool = False,
+        overwrite: bool = False,
+    ) -> None:
+        """Create a symlink with the raw relative POSIX *target*.
+
+        Absolute targets raise :class:`ValueError`. Relative targets are
+        interpreted from the link parent and may contain ``..``; later follow
+        operations still enforce root containment. Dangling targets are allowed.
+        The link parent chain may not contain a symlink. With
+        ``overwrite=False``, :meth:`lstat` detects any lexical entry at
+        *link_path* and raises :class:`FileExistsError`; with ``overwrite=True``,
+        only regular files and symlinks may be replaced, never directories.
+        *target_is_directory* is a Windows hint for dangling directory links.
+        Unsupported backends raise :class:`UnsupportedOperationError` with the
+        platform unsupported errno. A failed non-idempotent create request must
+        not be replayed after a connection failure.
+        """
+        del target, link_path, target_is_directory, overwrite
+        raise UnsupportedOperationError(_UNSUPPORTED_ERRNO, "symlink is not supported")
 
     # ------------------------------------------------------------------
     # Listing
@@ -528,13 +691,26 @@ class AbstractStorage(ABC):
 
     @abstractmethod
     async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
-        """Iterate directory entries."""
+        """Iterate all supported direct lexical entries of a directory.
+
+        Entries explicitly identify regular files, directories, and symlinks;
+        listing a symlink does not read or follow its target. A symlink root
+        raises :class:`NotADirectoryError`.
+        """
         raise NotImplementedError
         yield
 
     @abstractmethod
-    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
-        """Recursively walk a directory tree."""
+    async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:
+        """Recursively walk a lexical directory as structured snapshots.
+
+        Each result contains the current absolute logical directory path and a
+        tuple of all supported direct entries sorted by absolute logical path.
+        Only :attr:`EntryKind.DIRECTORY` entries recurse; symlinks, including
+        symlinks to directories, remain leaf entries. A symlink root raises
+        :class:`NotADirectoryError`. Network backends materialize each required
+        snapshot inside their lease and release it before yielding.
+        """
         raise NotImplementedError
         yield
 

@@ -9,7 +9,7 @@ import anyio.lowlevel
 import httpx
 
 from app.log import escape_tag
-from app.storage.abstract import FileInfo
+from app.storage.abstract import EntryKind, FileInfo
 from app.utils import logger_wrapper
 
 from .client import AsyncS3Client, CompletedPart
@@ -17,10 +17,12 @@ from .client import AsyncS3Client, CompletedPart
 
 def serialize_file_info(info: FileInfo) -> bytes:
     """将 ``FileInfo`` 序列化为 JSON bytes，用作目录标记对象的值。"""
+    if info.kind is not EntryKind.DIRECTORY:
+        raise ValueError("S3 directory markers require directory FileInfo")
     data: dict[str, object] = {
         "path": info.path,
         "name": info.name,
-        "is_dir": True,
+        "kind": EntryKind.DIRECTORY.value,
         "size": info.size,
     }
     if info.modified is not None:
@@ -33,13 +35,16 @@ def serialize_file_info(info: FileInfo) -> bytes:
 def deserialize_file_info(path: str, data: bytes) -> FileInfo:
     """从 JSON bytes 反序列化 ``FileInfo``（仅用于目录标记对象）。"""
     obj = json.loads(data.decode("utf-8"))
+    kind = EntryKind(obj["kind"])
+    if kind is not EntryKind.DIRECTORY:
+        raise ValueError(f"Invalid S3 directory marker kind: {kind.value}")
     modified = datetime.fromisoformat(obj["modified"]) if "modified" in obj else None
     created = datetime.fromisoformat(obj["created"]) if "created" in obj else None
     return FileInfo(
         path=obj.get("path", path),
         name=obj.get("name", ""),
-        is_dir=True,
-        size=obj.get("size"),
+        kind=kind,
+        size=obj.get("size", 0),
         modified=modified,
         created=created,
     )

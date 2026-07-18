@@ -14,6 +14,7 @@ def make_config(server: SFTPServerInfo, **overrides: object) -> SFTPConfig:
         "username": server.username,
         "password": SecretStr(server.password),
         "known_hosts": server.known_hosts,
+        "root_prefix": server.root_prefix,
     }
     values.update(overrides)
     return SFTPConfig.model_validate(values)

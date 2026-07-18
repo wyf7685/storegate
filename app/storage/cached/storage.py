@@ -1,4 +1,3 @@
-import itertools
 from collections.abc import AsyncGenerator, AsyncIterable
 from pathlib import PurePosixPath
 from typing import Literal, final, override
@@ -7,60 +6,46 @@ import anyio
 
 from app.log import escape_tag
 
-from ..abstract import AbstractStorage, BytesLike, FileInfo, PathLike
+from ..abstract import (
+    AbstractStorage,
+    BytesLike,
+    EntryKind,
+    FileInfo,
+    PathLike,
+    StorageCapabilities,
+    WalkEntry,
+)
 from .backend import CacheBackend
 from .backend.memory import MemoryCacheBackend
 
 
 @final
 class CachedStorage(AbstractStorage):
-    """Cache metadata and download queries of an :class:`AbstractStorage`.
+    """Cache metadata and downloads while preserving lexical symlink identity.
 
-    Wraps an existing storage backend and caches the results of
-    ``exists``, ``is_file``, ``is_dir``, ``stat``, ``iterdir`` and
-    ``download_stream`` via a pluggable :class:`~.backend.CacheBackend`.
+    Follow namespaces (``stat``, ``exists``, ``is_file``, ``is_dir`` and
+    ``download``) are distinct from lexical namespaces (``lstat`` and
+    ``is_symlink``). A lexical symlink may cache only its lexical metadata;
+    follow results are always read directly from the wrapped storage so target
+    mutations through another alias cannot leave a stale cached result.
 
-    **Cross-caching** — each read operation that returns a positive result
-    also backfills related caches so that subsequent queries for the same
-    path can be served without hitting the underlying storage:
-
-    - ``is_file`` → ``True``: also writes ``exists=True`` and ``is_dir=False``.
-    - ``is_dir`` → ``True``: also writes ``exists=True`` and ``is_file=False``.
-    - ``exists`` → ``False``: also writes ``is_file=False`` and ``is_dir=False``.
-    - ``stat`` success: also writes ``exists=True``, ``is_file`` and ``is_dir``.
-    - ``download_stream`` success: also writes ``exists=True``, ``is_file=True``
-      and ``is_dir=False``.
-
-    **Write-backfill** — after a successful write operation, semantically
-    certain values are written into the cache immediately, avoiding a
-    subsequent round-trip to the underlying storage:
-
-    - ``upload_stream``: ``exists=True, is_file=True, is_dir=False`` plus the
-      uploaded bytes cached for ``download_stream`` when ≤ threshold.
-    - ``unlink`` / ``rmdir`` / ``delete``: ``exists=False, is_file=False,
-      is_dir=False``.
-    - ``move``: source → ``exists=False, is_file=False, is_dir=False``;
-      destination → ``exists=True``, with ``is_file`` / ``is_dir`` inferred
-      from the source's cached type when available.
-    - ``copy``: destination → ``exists=True`` + type inferred from source cache.
-    - ``mkdir``: ``exists=True, is_file=False, is_dir=True``.
-    - ``rmtree``: all caches cleared (too broad to backfill precisely).
+    Directory discovery caches snapshots without changing their order. Regular
+    files and directories cross-fill both lexical and follow metadata, while a
+    discovered symlink fills only ``lstat`` and ``is_symlink``.
 
     Parameters
     ----------
     storage:
         The underlying storage to wrap.
     ttl:
-        TTL (seconds) for cached entries.  Default 30 s.
+        TTL (seconds) for cached entries. Default 30 s.
     capacity:
-        Maximum number of entries per cache.  Default 1000.
+        Maximum number of entries per cache. Default 1000.
     download_cache_threshold:
-        Maximum file size (bytes) to cache for ``download_stream``.
-        ``None`` to disable caching.  Default 16 KB.
+        Maximum file size (bytes) cached for ``download_stream``. ``None``
+        disables download caching. Default 16 KiB.
     cache:
-        Cache backend.  Pass ``"memory"`` (default) for the built-in
-        in-process :class:`~.backend.MemoryCacheBackend`, or any
-        :class:`~.backend.CacheBackend` instance (e.g. to use Redis).
+        Cache backend, or ``"memory"`` for the built-in in-process backend.
     """
 
     def __init__(
@@ -69,7 +54,7 @@ class CachedStorage(AbstractStorage):
         *,
         ttl: int = 30,
         capacity: int = 1000,
-        download_cache_threshold: int | None = 16 * 1024,  # 16 KB
+        download_cache_threshold: int | None = 16 * 1024,
         cache: Literal["memory"] | CacheBackend = "memory",
     ) -> None:
         super().__init__()
@@ -85,13 +70,11 @@ class CachedStorage(AbstractStorage):
         self._cache.configure_namespace("exists", ttl)
         self._cache.configure_namespace("is_file", ttl)
         self._cache.configure_namespace("is_dir", ttl)
+        self._cache.configure_namespace("is_symlink", ttl)
         self._cache.configure_namespace("stat", ttl)
+        self._cache.configure_namespace("lstat", ttl)
         self._cache.configure_namespace("iterdir", ttl)
         self._cache.configure_namespace("download", ttl * 2, capacity=capacity // 4)
-
-    # ------------------------------------------------------------------
-    # Identity
-    # ------------------------------------------------------------------
 
     @property
     @override
@@ -103,9 +86,10 @@ class CachedStorage(AbstractStorage):
     def cache_identity(self) -> str | None:
         return self._storage.cache_identity
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    @property
+    @override
+    def capabilities(self) -> StorageCapabilities:
+        return self._storage.capabilities
 
     @override
     async def connect(self) -> None:
@@ -141,17 +125,8 @@ class CachedStorage(AbstractStorage):
     async def ping(self) -> bool:
         return await self._cache.ping() and await self._storage.ping()
 
-    # ------------------------------------------------------------------
-    # Path helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _normalize(path: PathLike) -> str:
-        """Normalise *path* into a cache key.
-
-        Strips leading ``/`` and collapses ``"."`` to ``""``,
-        consistent with :meth:`S3Storage._remote_path_to_key`.
-        """
         p = PurePosixPath(path)
         if p.is_absolute():
             p = p.relative_to("/")
@@ -160,15 +135,55 @@ class CachedStorage(AbstractStorage):
 
     @staticmethod
     def _parent(normalized: str) -> str:
-        """Return the normalised parent directory of *normalized*."""
         if not normalized:
             return ""
         parent = str(PurePosixPath(normalized).parent)
         return "" if parent == "." else parent
 
-    # ------------------------------------------------------------------
-    # Cache management
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _lexical_cache_entries(np: str, info: FileInfo) -> list[tuple[str, str, object]]:
+        if info.kind is EntryKind.SYMLINK:
+            return [("lstat", np, info), ("is_symlink", np, True)]
+        return [
+            ("lstat", np, info),
+            ("stat", np, info),
+            ("is_symlink", np, False),
+            ("exists", np, True),
+            ("is_file", np, info.kind is EntryKind.FILE),
+            ("is_dir", np, info.kind is EntryKind.DIRECTORY),
+        ]
+
+    @staticmethod
+    def _follow_cache_entries(np: str, info: FileInfo) -> list[tuple[str, str, object]]:
+        return [
+            ("stat", np, info),
+            ("exists", np, True),
+            ("is_file", np, info.kind is EntryKind.FILE),
+            ("is_dir", np, info.kind is EntryKind.DIRECTORY),
+        ]
+
+    async def _cache_lexical_info(self, info: FileInfo) -> None:
+        await self._cache.mset(*self._lexical_cache_entries(self._normalize(info.path), info))
+
+    async def _cache_lexical_missing(self, np: str) -> None:
+        await self._cache.mset(
+            ("is_symlink", np, False),
+            ("exists", np, False),
+            ("is_file", np, False),
+            ("is_dir", np, False),
+        )
+
+    async def _is_lexical_symlink(self, path: PathLike, np: str) -> bool:
+        cached: bool | None = await self._cache.get("is_symlink", np)
+        if cached is not None:
+            return cached
+        try:
+            info = await self._storage.lstat(path)
+        except FileNotFoundError:
+            await self._cache_lexical_missing(np)
+            return False
+        await self._cache.mset(*self._lexical_cache_entries(np, info))
+        return info.kind is EntryKind.SYMLINK
 
     async def _invalidate_path(
         self,
@@ -177,27 +192,29 @@ class CachedStorage(AbstractStorage):
         exists: bool | None = None,
         is_file: bool | None = None,
         is_dir: bool | None = None,
+        is_symlink: bool | None = None,
         download: bytes | None = None,
     ) -> None:
-        """Remove all cached entries for *path* and its parent's ``iterdir``.
+        """Invalidate a path, its listing, and its parent listing.
 
-        Optionally backfill known post-write values.  Pass ``None`` (default)
-        for any field whose value is uncertain -- it will not be written.
+        Optional values are post-operation facts. ``None`` means the value is
+        uncertain and must remain absent rather than being inferred.
         """
         np = self._normalize(path)
-
-        # Batch delete all 6 caches for this path
-        deleted = await self._cache.mdelete(
+        parent = self._parent(np)
+        keys = [
             ("exists", np),
             ("is_file", np),
             ("is_dir", np),
+            ("is_symlink", np),
             ("stat", np),
-            ("iterdir", self._parent(np)),
+            ("lstat", np),
             ("download", np),
-        )
-        removed = deleted > 0
+            ("iterdir", np),
+            ("iterdir", parent),
+        ]
+        deleted = await self._cache.mdelete(*keys)
 
-        # Batch backfill
         entries: list[tuple[str, str, object]] = []
         if exists is not None:
             entries.append(("exists", np, exists))
@@ -205,38 +222,54 @@ class CachedStorage(AbstractStorage):
             entries.append(("is_file", np, is_file))
         if is_dir is not None:
             entries.append(("is_dir", np, is_dir))
+        if is_symlink is not None:
+            entries.append(("is_symlink", np, is_symlink))
         if download is not None:
             entries.append(("download", np, download))
         if entries:
             await self._cache.mset(*entries)
-            backfilled = True
-        else:
-            backfilled = False
-
-        if backfilled:
             self.log.debug(f"Cache backfilled: <y>{escape_tag(np)}</y>")
-        elif removed:
+        elif deleted > 0:
             self.log.debug(f"Cache invalidated: <y>{escape_tag(np)}</y>")
+
+    async def _invalidate_destination_ancestry(self, path: PathLike) -> None:
+        """Invalidate every destination ancestor and listing it can change."""
+        np = self._normalize(path)
+        parts = PurePosixPath(np).parts if np else ()
+        keys: list[tuple[str, str]] = []
+        for index in range(len(parts) + 1):
+            ancestor = str(PurePosixPath(*parts[:index])) if index else ""
+            keys.extend(
+                (
+                    ("exists", ancestor),
+                    ("is_file", ancestor),
+                    ("is_dir", ancestor),
+                    ("is_symlink", ancestor),
+                    ("stat", ancestor),
+                    ("lstat", ancestor),
+                    ("download", ancestor),
+                    ("iterdir", ancestor),
+                )
+            )
+        if await self._cache.mdelete(*keys) > 0:
+            self.log.debug(f"Destination ancestry invalidated: <y>{escape_tag(np)}</y>")
+
+    async def _invalidate_as_missing(self, path: PathLike) -> None:
+        await self._invalidate_path(
+            path,
+            exists=False,
+            is_file=False,
+            is_dir=False,
+            is_symlink=False,
+        )
 
     async def _clear_all_caches(self) -> None:
         await self._cache.clear()
         self.log.debug("All caches cleared")
 
-    # ------------------------------------------------------------------
-    # Introspection (for testing)
-    # ------------------------------------------------------------------
-
     def dump_cache(self) -> dict[str, dict[str, object]]:
-        """Return a complete snapshot of all cache namespaces.
-
-        Returns ``{namespace: {key: value}}``.  Intended for debugging
-        and tests; not part of the storage API contract.
-        """
+        """Return ``{namespace: {key: value}}`` for debugging and tests."""
         return self._cache.snapshot()
-
-    # ------------------------------------------------------------------
-    # Upload
-    # ------------------------------------------------------------------
 
     @override
     async def upload_stream(
@@ -259,18 +292,14 @@ class CachedStorage(AbstractStorage):
                 yield chunk
 
         await self._storage.upload_stream(_tracked_stream(), remote_path, overwrite=overwrite)
-
         await self._invalidate_path(
             remote_path,
             exists=True,
             is_file=True,
             is_dir=False,
+            is_symlink=False,
             download=bytes(buffer) if buffer is not None else None,
         )
-
-    # ------------------------------------------------------------------
-    # Download
-    # ------------------------------------------------------------------
 
     @override
     async def download_stream(
@@ -280,18 +309,16 @@ class CachedStorage(AbstractStorage):
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
         np = self._normalize(remote_path)
-
-        # 缓存中存储的是一定是完整文件内容 → 切片后即可服务 Range 请求
-        if self._download_cache_threshold is not None and (cached := await self._cache.get("download", np)) is not None:
-            length = len(cached)
-            self.log.trace(f"Cache hit: <le>download_stream</>(<y>{escape_tag(np)}</y>) → <g>{length} bytes</g>")
-            if offset:
-                yield cached[offset:]
-            else:
-                yield cached
+        if await self._is_lexical_symlink(remote_path, np):
+            async for chunk in self._storage.download_stream(remote_path, offset=offset):
+                yield chunk
             return
 
-        # offset > 0 时不写入缓存（下载的是片段）
+        if self._download_cache_threshold is not None and (cached := await self._cache.get("download", np)) is not None:
+            self.log.trace(f"Cache hit: <le>download_stream</>(<y>{escape_tag(np)}</y>) → <g>{len(cached)} bytes</g>")
+            yield cached[offset:] if offset else cached
+            return
+
         buffer = bytearray() if (offset == 0 and self._download_cache_threshold is not None) else None
         threshold = self._download_cache_threshold or 0
         async for chunk in self._storage.download_stream(remote_path, offset=offset):
@@ -301,35 +328,29 @@ class CachedStorage(AbstractStorage):
                     buffer = None
             yield chunk
 
-        # Backfill metadata（无论 offset 都写）
         await self._cache.mset(
             ("exists", np, True),
             ("is_file", np, True),
             ("is_dir", np, False),
         )
-
         if buffer is not None:
             await self._cache.set("download", np, bytes(buffer))
             self.log.debug(f"Cached: <le>download_stream</>(<y>{escape_tag(np)}</y>) → <g>{len(buffer)} bytes</g>")
 
-    # ------------------------------------------------------------------
-    # File operations
-    # ------------------------------------------------------------------
-
     @override
     async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
         await self._storage.unlink(path, missing_ok=missing_ok)
-        await self._invalidate_path(path, exists=False, is_file=False, is_dir=False)
+        await self._invalidate_as_missing(path)
 
     @override
     async def rmdir(self, path: PathLike) -> None:
         await self._storage.rmdir(path)
-        await self._invalidate_path(path, exists=False, is_file=False, is_dir=False)
+        await self._invalidate_as_missing(path)
 
     @override
     async def delete(self, path: PathLike) -> None:
         await self._storage.delete(path)
-        await self._invalidate_path(path, exists=False, is_file=False, is_dir=False)
+        await self._invalidate_as_missing(path)
 
     @override
     async def delete_many(self, *paths: PathLike) -> None:
@@ -339,24 +360,72 @@ class CachedStorage(AbstractStorage):
             for path in paths:
                 await self._invalidate_path(path)
 
+    async def _backfill_copied_kind(self, path: PathLike, kind: EntryKind) -> None:
+        np = self._normalize(path)
+        if kind is EntryKind.SYMLINK:
+            await self._cache.set("is_symlink", np, True)
+            return
+        await self._cache.mset(
+            ("exists", np, True),
+            ("is_file", np, kind is EntryKind.FILE),
+            ("is_dir", np, kind is EntryKind.DIRECTORY),
+            ("is_symlink", np, False),
+        )
+
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        await self._storage.move(src, dst, overwrite=overwrite)
+        source = await self.lstat(src)
         src_np = self._normalize(src)
-        [dst_is_file, dst_is_dir] = await self._cache.mget(("is_file", src_np), ("is_dir", src_np))
-        await self._invalidate_path(src, exists=False, is_file=False, is_dir=False)
-        await self._invalidate_path(dst, exists=True, is_file=dst_is_file, is_dir=dst_is_dir)
+        dst_np = self._normalize(dst)
+        try:
+            await self._storage.move(src, dst, overwrite=overwrite)
+        except BaseException:
+            await self._invalidate_path(src)
+            if dst_np != src_np:
+                await self._invalidate_destination_ancestry(dst)
+            raise
+        if dst_np == src_np:
+            await self._invalidate_path(src)
+            return
+        await self._invalidate_as_missing(src)
+        await self._invalidate_destination_ancestry(dst)
+        await self._backfill_copied_kind(dst, source.kind)
 
     @override
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        await self._storage.copy(src, dst, overwrite=overwrite)
-        src_np = self._normalize(src)
-        [dst_is_file, dst_is_dir] = await self._cache.mget(("is_file", src_np), ("is_dir", src_np))
-        await self._invalidate_path(dst, exists=True, is_file=dst_is_file, is_dir=dst_is_dir)
+        source = await self.lstat(src)
+        try:
+            await self._storage.copy(src, dst, overwrite=overwrite)
+        except BaseException:
+            await self._invalidate_destination_ancestry(dst)
+            raise
+        await self._invalidate_destination_ancestry(dst)
+        await self._backfill_copied_kind(dst, source.kind)
 
-    # ------------------------------------------------------------------
-    # Directory
-    # ------------------------------------------------------------------
+    @override
+    async def symlink(
+        self,
+        target: PathLike,
+        link_path: PathLike,
+        *,
+        target_is_directory: bool = False,
+        overwrite: bool = False,
+    ) -> None:
+        try:
+            await self._storage.symlink(
+                target,
+                link_path,
+                target_is_directory=target_is_directory,
+                overwrite=overwrite,
+            )
+        except BaseException:
+            await self._invalidate_path(link_path)
+            raise
+        await self._invalidate_path(link_path, is_symlink=True)
+
+    @override
+    async def readlink(self, path: PathLike) -> str:
+        return await self._storage.readlink(path)
 
     @override
     async def mkdir(
@@ -370,77 +439,73 @@ class CachedStorage(AbstractStorage):
         if parents:
             np = self._normalize(path)
             parts = PurePosixPath(np).parts if np else ()
-            for i in range(len(parts) + 1):
-                ancestor = str(PurePosixPath(*parts[:i])) if i > 0 else ""
-                if i == len(parts):
-                    # Final target: backfill known directory state
-                    await self._invalidate_path(ancestor, exists=True, is_file=False, is_dir=True)
+            for index in range(len(parts) + 1):
+                ancestor = str(PurePosixPath(*parts[:index])) if index else ""
+                if index == len(parts):
+                    await self._invalidate_path(
+                        ancestor,
+                        exists=True,
+                        is_file=False,
+                        is_dir=True,
+                        is_symlink=False,
+                    )
                 else:
-                    # Intermediate ancestors: pure invalidation (can't infer full listing)
                     await self._invalidate_path(ancestor)
         else:
-            await self._invalidate_path(path, exists=True, is_file=False, is_dir=True)
+            await self._invalidate_path(
+                path,
+                exists=True,
+                is_file=False,
+                is_dir=True,
+                is_symlink=False,
+            )
 
     @override
     async def rmtree(self, path: PathLike) -> None:
-        await self._storage.rmtree(path)
-        self.log.debug("RmTree — clearing all caches")
-        await self._clear_all_caches()
-
-    async def _invalidate_tree_paths(self, *paths: PathLike) -> None:
-        for path in paths:
-            await self._invalidate_path(path)
-        self.log.debug("Tree operation — clearing all caches")
-        await self._clear_all_caches()
+        try:
+            await self._storage.rmtree(path)
+        finally:
+            await self._clear_all_caches()
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         try:
             await self._storage.copytree(src, dst, overwrite=overwrite)
         finally:
-            await self._invalidate_tree_paths(src, dst)
+            await self._clear_all_caches()
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         try:
             await self._storage.movetree(src, dst, overwrite=overwrite)
         finally:
-            await self._invalidate_tree_paths(src, dst)
-
-    # ------------------------------------------------------------------
-    # Metadata
-    # ------------------------------------------------------------------
+            await self._clear_all_caches()
 
     @override
     async def exists(self, path: PathLike) -> bool:
         np = self._normalize(path)
+        if await self._is_lexical_symlink(path, np):
+            return await self._storage.exists(path)
         cached: bool | None = await self._cache.get("exists", np)
         if cached is not None:
             self.log.trace(f"Cache hit: <le>exists</>(<y>{escape_tag(np)}</y>) = <g>{cached}</g>")
             return cached
         result = await self._storage.exists(path)
-        if result:
-            await self._cache.set("exists", np, True)
-        else:
-            # Does not exist → definitely not a file or directory either
-            await self._cache.mset(
-                ("exists", np, False),
-                ("is_file", np, False),
-                ("is_dir", np, False),
-            )
+        await self._cache.set("exists", np, result)
         self.log.debug(f"Cache miss: <le>exists</>(<y>{escape_tag(np)}</y>) = <g>{result}</g>")
         return result
 
     @override
     async def is_file(self, path: PathLike) -> bool:
         np = self._normalize(path)
+        if await self._is_lexical_symlink(path, np):
+            return await self._storage.is_file(path)
         cached: bool | None = await self._cache.get("is_file", np)
         if cached is not None:
             self.log.trace(f"Cache hit: <le>is_file</>(<y>{escape_tag(np)}</y>) = <g>{cached}</g>")
             return cached
         result = await self._storage.is_file(path)
         if result:
-            # Is a file → exists and is not a directory
             await self._cache.mset(
                 ("is_file", np, True),
                 ("exists", np, True),
@@ -454,13 +519,14 @@ class CachedStorage(AbstractStorage):
     @override
     async def is_dir(self, path: PathLike) -> bool:
         np = self._normalize(path)
+        if await self._is_lexical_symlink(path, np):
+            return await self._storage.is_dir(path)
         cached: bool | None = await self._cache.get("is_dir", np)
         if cached is not None:
             self.log.trace(f"Cache hit: <le>is_dir</>(<y>{escape_tag(np)}</y>) = <g>{cached}</g>")
             return cached
         result = await self._storage.is_dir(path)
         if result:
-            # Is a directory → exists and is not a file
             await self._cache.mset(
                 ("is_dir", np, True),
                 ("exists", np, True),
@@ -471,66 +537,83 @@ class CachedStorage(AbstractStorage):
         self.log.debug(f"Cache miss: <le>is_dir</>(<y>{escape_tag(np)}</y>) = <g>{result}</g>")
         return result
 
-    @staticmethod
-    def _info_to_cache_entries(np: str, info: FileInfo) -> list[tuple[str, str, object]]:
-        return [
-            ("stat", np, info),
-            ("exists", np, True),
-            ("is_file", np, not info.is_dir),
-            ("is_dir", np, info.is_dir),
-        ]
+    @override
+    async def is_symlink(self, path: PathLike) -> bool:
+        np = self._normalize(path)
+        cached: bool | None = await self._cache.get("is_symlink", np)
+        if cached is not None:
+            self.log.trace(f"Cache hit: <le>is_symlink</>(<y>{escape_tag(np)}</y>) = <g>{cached}</g>")
+            return cached
+        try:
+            info = await self.lstat(path)
+        except FileNotFoundError:
+            return False
+        return info.kind is EntryKind.SYMLINK
 
     @override
     async def stat(self, path: PathLike) -> FileInfo:
         np = self._normalize(path)
+        if await self._is_lexical_symlink(path, np):
+            return await self._storage.stat(path)
         cached: FileInfo | None = await self._cache.get("stat", np)
         if cached is not None:
             self.log.trace(f"Cache hit: <le>stat</>(<y>{escape_tag(np)}</y>)")
             return cached
-        result = await self._storage.stat(path)  # may raise FileNotFoundError
-        # stat is the most complete metadata source
-        await self._cache.mset(*self._info_to_cache_entries(np, result))
+        result = await self._storage.stat(path)
+        await self._cache.mset(*self._follow_cache_entries(np, result))
         self.log.debug(f"Cache miss: <le>stat</>(<y>{escape_tag(np)}</y>)")
         return result
 
-    # ------------------------------------------------------------------
-    # Listing
-    # ------------------------------------------------------------------
+    @override
+    async def lstat(self, path: PathLike) -> FileInfo:
+        np = self._normalize(path)
+        cached: FileInfo | None = await self._cache.get("lstat", np)
+        if cached is not None:
+            self.log.trace(f"Cache hit: <le>lstat</>(<y>{escape_tag(np)}</y>)")
+            return cached
+        try:
+            result = await self._storage.lstat(path)
+        except FileNotFoundError:
+            await self._cache_lexical_missing(np)
+            raise
+        await self._cache.mset(*self._lexical_cache_entries(np, result))
+        self.log.debug(f"Cache miss: <le>lstat</>(<y>{escape_tag(np)}</y>)")
+        return result
+
+    async def _backfill_discovery(self, infos: tuple[FileInfo, ...] | list[FileInfo]) -> None:
+        entries: list[tuple[str, str, object]] = []
+        for info in infos:
+            entries.extend(self._lexical_cache_entries(self._normalize(info.path), info))
+        if entries:
+            await self._cache.mset(*entries)
 
     @override
     async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
         np = self._normalize(path)
         cached: list[FileInfo] | None = await self._cache.get("iterdir", np)
         if cached is not None:
+            await self._backfill_discovery(cached)
             self.log.trace(f"Cache hit: <le>iterdir</>(<y>{escape_tag(np)}</y>) → <g>{len(cached)}</g> entries")
             for info in cached:
                 yield info
             return
+
         entries: list[FileInfo] = []
         async for info in self._storage.iterdir(path):
             entries.append(info)
-            await self._cache.mset(*self._info_to_cache_entries(self._normalize(info.path), info))
+            await self._cache.mset(*self._lexical_cache_entries(self._normalize(info.path), info))
             yield info
         await self._cache.set("iterdir", np, entries.copy())
         self.log.debug(f"Cache miss: <le>iterdir</>(<y>{escape_tag(np)}</y>) → <g>{len(entries)}</g> entries")
 
     @override
-    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
-        dirs: list[FileInfo] = []
-        files: list[FileInfo] = []
-        async for entry in self.iterdir(path):
-            (dirs if entry.is_dir else files).append(entry)
-        yield self.normalize_path(path).as_posix(), dirs, files
-        for d in dirs:
-            async for result in self.walk(d.path):
-                yield result
+    async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:
+        async for snapshot in self._storage.walk(path):
+            await self._backfill_discovery(snapshot.entries)
+            yield snapshot
 
     @override
     async def list_(self, path: PathLike) -> list[FileInfo]:
-        infos: list[FileInfo] = await self._storage.list_(path)
-        await self._cache.mset(
-            *itertools.chain.from_iterable(
-                self._info_to_cache_entries(self._normalize(entry.path), entry) for entry in infos
-            )
-        )
+        infos = await self._storage.list_(path)
+        await self._backfill_discovery(infos)
         return infos

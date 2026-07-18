@@ -4,8 +4,17 @@ from pathlib import PurePosixPath
 
 import pytest
 
-from app.storage import AbstractStorage
+from app.storage import AbstractStorage, EntryKind, FileInfo
 from tests.support.ids import uid
+
+
+def _assert_kind(info: FileInfo, expected: EntryKind) -> None:
+    assert info.kind is expected
+    assert (info.is_file, info.is_dir, info.is_symlink) == {
+        EntryKind.FILE: (True, False, False),
+        EntryKind.DIRECTORY: (False, True, False),
+        EntryKind.SYMLINK: (False, False, True),
+    }[expected]
 
 
 class TestIsDir:
@@ -47,7 +56,7 @@ class TestStat:
         try:
             await storage.mkdir(path)
             info = await storage.stat(path)
-            assert info.is_dir
+            _assert_kind(info, EntryKind.DIRECTORY)
             assert info.name == path
             assert info.size == 0
         finally:
@@ -58,14 +67,14 @@ class TestStat:
         try:
             await storage.upload_bytes(b"hello world", path)
             info = await storage.stat(path)
-            assert not info.is_dir
+            _assert_kind(info, EntryKind.FILE)
             assert info.size == 11
         finally:
             await storage.delete(path)
 
     async def test_root(self, storage: AbstractStorage):
         info = await storage.stat("/")
-        assert info.is_dir
+        _assert_kind(info, EntryKind.DIRECTORY)
 
     async def test_nonexistent_raises(self, storage: AbstractStorage):
         with pytest.raises(FileNotFoundError):

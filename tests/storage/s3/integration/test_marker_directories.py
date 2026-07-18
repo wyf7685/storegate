@@ -37,9 +37,7 @@ class TestMarkerDirectories:
         base = f"test-upload-walk-{uid()}"
         try:
             await real_s3_storage.upload_bytes(b"hello", f"{base}/sub/file.txt")
-            walked_dirs: list[str] = []
-            async for sp, _sd, _sf in real_s3_storage.walk(base):
-                walked_dirs.append(sp)
+            walked_dirs = [walked.path async for walked in real_s3_storage.walk(base)]
             assert len(walked_dirs) >= 2  # base + sub
         finally:
             await real_s3_storage.rmtree(base)

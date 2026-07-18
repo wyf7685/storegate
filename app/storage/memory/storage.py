@@ -1,36 +1,46 @@
+import errno
 import itertools
-from collections.abc import AsyncGenerator, AsyncIterable
+from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import final, override
 
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike
+from app.storage.abstract import (
+    AbstractStorage,
+    BytesLike,
+    EntryKind,
+    FileInfo,
+    PathLike,
+    StorageCapabilities,
+    WalkEntry,
+)
 
 _sid = itertools.count()
+_MEMORY_CAPABILITIES = StorageCapabilities(symlink_metadata=True, readlink=True, symlink_create=True)
+_MAX_SYMLINK_HOPS = 40
 
 
 @final
 class MemoryStorage(AbstractStorage):
-    """In-memory storage backend for testing / ephemeral use.
-
-    Usage::
-
-        async with MemoryStorage() as storage:
-            await storage.upload_bytes(b"hello", "foo.txt")
-    """
+    """In-memory storage backend for testing and ephemeral use."""
 
     def __init__(self, root: str | None = None) -> None:
         super().__init__()
-        _root = PurePosixPath("/", root) if root is not None else PurePosixPath("/")
-        # Normalise away double-leading-slash when root == "/".
-        self._root: PurePosixPath = PurePosixPath(str(_root).replace("//", "/"))
-        self._files: dict[str, bytes] = {}  # path → content
-        self._dirs: set[str] = set()  # directory paths
-        self._now: float = datetime.now(tz=UTC).timestamp()
-        self._id: int = next(_sid)
+        raw_root = PurePosixPath(root or "/")
+        if "\x00" in raw_root.as_posix():
+            raise ValueError("Memory root must not contain NUL")
+        if ".." in raw_root.parts:
+            raise ValueError("Memory root must not contain '..' segments")
+        root_parts = tuple(part for part in raw_root.parts if part not in {"/", "."})
+        self._root = PurePosixPath("/", *root_parts)
+        self._files: dict[str, bytes] = {}
+        self._dirs: set[str] = {self._root.as_posix()}
+        self._links: dict[str, str] = {}
+        self._now = datetime.now(tz=UTC)
+        self._id = next(_sid)
 
     # ------------------------------------------------------------------
-    # Identity
+    # Identity and lifecycle
     # ------------------------------------------------------------------
 
     @property
@@ -38,9 +48,10 @@ class MemoryStorage(AbstractStorage):
     def id(self) -> str:
         return f"memory:{self._id}:{self._root.as_posix()}"
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    @property
+    @override
+    def capabilities(self) -> StorageCapabilities:
+        return _MEMORY_CAPABILITIES
 
     @override
     async def connect(self) -> None:
@@ -55,33 +66,281 @@ class MemoryStorage(AbstractStorage):
         return True
 
     # ------------------------------------------------------------------
-    # Path helpers
+    # Paths and namespace
     # ------------------------------------------------------------------
+
+    def _logical_path(self, path: PathLike) -> PurePosixPath:
+        raw = PurePosixPath(path)
+        if "\x00" in raw.as_posix():
+            raise ValueError("Memory path must not contain NUL")
+        if ".." in raw.parts:
+            raise ValueError("Memory path must not contain '..' segments")
+        return self.normalize_path(raw)
+
+    def _backend_path(self, path: PathLike) -> PurePosixPath:
+        logical = self._logical_path(path)
+        relative = logical.relative_to("/")
+        return self._root if relative == PurePosixPath(".") else self._root / relative
 
     def _resolve(self, path: PathLike) -> str:
-        """Normalise *path* relative to ``self._root``."""
-        resolved = self._root.joinpath(self.normalize_path(path).relative_to("/")).as_posix()
-        return "" if resolved in (".", "/") else resolved
+        """Return the lexical backend-native key used by fixture injection."""
+        return self._backend_path(path).as_posix()
+
+    def _logical_from_backend(self, path: PurePosixPath) -> PurePosixPath:
+        relative = path.relative_to(self._root)
+        return PurePosixPath("/") if relative == PurePosixPath(".") else PurePosixPath("/") / relative
+
+    @staticmethod
+    def _is_descendant(path: PurePosixPath, parent: PurePosixPath) -> bool:
+        return path != parent and parent in path.parents
+
+    def _assert_contained(self, path: PurePosixPath, *, raw_target: str | None = None) -> None:
+        try:
+            path.relative_to(self._root)
+        except ValueError:
+            message = f"Symlink target escapes storage root: {raw_target!r}" if raw_target is not None else str(path)
+            raise PermissionError(errno.EACCES, message) from None
+
+    @staticmethod
+    def _canonical_native(path: PurePosixPath) -> PurePosixPath:
+        parts: list[str] = []
+        for part in path.parts:
+            if part in {"", "/", "."}:
+                continue
+            if part == "..":
+                if parts:
+                    parts.pop()
+                continue
+            parts.append(part)
+        return PurePosixPath("/", *parts)
+
+    def _entry_kind(self, path: PurePosixPath) -> EntryKind | None:
+        key = path.as_posix()
+        kinds = (
+            EntryKind.FILE if key in self._files else None,
+            EntryKind.DIRECTORY if key == self._root.as_posix() or key in self._dirs else None,
+            EntryKind.SYMLINK if key in self._links else None,
+        )
+        present = tuple(kind for kind in kinds if kind is not None)
+        if len(present) > 1:
+            raise RuntimeError(f"Memory namespace invariant violated at {path}")
+        return present[0] if present else None
+
+    def _assert_no_intermediate_links(self, path: PurePosixPath) -> None:
+        relative = path.relative_to(self._root)
+        current = self._root
+        for part in relative.parts[:-1]:
+            current /= part
+            kind = self._entry_kind(current)
+            if kind is EntryKind.SYMLINK:
+                raise OSError(errno.ELOOP, f"Intermediate path is a symlink: {self._logical_from_backend(current)}")
+            if kind is EntryKind.FILE:
+                raise NotADirectoryError(f"Intermediate path is not a directory: {self._logical_from_backend(current)}")
+
+    def _path_pair(self, path: PathLike) -> tuple[PurePosixPath, PurePosixPath]:
+        logical = self._logical_path(path)
+        backend = self._backend_path(logical)
+        self._assert_no_intermediate_links(backend)
+        return logical, backend
+
+    def _missing_parent_dirs(self, path: PurePosixPath) -> tuple[PurePosixPath, ...]:
+        relative = path.parent.relative_to(self._root)
+        current = self._root
+        missing: list[PurePosixPath] = []
+        for part in relative.parts:
+            current /= part
+            kind = self._entry_kind(current)
+            if kind is EntryKind.SYMLINK:
+                raise OSError(errno.ELOOP, f"Intermediate path is a symlink: {self._logical_from_backend(current)}")
+            if kind is EntryKind.FILE:
+                raise NotADirectoryError(f"Intermediate path is not a directory: {self._logical_from_backend(current)}")
+            if kind is None:
+                missing.append(current)
+        return tuple(missing)
+
+    def _require_parent_directory(self, path: PurePosixPath) -> None:
+        parent = path.parent
+        kind = self._entry_kind(parent)
+        if kind is EntryKind.SYMLINK:
+            raise OSError(errno.ELOOP, f"Parent path is a symlink: {self._logical_from_backend(parent)}")
+        if kind is not EntryKind.DIRECTORY:
+            if kind is None:
+                raise FileNotFoundError(f"Parent directory not found: {self._logical_from_backend(path)}")
+            raise NotADirectoryError(f"Parent path is not a directory: {self._logical_from_backend(parent)}")
+
+    def _first_link(self, path: PurePosixPath) -> PurePosixPath | None:
+        self._assert_contained(path)
+        relative = path.relative_to(self._root)
+        current = self._root
+        for part in relative.parts:
+            current /= part
+            if current.as_posix() in self._links:
+                return current
+        return None
+
+    def _link_target(self, link_path: PurePosixPath, raw_target: str, suffix: tuple[str, ...]) -> PurePosixPath:
+        if "\x00" in raw_target:
+            raise ValueError("Memory symlink target must not contain NUL")
+        target = PurePosixPath(raw_target)
+        base = target if target.is_absolute() else link_path.parent / target
+        candidate = self._canonical_native(base.joinpath(*suffix))
+        self._assert_contained(candidate, raw_target=raw_target)
+        return candidate
+
+    def _follow(self, path: PurePosixPath) -> PurePosixPath:
+        candidate = path
+        visited: set[str] = set()
+        hops = 0
+        while link_path := self._first_link(candidate):
+            key = link_path.as_posix()
+            if key in visited or hops >= _MAX_SYMLINK_HOPS:
+                raise OSError(
+                    errno.ELOOP,
+                    f"Too many symbolic links while resolving {self._logical_from_backend(path)}",
+                )
+            visited.add(key)
+            hops += 1
+            suffix = candidate.relative_to(link_path).parts
+            candidate = self._link_target(link_path, self._links[key], suffix)
+        return candidate
+
+    def _info(self, backend: PurePosixPath, logical: PurePosixPath, kind: EntryKind) -> FileInfo:
+        key = backend.as_posix()
+        size = len(self._files[key]) if kind is EntryKind.FILE else 0
+        if kind is EntryKind.SYMLINK:
+            size = len(self._links[key].encode())
+        return FileInfo(
+            path=logical.as_posix(),
+            name=logical.name,
+            kind=kind,
+            size=size,
+            modified=self._now,
+            created=self._now,
+        )
+
+    def _direct_children(self, directory: PurePosixPath) -> tuple[tuple[PurePosixPath, EntryKind], ...]:
+        children: list[tuple[PurePosixPath, EntryKind]] = []
+        directory_key = directory.as_posix()
+        for key in self._dirs:
+            child = PurePosixPath(key)
+            if child != directory and child.parent == directory:
+                children.append((child, EntryKind.DIRECTORY))
+        for key in self._files:
+            child = PurePosixPath(key)
+            if child.parent == directory:
+                children.append((child, EntryKind.FILE))
+        for key in self._links:
+            child = PurePosixPath(key)
+            if child.parent == directory:
+                children.append((child, EntryKind.SYMLINK))
+        children.sort(key=lambda item: item[0].as_posix())
+        for child, _ in children:
+            if child.parent.as_posix() != directory_key:
+                raise RuntimeError("Memory namespace child invariant violated")
+        return tuple(children)
+
+    def _tree_entries(self, root: PurePosixPath) -> tuple[tuple[PurePosixPath, EntryKind], ...]:
+        kind = self._entry_kind(root)
+        if kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {self._logical_from_backend(root)}")
+        entries: list[tuple[PurePosixPath, EntryKind]] = [(root, EntryKind.DIRECTORY)]
+        for key in self._dirs:
+            path = PurePosixPath(key)
+            if self._is_descendant(path, root):
+                entries.append((path, EntryKind.DIRECTORY))
+        for key in self._files:
+            path = PurePosixPath(key)
+            if self._is_descendant(path, root):
+                entries.append((path, EntryKind.FILE))
+        for key in self._links:
+            path = PurePosixPath(key)
+            if self._is_descendant(path, root):
+                entries.append((path, EntryKind.SYMLINK))
+        entries.sort(key=lambda item: item[0].as_posix())
+        return tuple(entries)
+
+    @staticmethod
+    def _remove_entry(
+        path: PurePosixPath,
+        files: dict[str, bytes],
+        dirs: set[str],
+        links: dict[str, str],
+    ) -> None:
+        key = path.as_posix()
+        files.pop(key, None)
+        dirs.discard(key)
+        links.pop(key, None)
+
+    def _ensure_dirs_in_state(
+        self,
+        directories: Iterable[PurePosixPath],
+        files: dict[str, bytes],
+        dirs: set[str],
+        links: dict[str, str],
+    ) -> None:
+        for directory in directories:
+            key = directory.as_posix()
+            if key in files or key in links:
+                raise NotADirectoryError(f"Parent path is not a directory: {self._logical_from_backend(directory)}")
+            dirs.add(key)
+
+    def _copytree_state(
+        self,
+        source: PurePosixPath,
+        destination: PurePosixPath,
+        *,
+        overwrite: bool,
+    ) -> tuple[dict[str, bytes], set[str], dict[str, str]]:
+        snapshot = self._tree_entries(source)
+        if self._is_descendant(destination, source):
+            raise ValueError("Destination must not be inside the source tree")
+
+        files = self._files.copy()
+        dirs = self._dirs.copy()
+        links = self._links.copy()
+        destination_kind = self._entry_kind(destination)
+        if destination_kind is not None and not overwrite:
+            raise FileExistsError(f"Destination already exists: {self._logical_from_backend(destination)}")
+
+        parent_dirs = self._missing_parent_dirs(destination)
+        self._ensure_dirs_in_state(parent_dirs, files, dirs, links)
+        if destination_kind in {EntryKind.FILE, EntryKind.SYMLINK}:
+            self._remove_entry(destination, files, dirs, links)
+        dirs.add(destination.as_posix())
+
+        for source_path, source_kind in snapshot[1:]:
+            relative = source_path.relative_to(source)
+            target = destination / relative
+            target_key = target.as_posix()
+            target_kind = (
+                EntryKind.FILE
+                if target_key in files
+                else EntryKind.DIRECTORY
+                if target_key in dirs
+                else EntryKind.SYMLINK
+                if target_key in links
+                else None
+            )
+            if source_kind is EntryKind.DIRECTORY:
+                if target_kind in {EntryKind.FILE, EntryKind.SYMLINK}:
+                    if not overwrite:
+                        raise FileExistsError(f"Destination already exists: {self._logical_from_backend(target)}")
+                    self._remove_entry(target, files, dirs, links)
+                dirs.add(target_key)
+                continue
+            if target_kind is EntryKind.DIRECTORY:
+                raise IsADirectoryError(f"Destination is a directory: {self._logical_from_backend(target)}")
+            if target_kind is not None and not overwrite:
+                raise FileExistsError(f"Destination already exists: {self._logical_from_backend(target)}")
+            self._remove_entry(target, files, dirs, links)
+            if source_kind is EntryKind.FILE:
+                files[target_key] = self._files[source_path.as_posix()]
+            else:
+                links[target_key] = self._links[source_path.as_posix()]
+        return files, dirs, links
 
     # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _ensure_parent_dirs(self, path: str) -> None:
-        """Record all ancestor directories of *path*."""
-        parent = PurePosixPath(path).parent
-        parts = parent.parts
-        for i in range(1, len(parts) + 1):
-            self._dirs.add(str(PurePosixPath(*parts[:i])))
-
-    def _is_dir(self, path: str) -> bool:
-        if path == "" or path in self._dirs:
-            return True
-        prefix = path + "/" if path else ""
-        return any(k.startswith(prefix) for k in self._files)
-
-    # ------------------------------------------------------------------
-    # Upload
+    # Upload and download
     # ------------------------------------------------------------------
 
     @override
@@ -92,28 +351,23 @@ class MemoryStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
-        try:
-            info = await self.stat(remote_path)
-        except FileNotFoundError:
-            pass
-        else:
-            if info.is_dir:
-                raise IsADirectoryError(f"Is a directory: {remote_path}")
-            if not overwrite:
-                raise FileExistsError(f"File already exists: {remote_path}")
-
-        target = self._resolve(remote_path)
-        self._ensure_parent_dirs(target)
+        _, target = self._path_pair(remote_path)
+        kind = self._entry_kind(target)
+        if kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {remote_path}")
+        if kind is EntryKind.SYMLINK:
+            raise OSError(errno.ELOOP, f"Refusing to upload through symlink: {remote_path}")
+        if kind is EntryKind.FILE and not overwrite:
+            raise FileExistsError(f"File already exists: {remote_path}")
+        missing_parents = self._missing_parent_dirs(target)
 
         buffer = bytearray()
         async for chunk in stream:
-            buffer.extend(chunk if isinstance(chunk, (bytes, bytearray, memoryview)) else memoryview(chunk))
+            buffer.extend(chunk)
 
-        self._files[target] = bytes(buffer)
-
-    # ------------------------------------------------------------------
-    # Download
-    # ------------------------------------------------------------------
+        for directory in missing_parents:
+            self._dirs.add(directory.as_posix())
+        self._files[target.as_posix()] = bytes(buffer)
 
     @override
     async def download_stream(
@@ -122,20 +376,19 @@ class MemoryStorage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
-        target = self._resolve(remote_path)
-
-        try:
-            data = self._files[target]
-        except KeyError:
-            raise FileNotFoundError(f"File not found: {remote_path}") from None
-
-        if offset >= len(data):
-            return
-
-        remaining = data[offset:]
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        _, lexical = self._path_pair(remote_path)
+        target = self._follow(lexical)
+        kind = self._entry_kind(target)
+        if kind is None:
+            raise FileNotFoundError(f"File not found: {remote_path}")
+        if kind is not EntryKind.FILE:
+            raise IsADirectoryError(f"Not a regular file: {remote_path}")
+        data = self._files[target.as_posix()]
         step = 1024 * 1024
-        for i in range(0, len(remaining), step):
-            yield remaining[i : i + step]
+        for index in range(offset, len(data), step):
+            yield data[index : index + step]
 
     # ------------------------------------------------------------------
     # File operations
@@ -143,76 +396,82 @@ class MemoryStorage(AbstractStorage):
 
     @override
     async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
-        target = self._resolve(path)
-
-        if target in self._files:
-            del self._files[target]
+        _, target = self._path_pair(path)
+        kind = self._entry_kind(target)
+        if kind is EntryKind.FILE:
+            del self._files[target.as_posix()]
             return
-
-        if target in self._dirs or target == "" or self._is_dir(target):
+        if kind is EntryKind.SYMLINK:
+            del self._links[target.as_posix()]
+            return
+        if kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {path}")
-
-        if missing_ok:
-            return
-
-        raise FileNotFoundError(f"File not found: {path}")
+        if not missing_ok:
+            raise FileNotFoundError(f"File not found: {path}")
 
     @override
     async def rmdir(self, path: PathLike) -> None:
-        target = self._resolve(path)
-
-        if target in self._files:
+        _, target = self._path_pair(path)
+        if self._entry_kind(target) is not EntryKind.DIRECTORY:
+            if self._entry_kind(target) is None:
+                raise FileNotFoundError(f"Directory not found: {path}")
             raise NotADirectoryError(f"Not a directory: {path}")
-        if target not in self._dirs and target != "" and not self._is_dir(target):
-            raise FileNotFoundError(f"Directory not found: {path}")
+        if self._direct_children(target):
+            raise OSError(errno.ENOTEMPTY, f"Directory not empty: {path}")
+        if target != self._root:
+            self._dirs.discard(target.as_posix())
 
-        prefix = target + "/" if target else ""
-        # Only allow deletion of empty directories.
-        for key in self._files:
-            if key.startswith(prefix):
-                raise OSError(f"Directory not empty: {path}")
-        for key in self._dirs:
-            if key != target and key.startswith(prefix):
-                raise OSError(f"Directory not empty: {path}")
-        if target in self._dirs:
-            self._dirs.discard(target)
+    def _prepare_entry_destination(
+        self,
+        source: PurePosixPath,
+        destination: PurePosixPath,
+        *,
+        overwrite: bool,
+    ) -> tuple[EntryKind, tuple[PurePosixPath, ...]]:
+        source_kind = self._entry_kind(source)
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {self._logical_from_backend(source)}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {self._logical_from_backend(source)}")
+        destination_kind = self._entry_kind(destination)
+        if destination_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Destination is a directory: {self._logical_from_backend(destination)}")
+        if destination_kind is not None and not overwrite:
+            raise FileExistsError(f"Destination already exists: {self._logical_from_backend(destination)}")
+        return source_kind, self._missing_parent_dirs(destination)
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        source = self._resolve(src)
-        dest = self._resolve(dst)
-        if source not in self._files:
-            if self._is_dir(source) or source == "":
-                raise IsADirectoryError(f"Is a directory: {src}")
-            raise FileNotFoundError(f"Source not found: {src}")
-        if source == dest and overwrite:
+        _, source = self._path_pair(src)
+        _, destination = self._path_pair(dst)
+        source_kind, missing_parents = self._prepare_entry_destination(source, destination, overwrite=overwrite)
+        if source == destination:
             return
-        if dest in self._dirs or dest == "" or self._is_dir(dest):
-            raise IsADirectoryError(f"Destination is a directory: {dst}")
-        if dest in self._files and not overwrite:
-            raise FileExistsError(f"Destination file already exists: {dst}")
-        self._ensure_parent_dirs(dest)
-        self._files[dest] = self._files.pop(source)
+        for directory in missing_parents:
+            self._dirs.add(directory.as_posix())
+        self._remove_entry(destination, self._files, self._dirs, self._links)
+        if source_kind is EntryKind.FILE:
+            self._files[destination.as_posix()] = self._files.pop(source.as_posix())
+        else:
+            self._links[destination.as_posix()] = self._links.pop(source.as_posix())
 
     @override
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        source = self._resolve(src)
-        dest = self._resolve(dst)
-        if source not in self._files:
-            if self._is_dir(source) or source == "":
-                raise IsADirectoryError(f"Is a directory: {src}")
-            raise FileNotFoundError(f"Source not found: {src}")
-        if source == dest and overwrite:
+        _, source = self._path_pair(src)
+        _, destination = self._path_pair(dst)
+        source_kind, missing_parents = self._prepare_entry_destination(source, destination, overwrite=overwrite)
+        if source == destination:
             return
-        if dest in self._dirs or dest == "" or self._is_dir(dest):
-            raise IsADirectoryError(f"Destination is a directory: {dst}")
-        if dest in self._files and not overwrite:
-            raise FileExistsError(f"Destination file already exists: {dst}")
-        self._ensure_parent_dirs(dest)
-        self._files[dest] = self._files[source]
+        for directory in missing_parents:
+            self._dirs.add(directory.as_posix())
+        self._remove_entry(destination, self._files, self._dirs, self._links)
+        if source_kind is EntryKind.FILE:
+            self._files[destination.as_posix()] = self._files[source.as_posix()]
+        else:
+            self._links[destination.as_posix()] = self._links[source.as_posix()]
 
     # ------------------------------------------------------------------
-    # Directory
+    # Directory operations
     # ------------------------------------------------------------------
 
     @override
@@ -223,192 +482,151 @@ class MemoryStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
-        target = self._resolve(path)
-
-        if target in self._files:
-            raise FileExistsError(f"Path is a file: {path}")
-        if target in self._dirs:
+        _, target = self._path_pair(path)
+        kind = self._entry_kind(target)
+        if kind is EntryKind.DIRECTORY:
             if exist_ok:
                 return
             raise FileExistsError(f"Directory already exists: {path}")
+        if kind is not None:
+            raise FileExistsError(f"Path already exists: {path}")
 
         if parents:
-            self._ensure_parent_dirs(target)
-
-        parent = str(PurePosixPath(target).parent) if target else ""
-        if parent in (".", "/"):
-            parent = ""
-        if target and parent != "" and parent not in self._dirs:
-            raise FileNotFoundError(f"Parent directory not found: {path}")
-
-        self._dirs.add(target or "")
+            missing = self._missing_parent_dirs(target)
+            for directory in missing:
+                self._dirs.add(directory.as_posix())
+        else:
+            self._require_parent_directory(target)
+        self._dirs.add(target.as_posix())
 
     @override
     async def rmtree(self, path: PathLike) -> None:
-        target = self._resolve(path)
-
-        if target in self._files:
-            raise NotADirectoryError(f"Not a directory: {path}")
-
-        prefix = target + "/" if target else ""
-
-        for key in list(self._files):
-            if key == target or key.startswith(prefix):
-                del self._files[key]
-
-        for key in list(self._dirs):
-            if key == target or key.startswith(prefix):
-                self._dirs.discard(key)
+        _, target = self._path_pair(path)
+        snapshot = self._tree_entries(target)
+        files = self._files.copy()
+        dirs = self._dirs.copy()
+        links = self._links.copy()
+        for entry, _ in reversed(snapshot):
+            self._remove_entry(entry, files, dirs, links)
+        dirs.add(self._root.as_posix())
+        self._files, self._dirs, self._links = files, dirs, links
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        target_src = self._resolve(src)
-        target_dst = self._resolve(dst)
-
-        # 类型校验
-        if not (target_src in self._dirs or target_src == "" or self._is_dir(target_src)):
-            raise NotADirectoryError(f"Not a directory: {src}")
-
-        # 覆盖策略
-        if not overwrite and (
-            target_dst in self._dirs or target_dst == "" or self._is_dir(target_dst) or target_dst in self._files
-        ):
-            raise FileExistsError(f"Destination already exists: {dst}")
-
-        src_prefix = target_src + "/" if target_src else ""
-
-        # 收集源下所有文件和目录
-        files_to_copy: list[tuple[str, str]] = []
-        for key in self._files:
-            if key == target_src or key.startswith(src_prefix):
-                rel = key[len(src_prefix) :] if target_src else key
-                dst_path = target_dst + "/" + rel if target_dst else rel
-                files_to_copy.append((key, dst_path))
-
-        dirs_to_create: list[str] = []
-        for key in self._dirs:
-            if key == target_src:
-                dirs_to_create.append(target_dst)
-            elif key.startswith(src_prefix):
-                rel = key[len(src_prefix) :] if target_src else key
-                dirs_to_create.append(target_dst + "/" + rel)
-
-        # overwrite: 清理目标端已有数据
-        if overwrite:
-            dst_prefix = target_dst + "/" if target_dst else ""
-            for key in list(self._files):
-                if key == target_dst or key.startswith(dst_prefix):
-                    del self._files[key]
-            for key in list(self._dirs):
-                if key == target_dst or key.startswith(dst_prefix):
-                    self._dirs.discard(key)
-
-        # 创建目标目录结构
-        for d in dirs_to_create:
-            self._dirs.add(d)
-        if target_dst and target_dst not in self._dirs:
-            self._dirs.add(target_dst)
-        self._ensure_parent_dirs(target_dst)
-
-        # 复制所有文件 (bytes 不可变, 共享引用安全)
-        for src_path, dst_path in files_to_copy:
-            self._files[dst_path] = self._files[src_path]
+        _, source = self._path_pair(src)
+        _, destination = self._path_pair(dst)
+        if source == destination:
+            if self._entry_kind(source) is not EntryKind.DIRECTORY:
+                raise NotADirectoryError(f"Not a directory: {src}")
+            if not overwrite:
+                raise FileExistsError(f"Destination already exists: {dst}")
+            return
+        files, dirs, links = self._copytree_state(source, destination, overwrite=overwrite)
+        self._files, self._dirs, self._links = files, dirs, links
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        target_src = self._resolve(src)
-        target_dst = self._resolve(dst)
-
-        # 类型校验
-        if not (target_src in self._dirs or target_src == "" or self._is_dir(target_src)):
-            raise NotADirectoryError(f"Not a directory: {src}")
-
-        # 覆盖策略
-        if not overwrite and (
-            target_dst in self._dirs or target_dst == "" or self._is_dir(target_dst) or target_dst in self._files
-        ):
-            raise FileExistsError(f"Destination already exists: {dst}")
-
-        src_prefix = target_src + "/" if target_src else ""
-
-        # overwrite: 清理目标端已有数据
-        if overwrite:
-            dst_prefix = target_dst + "/" if target_dst else ""
-            for key in list(self._files):
-                if key == target_dst or key.startswith(dst_prefix):
-                    del self._files[key]
-            for key in list(self._dirs):
-                if key == target_dst or key.startswith(dst_prefix):
-                    self._dirs.discard(key)
-
-        # 移动文件 (键重命名)
-        moved_files: dict[str, bytes] = {}
-        for key in list(self._files):
-            if key == target_src or key.startswith(src_prefix):
-                rel = key[len(src_prefix) :] if target_src else key
-                dst_path = target_dst + "/" + rel if target_dst else rel
-                moved_files[dst_path] = self._files.pop(key)
-        self._files.update(moved_files)
-
-        # 移动目录
-        for key in list(self._dirs):
-            if key == target_src:
-                self._dirs.discard(key)
-                self._dirs.add(target_dst)
-            elif key.startswith(src_prefix):
-                rel = key[len(src_prefix) :] if target_src else key
-                dst_path = target_dst + "/" + rel if target_dst else rel
-                self._dirs.discard(key)
-                self._dirs.add(dst_path)
-
-        self._ensure_parent_dirs(target_dst)
+        _, source = self._path_pair(src)
+        _, destination = self._path_pair(dst)
+        if source == destination:
+            if self._entry_kind(source) is not EntryKind.DIRECTORY:
+                raise NotADirectoryError(f"Not a directory: {src}")
+            if not overwrite:
+                raise FileExistsError(f"Destination already exists: {dst}")
+            return
+        files, dirs, links = self._copytree_state(source, destination, overwrite=overwrite)
+        source_snapshot = self._tree_entries(source)
+        for entry, _ in reversed(source_snapshot):
+            self._remove_entry(entry, files, dirs, links)
+        dirs.add(self._root.as_posix())
+        self._files, self._dirs, self._links = files, dirs, links
 
     # ------------------------------------------------------------------
-    # Metadata
+    # Metadata and symlinks
     # ------------------------------------------------------------------
 
     @override
     async def exists(self, path: PathLike) -> bool:
-        target = self._resolve(path)
-        return target in self._files or target in self._dirs or self._is_dir(target)
+        try:
+            await self.stat(path)
+        except FileNotFoundError:
+            return False
+        return True
 
     @override
     async def is_file(self, path: PathLike) -> bool:
-        return self._resolve(path) in self._files
+        try:
+            return (await self.stat(path)).kind is EntryKind.FILE
+        except FileNotFoundError:
+            return False
 
     @override
     async def is_dir(self, path: PathLike) -> bool:
-        target = self._resolve(path)
-        if target in self._dirs:
-            return True
-        return target == "" or self._is_dir(target)
+        try:
+            return (await self.stat(path)).kind is EntryKind.DIRECTORY
+        except FileNotFoundError:
+            return False
+
+    @override
+    async def lstat(self, path: PathLike) -> FileInfo:
+        logical, target = self._path_pair(path)
+        kind = self._entry_kind(target)
+        if kind is None:
+            raise FileNotFoundError(f"Path not found: {path}")
+        return self._info(target, logical, kind)
 
     @override
     async def stat(self, path: PathLike) -> FileInfo:
-        target = self._resolve(path)
-        name = PurePosixPath(target).name if target else ""
+        logical, lexical = self._path_pair(path)
+        target = self._follow(lexical)
+        kind = self._entry_kind(target)
+        if kind is None:
+            raise FileNotFoundError(f"Path not found: {path}")
+        if kind is EntryKind.SYMLINK:
+            raise RuntimeError("Memory symlink resolver returned an unresolved link")
+        return self._info(target, logical, kind)
 
-        if target in self._files:
-            return FileInfo(
-                path=self.normalize_path(path).as_posix(),
-                name=name,
-                is_dir=False,
-                size=len(self._files[target]),
-                modified=datetime.fromtimestamp(self._now, tz=UTC),
-                created=datetime.fromtimestamp(self._now, tz=UTC),
-            )
+    @override
+    async def is_symlink(self, path: PathLike) -> bool:
+        try:
+            return (await self.lstat(path)).kind is EntryKind.SYMLINK
+        except FileNotFoundError:
+            return False
 
-        if target in self._dirs or target == "" or self._is_dir(target):
-            return FileInfo(
-                path=self.normalize_path(path).as_posix(),
-                name=name,
-                is_dir=True,
-                size=0,
-                modified=datetime.fromtimestamp(self._now, tz=UTC),
-                created=datetime.fromtimestamp(self._now, tz=UTC),
-            )
+    @override
+    async def readlink(self, path: PathLike) -> str:
+        _, target = self._path_pair(path)
+        try:
+            return self._links[target.as_posix()]
+        except KeyError:
+            if self._entry_kind(target) is None:
+                raise FileNotFoundError(f"Path not found: {path}") from None
+            raise OSError(errno.EINVAL, f"Not a symbolic link: {path}") from None
 
-        raise FileNotFoundError(f"Path not found: {path}")
+    @override
+    async def symlink(
+        self,
+        target: PathLike,
+        link_path: PathLike,
+        *,
+        target_is_directory: bool = False,
+        overwrite: bool = False,
+    ) -> None:
+        del target_is_directory
+        raw_target = str(target)
+        if "\x00" in raw_target:
+            raise ValueError("Memory symlink target must not contain NUL")
+        if PurePosixPath(raw_target).is_absolute():
+            raise ValueError("Memory symlink target must be relative")
+        _, link = self._path_pair(link_path)
+        self._require_parent_directory(link)
+        kind = self._entry_kind(link)
+        if kind is not None and not overwrite:
+            raise FileExistsError(f"Destination already exists: {link_path}")
+        if kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Destination is a directory: {link_path}")
+        self._remove_entry(link, self._files, self._dirs, self._links)
+        self._links[link.as_posix()] = raw_target
 
     # ------------------------------------------------------------------
     # Listing
@@ -416,112 +634,27 @@ class MemoryStorage(AbstractStorage):
 
     @override
     async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
-        target = self._resolve(path)
-
-        # Allow listing root that has files but hasn't been explicitly mkdir'd.
-        if target not in self._dirs and target != "" and not self._is_dir(target):
+        logical, target = self._path_pair(path)
+        if self._entry_kind(target) is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {path}")
-
-        seen: set[str] = set()
-        prefix = target + "/" if target else ""
-
-        # Yield subdirectories.
-        for d in self._dirs:
-            if d == target or not d.startswith(prefix):
-                continue
-            rest = d[len(prefix) :].lstrip("/")
-            if not rest or "/" in rest:
-                continue  # root marker or not an immediate child
-            if rest in seen:
-                continue
-            seen.add(rest)
-            yield FileInfo(
-                path=self.normalize_path(path).joinpath(rest).as_posix(),
-                name=rest,
-                is_dir=True,
-                size=0,
-                modified=datetime.fromtimestamp(self._now, tz=UTC),
-                created=datetime.fromtimestamp(self._now, tz=UTC),
-            )
-
-        # Yield files.
-        for fpath, content in self._files.items():
-            if not fpath.startswith(prefix):
-                continue
-            rest = fpath[len(prefix) :].lstrip("/")
-            if not rest or "/" in rest:
-                continue  # not an immediate child
-            if rest in seen:
-                continue
-            seen.add(rest)
-            yield FileInfo(
-                path=self.normalize_path(path).joinpath(rest).as_posix(),
-                name=rest,
-                is_dir=False,
-                size=len(content),
-                modified=datetime.fromtimestamp(self._now, tz=UTC),
-                created=datetime.fromtimestamp(self._now, tz=UTC),
-            )
+        for child, kind in self._direct_children(target):
+            child_logical = logical / child.name
+            yield self._info(child, child_logical, kind)
 
     @override
-    async def walk(self, path: PathLike) -> AsyncGenerator[tuple[str, list[FileInfo], list[FileInfo]]]:
-        target = self._resolve(path)
-
-        if target not in self._dirs and target != "" and not self._is_dir(target):
+    async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:
+        logical, target = self._path_pair(path)
+        if self._entry_kind(target) is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {path}")
 
-        prefix = target.removesuffix("/") + "/" if target else ""
+        async def visit(directory: PurePosixPath, directory_logical: PurePosixPath) -> AsyncGenerator[WalkEntry]:
+            children = self._direct_children(directory)
+            entries = tuple(self._info(child, directory_logical / child.name, kind) for child, kind in children)
+            yield WalkEntry(path=directory_logical.as_posix(), entries=entries)
+            for child, kind in children:
+                if kind is EntryKind.DIRECTORY:
+                    async for result in visit(child, directory_logical / child.name):
+                        yield result
 
-        # Collect immediate children, partitioned into dirs and files.
-        dir_names: set[str] = set()
-        dirs: list[FileInfo] = []
-        files: list[FileInfo] = []
-        seen: set[str] = set()
-
-        for d in self._dirs:
-            if d == target or not d.startswith(prefix):
-                continue
-            rest = d[len(prefix) :].lstrip("/")
-            if not rest or "/" in rest:
-                continue
-            if rest in seen:
-                continue
-            seen.add(rest)
-            dir_names.add(rest)
-            dirs.append(
-                FileInfo(
-                    path=self.normalize_path(path).joinpath(rest).as_posix(),
-                    name=rest,
-                    is_dir=True,
-                    size=0,
-                    modified=datetime.fromtimestamp(self._now, tz=UTC),
-                    created=datetime.fromtimestamp(self._now, tz=UTC),
-                )
-            )
-
-        for fpath, content in self._files.items():
-            if not fpath.startswith(prefix):
-                continue
-            rest = fpath[len(prefix) :].lstrip("/")
-            if not rest or "/" in rest:
-                continue
-            if rest in seen:
-                continue
-            seen.add(rest)
-            files.append(
-                FileInfo(
-                    path=self.normalize_path(path).joinpath(rest).as_posix(),
-                    name=rest,
-                    is_dir=False,
-                    size=len(content),
-                    modified=datetime.fromtimestamp(self._now, tz=UTC),
-                    created=datetime.fromtimestamp(self._now, tz=UTC),
-                )
-            )
-
-        yield self.normalize_path(path).as_posix(), dirs, files
-
-        for d in sorted(dir_names):
-            sub_path = str(PurePosixPath(path) / d) if path else d
-            async for sp, sd, sf in self.walk(sub_path):
-                yield sp, sd, sf
+        async for result in visit(target, logical):
+            yield result

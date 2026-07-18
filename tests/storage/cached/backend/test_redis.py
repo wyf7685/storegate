@@ -1,12 +1,14 @@
 """RedisCacheBackend tests."""
 
 import fnmatch
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self, cast
 
 import pytest
 from pydantic import SecretStr
 
+from app.storage import EntryKind, FileInfo
 from app.storage.cached import CachedStorage, RedisCacheBackend
 from app.storage.dav.client import DavConfig
 from app.storage.local import LocalStorage
@@ -137,6 +139,57 @@ async def test_auto_prefix_isolates_shared_redis() -> None:
     assert await first.get("exists", "batch.txt") is None
     assert await second.get("exists", "batch.txt") is False
     assert redis.scan_matches == [f"{first._scope_prefix()}:*"]
+
+
+async def test_v2_file_info_roundtrip_and_strict_kind() -> None:
+    redis = FakeRedis()
+    backend = RedisCacheBackend()
+    backend.bind_storage('{"kind":"local","root":"/schema"}')
+    for namespace in ("stat", "lstat", "iterdir", "is_symlink"):
+        backend.configure_namespace(namespace, 30)
+    _install_fake_client(backend, redis)
+
+    modified = datetime(2026, 7, 18, 12, 30, tzinfo=UTC)
+    link = FileInfo(
+        path="/link",
+        name="link",
+        kind=EntryKind.SYMLINK,
+        size=6,
+        modified=modified,
+    )
+    directory = FileInfo(path="/dir", name="dir", kind=EntryKind.DIRECTORY)
+
+    await backend.set("stat", "link", link)
+    await backend.set("lstat", "link", link)
+    await backend.set("iterdir", "", [directory, link])
+    await backend.set("is_symlink", "link", True)
+
+    assert backend._scope_prefix().startswith("storegate:v2:")
+    assert await backend.get("stat", "link") == link
+    assert await backend.get("lstat", "link") == link
+    assert await backend.get("iterdir", "") == [directory, link]
+    assert await backend.get("is_symlink", "link") is True
+    assert b'"kind":"symlink"' in redis.values[backend._rk("stat", "link")]
+    assert b'"is_dir"' not in redis.values[backend._rk("stat", "link")]
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        (b'{"path":"/legacy","name":"legacy","is_dir":false}', KeyError),
+        (b'{"path":"/bad","name":"bad","kind":"socket"}', ValueError),
+    ],
+)
+async def test_file_info_decoder_rejects_legacy_or_invalid_kind(payload: bytes, error: type[Exception]) -> None:
+    redis = FakeRedis()
+    backend = RedisCacheBackend()
+    backend.bind_storage('{"kind":"local","root":"/strict"}')
+    backend.configure_namespace("stat", 30)
+    _install_fake_client(backend, redis)
+    redis.values[backend._rk("stat", "entry")] = payload
+
+    with pytest.raises(error):
+        await backend.get("stat", "entry")
 
 
 async def test_cached_storage_close_preserves_redis_entries(tmp_path: Path) -> None:

@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import anyio
 import pytest
 
-from app.storage.abstract import BytesLike, PathLike
+from app.storage.abstract import BytesLike, FileInfo, PathLike
 from app.storage.index import IndexStorage
 from app.storage.index.lock import LockLeaseLostError, StorageFileLocker
 from app.storage.index.ref import hash_to_path
@@ -64,10 +64,9 @@ class _ReplaceAfterReadStorage(MemoryStorage):  # ty: ignore[subclass-of-final-c
 
 
 class _BlockingExistsStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
-    async def exists(self, path: PathLike) -> bool:
-        _ = path
+    async def lstat(self, path: PathLike) -> FileInfo:
         await anyio.sleep_forever()
-        return False
+        return await super().lstat(path)
 
 
 class _BlockingLockStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]

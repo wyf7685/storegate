@@ -1,12 +1,13 @@
 """WebDAV multistatus XML parsing and ``DavResource`` → ``FileInfo`` conversion."""
 
+import errno
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlparse
 
-from app.storage.abstract import FileInfo
+from app.storage.abstract import EntryKind, FileInfo, UnsupportedOperationError
 
 from .client import DavResource, DavResponseParseError
 
@@ -22,6 +23,23 @@ PROPFIND_BODY = (
     b"<D:displayname/>"
     b"</D:prop>"
     b"</D:propfind>"
+)
+
+_UNSUPPORTED_ERRNO = getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)
+_SPECIAL_RESOURCE_TYPE_NAMES = frozenset(
+    {
+        "activity",
+        "baseline",
+        "link",
+        "redirect-reference",
+        "redirectref",
+        "symbolic-link",
+        "symlink",
+        "version",
+        "version-history",
+        "working-resource",
+        "workspace",
+    }
 )
 
 
@@ -63,7 +81,8 @@ def parse_multistatus(content: bytes) -> list[DavResource]:
             continue
         href = unquote(href)
         prop = response.find(".//{*}prop")
-        is_collection = prop is not None and prop.find(".//{*}collection") is not None
+        resource_type = prop.find("./{*}resourcetype") if prop is not None else None
+        resource_types = tuple(child.tag for child in resource_type) if resource_type is not None else ()
 
         length_text = _find_text(response, "getcontentlength")
         content_length: int | None = None
@@ -84,7 +103,7 @@ def parse_multistatus(content: bytes) -> list[DavResource]:
         resources.append(
             DavResource(
                 href=href,
-                is_collection=is_collection,
+                resource_types=resource_types,
                 content_length=content_length,
                 last_modified=last_modified,
                 creation_date=creation_date,
@@ -109,17 +128,49 @@ def href_to_storage_path(href: str, url_prefix: str) -> str:
     return path.lstrip("/").rstrip("/")
 
 
+def _resource_type_name(resource_type: str) -> str:
+    return resource_type.rsplit("}", maxsplit=1)[-1].lower()
+
+
+def dav_resource_entry_kind(resource: DavResource) -> EntryKind | None:
+    """Classify standard WebDAV file/collection resources.
+
+    WebDAV extensions may expose link, redirect-reference, version, or other
+    special resources through non-standard ``resourcetype`` children. Known
+    special types are rejected even if a server also labels them collections.
+    Other extension collections remain directory-like; a non-collection with
+    any resource type is not safe to treat as a file.
+    """
+    if any(
+        _resource_type_name(resource_type) in _SPECIAL_RESOURCE_TYPE_NAMES for resource_type in resource.resource_types
+    ):
+        return None
+
+    if resource.is_collection:
+        return EntryKind.DIRECTORY
+    if resource.resource_types:
+        return None
+    return EntryKind.FILE
+
+
 def dav_resource_to_file_info(resource: DavResource, storage_path: str) -> FileInfo:
     """Convert a :class:`DavResource` to :class:`FileInfo`.
 
     *storage_path* is the storage-relative path (output of
     :func:`href_to_storage_path`); it is normalized to an absolute POSIX path.
     """
+    kind = dav_resource_entry_kind(resource)
+    if kind is None:
+        resource_types = ", ".join(resource.resource_types)
+        raise UnsupportedOperationError(
+            _UNSUPPORTED_ERRNO,
+            f"Unsupported WebDAV resource type at {storage_path!r}: {resource_types}",
+        )
     np = PurePosixPath("/") / PurePosixPath(storage_path)
     return FileInfo(
         path=np.as_posix(),
         name=np.name,
-        is_dir=resource.is_collection,
+        kind=kind,
         size=resource.content_length or 0,
         modified=resource.last_modified,
         created=resource.creation_date,

@@ -1,3 +1,4 @@
+import errno
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from pathlib import Path, PurePosixPath
@@ -7,10 +8,20 @@ from urllib.parse import urlparse
 import anyio
 
 from app.log import escape_tag
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike, make_cache_identity
+from app.storage.abstract import (
+    AbstractStorage,
+    BytesLike,
+    EntryKind,
+    FileInfo,
+    PathLike,
+    StorageCapabilities,
+    UnsupportedOperationError,
+    WalkEntry,
+    make_cache_identity,
+)
 from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
-from .client import AsyncDavClient, DavClientError, DavConfig, DavHttpStatusError
+from .client import AsyncDavClient, DavClientError, DavConfig, DavHttpStatusError, DavResource
 from .utils import dav_resource_to_file_info, href_to_storage_path
 
 translator = ExceptionTranslator(
@@ -18,6 +29,13 @@ translator = ExceptionTranslator(
     catch=DavClientError,
     default=OSError,
 )
+
+_DAV_CAPABILITIES = StorageCapabilities()
+_UNSUPPORTED_ERRNO = getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)
+
+
+def _unsupported_entry(path: PathLike) -> UnsupportedOperationError:
+    return UnsupportedOperationError(_UNSUPPORTED_ERRNO, f"Unsupported WebDAV resource: {path}")
 
 
 @translator.handles(DavHttpStatusError)
@@ -35,10 +53,11 @@ def _(exc_group: ExceptionGroup[DavHttpStatusError], msg: str) -> OSError:
 class DavStorage(AbstractStorage):
     """WebDAV client storage backend.
 
-    Accesses a remote WebDAV server (Nextcloud, ownCloud, Apache mod_dav,
-    wsgidav, ...) via HTTP and exposes it as an :class:`AbstractStorage`.
-    Symmetric with :class:`S3Storage`: a self-built async HTTP client
-    (``client/``) wrapped by a storage adapter.
+    Core WebDAV exposes ordinary files and collections but has no standard
+    symlink inspection or creation primitives. Non-collection extension
+    resource types are treated as unsupported rather than regular files.
+    Servers that follow links and report only the resolved target remain
+    outside client-side detection; confinement then depends on the server.
     """
 
     _client: AsyncDavClient | None = None
@@ -66,6 +85,11 @@ class DavStorage(AbstractStorage):
             root_prefix=self._config.root_prefix,
             scheme=parsed.scheme,
         )
+
+    @property
+    @override
+    def capabilities(self) -> StorageCapabilities:
+        return _DAV_CAPABILITIES
 
     @property
     def _url_prefix(self) -> str:
@@ -144,7 +168,7 @@ class DavStorage(AbstractStorage):
         np = self.normalize_path(path)
         rel = self._remote_path(path)
         if rel == "":
-            return FileInfo(path=np.as_posix(), name="", is_dir=True, size=0)
+            return FileInfo(path=np.as_posix(), name="", kind=EntryKind.DIRECTORY, size=0)
 
         client = self._ensure_client()
         resources = await client.propfind(rel, depth=0)
@@ -170,7 +194,7 @@ class DavStorage(AbstractStorage):
             info = await self.stat(path)
         except FileNotFoundError:
             return False
-        return not info.is_dir
+        return info.kind is EntryKind.FILE
 
     @override
     @translator.wrap("Failed to check if path is a directory: {path}")
@@ -205,7 +229,7 @@ class DavStorage(AbstractStorage):
         except FileNotFoundError:
             pass
         else:
-            if not info.is_dir:
+            if info.kind is not EntryKind.DIRECTORY:
                 raise FileExistsError(f"Path is a file: {path}")
             if exist_ok:
                 return
@@ -229,30 +253,73 @@ class DavStorage(AbstractStorage):
             raise
         self.log.info(f"MkDir: <y>{escape_tag(rel)}</y>")
 
-    @override
-    @translator.wrap_agen("Failed to iterate directory {path}")
-    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
+    async def _raw_directory_entries(self, path: PathLike) -> tuple[tuple[DavResource, str], ...]:
         rel = self._remote_path(path)
-        client = self._ensure_client()
-        resources = await client.propfind(rel, depth=1)
+        resources = await self._ensure_client().propfind(rel, depth=1)
+        entries: list[tuple[DavResource, str]] = []
         for resource in resources:
             storage_path = href_to_storage_path(resource.href, self._url_prefix)
             if storage_path == rel or storage_path == "":
-                continue  # skip the collection itself
-            yield dav_resource_to_file_info(resource, storage_path)
+                continue
+            entries.append((resource, storage_path))
+        return tuple(entries)
+
+    async def _scan_directory(self, path: PathLike, *, strict: bool) -> tuple[FileInfo, ...]:
+        entries: list[FileInfo] = []
+        for resource, storage_path in await self._raw_directory_entries(path):
+            try:
+                entry = dav_resource_to_file_info(resource, storage_path)
+            except UnsupportedOperationError:
+                if strict:
+                    raise
+                self.log.debug(
+                    f"Skipping unsupported WebDAV resource <y>{escape_tag(storage_path)}</y>: "
+                    f"{resource.resource_types!r}"
+                )
+                continue
+            entries.append(entry)
+        return tuple(sorted(entries, key=lambda entry: entry.path))
+
+    async def _strict_walk_snapshot(self, path: PathLike, *, root: FileInfo | None = None) -> tuple[WalkEntry, ...]:
+        if root is None:
+            root = await self.stat(path)
+        if root.kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {path}")
+
+        pending = [self.normalize_path(path)]
+        snapshot: list[WalkEntry] = []
+        while pending:
+            current = pending.pop()
+            entries = await self._scan_directory(current, strict=True)
+            snapshot.append(WalkEntry(path=current.as_posix(), entries=entries))
+            directories = [entry for entry in entries if entry.kind is EntryKind.DIRECTORY]
+            pending.extend(PurePosixPath(entry.path) for entry in reversed(directories))
+        return tuple(snapshot)
+
+    @override
+    @translator.wrap_agen("Failed to iterate directory {path}")
+    async def iterdir(self, path: PathLike) -> AsyncIterator[FileInfo]:
+        for entry in await self._scan_directory(path, strict=False):
+            yield entry
 
     @override
     @translator.wrap_agen("Failed to walk directory {path}")
-    async def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
-        dirs: list[FileInfo] = []
-        files: list[FileInfo] = []
-        async for entry in self.iterdir(path):
-            (dirs if entry.is_dir else files).append(entry)
+    async def walk(self, path: PathLike) -> AsyncIterator[WalkEntry]:
+        root = await self.stat(path)
+        if root.kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {path}")
 
-        yield self.normalize_path(path).as_posix(), dirs, files
-        for dir in dirs:
-            async for sp, sd, sf in self.walk(dir.path):
-                yield sp, sd, sf
+        normalized = self.normalize_path(path)
+        entries = await self._scan_directory(normalized, strict=False)
+        yield WalkEntry(path=normalized.as_posix(), entries=entries)
+        for entry in entries:
+            if entry.kind is EntryKind.DIRECTORY:
+                async for child in self.walk(entry.path):
+                    yield child
+
+    @override
+    async def _is_dir_empty(self, path: PathLike) -> bool:
+        return not await self._raw_directory_entries(path)
 
     # ------------------------------------------------------------------
     # Upload / Download
@@ -273,8 +340,10 @@ class DavStorage(AbstractStorage):
         except FileNotFoundError:
             pass
         else:
-            if info.is_dir:
+            if info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Is a directory: {remote_path}")
+            if info.kind is not EntryKind.FILE:
+                raise _unsupported_entry(remote_path)
             if not overwrite:
                 raise FileExistsError(f"File already exists: {remote_path}")
 
@@ -305,8 +374,10 @@ class DavStorage(AbstractStorage):
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
         info = await self.stat(remote_path)
-        if info.is_dir:
+        if info.kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {remote_path}")
+        if info.kind is not EntryKind.FILE:
+            raise _unsupported_entry(remote_path)
         if info.size > 0 and offset >= info.size:
             return
 
@@ -334,8 +405,10 @@ class DavStorage(AbstractStorage):
                 raise
             return
 
-        if info.is_dir:
+        if info.kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {path}")
+        if info.kind is not EntryKind.FILE:
+            raise _unsupported_entry(path)
 
         self.log.info(f"Delete: <y>{escape_tag(rel)}</y>")
         await self._ensure_client().delete(rel)
@@ -351,7 +424,7 @@ class DavStorage(AbstractStorage):
             info = await self.stat(path)
         except FileNotFoundError:
             raise FileNotFoundError(f"Directory not found: {path}") from None
-        if not info.is_dir:
+        if info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {path}")
         if not await self._is_dir_empty(path):
             raise OSError(f"Directory not empty: {path}")
@@ -372,8 +445,10 @@ class DavStorage(AbstractStorage):
         except FileNotFoundError:
             return
 
-        if not info.is_dir:
+        if info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {path}")
+
+        await self._strict_walk_snapshot(path, root=info)
 
         self.log.info(f"RmTree: <y>{escape_tag(rel)}</y>")
         # WebDAV DELETE on a collection is naturally recursive.
@@ -462,8 +537,10 @@ class DavStorage(AbstractStorage):
             source_info = await self.stat(src)
         except FileNotFoundError:
             raise FileNotFoundError(f"Source not found: {src}") from None
-        if source_info.is_dir:
+        if source_info.kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {src}")
+        if source_info.kind is not EntryKind.FILE:
+            raise _unsupported_entry(src)
 
         dst_rel = self._remote_path(dst)
         if self.normalize_path(src) == self.normalize_path(dst):
@@ -526,8 +603,10 @@ class DavStorage(AbstractStorage):
             info = await self.stat(src)
         except FileNotFoundError:
             raise FileNotFoundError(f"Source not found: {src}") from None
-        if info.is_dir:
+        if info.kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {src}")
+        if info.kind is not EntryKind.FILE:
+            raise _unsupported_entry(src)
         if self.normalize_path(src) == self.normalize_path(dst):
             if not overwrite:
                 raise FileExistsError(f"Source and destination are the same: {src}")
@@ -555,10 +634,12 @@ class DavStorage(AbstractStorage):
             info = await self.stat(src)
         except FileNotFoundError:
             raise NotADirectoryError(f"Not a directory: {src}") from None
-        if not info.is_dir:
+        if info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
         if not overwrite and await self.exists(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
+
+        snapshot = await self._strict_walk_snapshot(src_np, root=info)
 
         client = self._ensure_client()
         self.log.info(f"CopyTree: <y>{escape_tag(src_np.as_posix())}</y> → <y>{escape_tag(dst_np.as_posix())}</y>")
@@ -578,7 +659,7 @@ class DavStorage(AbstractStorage):
         else:
             return
 
-        await self._copytree_fallback(src_np, dst_np, overwrite)
+        await self._copytree_fallback(src_np, dst_np, overwrite, snapshot=snapshot)
 
     @override
     @translator.wrap("Failed to move tree {src} → {dst} (overwrite={overwrite})")
@@ -587,10 +668,12 @@ class DavStorage(AbstractStorage):
             info = await self.stat(src)
         except FileNotFoundError:
             raise NotADirectoryError(f"Not a directory: {src}") from None
-        if not info.is_dir:
+        if info.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
         if not overwrite and await self.exists(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
+
+        await self._strict_walk_snapshot(src, root=info)
 
         client = self._ensure_client()
         await self.mkdir(self.normalize_path(dst).parent.as_posix(), parents=True, exist_ok=True)
@@ -608,10 +691,23 @@ class DavStorage(AbstractStorage):
             await self.copytree(src, dst, overwrite=overwrite)
             await self.rmtree(src)
 
-    async def _copytree_fallback(self, src_np: PurePosixPath, dst_np: PurePosixPath, overwrite: bool) -> None:
+    async def _copytree_fallback(
+        self,
+        src_np: PurePosixPath,
+        dst_np: PurePosixPath,
+        overwrite: bool,
+        *,
+        snapshot: tuple[WalkEntry, ...] | None = None,
+    ) -> None:
         """Walk-and-copy fallback with per-target destination backups."""
         client = self._ensure_client()
         _ = overwrite
+        if snapshot is None:
+            snapshot = await self._strict_walk_snapshot(src_np)
+        for walk_entry in snapshot:
+            for entry in walk_entry.entries:
+                if entry.kind not in {EntryKind.FILE, EntryKind.DIRECTORY}:
+                    raise _unsupported_entry(entry.path)
         backups: dict[PurePosixPath, PurePosixPath] = {}
         created: set[PurePosixPath] = set()
         created_dirs: set[PurePosixPath] = set()
@@ -624,8 +720,10 @@ class DavStorage(AbstractStorage):
             except FileNotFoundError:
                 created.add(path)
                 return
-            if info.is_dir:
+            if info.kind is EntryKind.DIRECTORY:
                 return
+            if info.kind is not EntryKind.FILE:
+                raise _unsupported_entry(path)
             backup = PurePosixPath(f"{path.as_posix()}.storegate-copytree-backup-{uuid.uuid4().hex}")
             await client.move(self._remote_path(path), self._remote_path(backup), overwrite=False)
             backups[path] = backup
@@ -634,18 +732,18 @@ class DavStorage(AbstractStorage):
             if not await self.exists(dst_np):
                 await self.mkdir(dst_np.as_posix(), parents=True, exist_ok=False)
                 created_dirs.add(dst_np)
-            async for current, directories, files in self.walk(src_np):
-                relative = PurePosixPath(current).relative_to(src_np)
+            for walk_entry in snapshot:
+                relative = PurePosixPath(walk_entry.path).relative_to(src_np)
                 target_dir = dst_np if relative == PurePosixPath(".") else dst_np / relative
-                for directory in directories:
+                for directory in (entry for entry in walk_entry.entries if entry.kind is EntryKind.DIRECTORY):
                     target = target_dir / directory.name
                     if not await self.exists(target):
                         await self.mkdir(target.as_posix(), parents=True, exist_ok=False)
                         created_dirs.add(target)
-                for file in files:
+                for file in (entry for entry in walk_entry.entries if entry.kind is EntryKind.FILE):
                     target = target_dir / file.name
                     await stage_target(target)
-                    await self.copy(PurePosixPath(file.path).as_posix(), target.as_posix(), overwrite=True)
+                    await self.copy(file.path, target.as_posix(), overwrite=True)
         except BaseException as primary:
             rollback_errors: list[BaseException] = []
             with anyio.CancelScope(shield=True):

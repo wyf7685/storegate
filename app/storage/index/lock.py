@@ -15,6 +15,8 @@ from app.storage import AbstractStorage
 from app.storage.abstract import PathLike
 from app.utils import logger_wrapper
 
+from ._guard import download_private_file, lstat_private_entry, lstat_private_entry_or_none
+
 if TYPE_CHECKING:
     from .storage import IndexStorage
 
@@ -72,7 +74,7 @@ class StorageFileLocker:
 
     async def _release_lock_locked(self, storage: AbstractStorage, lock_path: PathLike, lease: LockLease) -> None:
         try:
-            current = await storage.download_bytes(lock_path)
+            current = await download_private_file(storage, lock_path, label="lock file")
             data = json.loads(current.decode())
             if data.get("owner") != lease.owner:
                 self.log.warning(f"Lock <y>{escape_tag(lock_path)}</y> owner changed; leaving it intact")
@@ -80,7 +82,7 @@ class StorageFileLocker:
             # The storage contract has no conditional delete. Re-reading immediately before
             # unlink minimizes the takeover race, but another process can still replace the
             # lock after this check and before unlink.
-            if await storage.download_bytes(lock_path) != current:
+            if await download_private_file(storage, lock_path, label="lock file") != current:
                 self.log.warning(f"Lock <y>{escape_tag(lock_path)}</y> changed; leaving it intact")
                 return
             await storage.unlink(lock_path, missing_ok=True)
@@ -99,7 +101,7 @@ class StorageFileLocker:
             try:
                 with anyio.fail_after(self.lock_timeout):
                     async with self.local_lock_guard(key):
-                        current = await lease.storage.download_bytes(lease.path)
+                        current = await download_private_file(lease.storage, lease.path, label="lock file")
                         data = json.loads(current.decode())
                         if data.get("owner") != lease.owner:
                             raise LockLeaseLostError(f"Storage lock ownership lost during renewal: {lease.path}")
@@ -110,7 +112,7 @@ class StorageFileLocker:
                         data["expires"] = expires.isoformat()
                         payload = json.dumps(data, separators=(",", ":")).encode()
                         # A second read is the best ownership proof available without CAS.
-                        if await lease.storage.download_bytes(lease.path) != current:
+                        if await download_private_file(lease.storage, lease.path, label="lock file") != current:
                             raise LockLeaseLostError(f"Storage lock ownership changed during renewal: {lease.path}")
                         await lease.storage.upload_bytes(payload, lease.path, overwrite=True)
                         lease = dataclasses.replace(lease, expires=expires)
@@ -162,7 +164,8 @@ class StorageFileLocker:
             try:
                 with anyio.fail_after(remaining):
                     async with self.local_lock_guard(key):
-                        if not await storage.exists(lock_path):
+                        lock_info = await lstat_private_entry_or_none(storage, lock_path, label="lock file")
+                        if lock_info is None:
                             owner = uuid.uuid4().hex
                             handoff_timeout = deadline - anyio.current_time()
                             if handoff_timeout <= 0:
@@ -189,7 +192,7 @@ class StorageFileLocker:
                                 return lease
                         else:
                             try:
-                                lock_bytes = await storage.download_bytes(lock_path)
+                                lock_bytes = await download_private_file(storage, lock_path, label="lock file")
                             except FileNotFoundError:
                                 lock_bytes = None
                             if lock_bytes is not None:
@@ -198,7 +201,7 @@ class StorageFileLocker:
                                     stale = datetime.fromisoformat(lock_data["expires"]) <= datetime.now(UTC)
                                 except KeyError, TypeError, ValueError, UnicodeDecodeError:
                                     try:
-                                        info = await storage.stat(lock_path)
+                                        info = await lstat_private_entry(storage, lock_path, label="lock file")
                                         stale = (
                                             info.modified is not None
                                             and (datetime.now(UTC) - info.modified).total_seconds() >= self.lock_lease
@@ -209,7 +212,10 @@ class StorageFileLocker:
                                     # The equality check narrows, but cannot eliminate, the
                                     # final cross-process replace-before-unlink race without CAS.
                                     try:
-                                        if await storage.download_bytes(lock_path) == lock_bytes:
+                                        if (
+                                            await download_private_file(storage, lock_path, label="lock file")
+                                            == lock_bytes
+                                        ):
                                             await storage.unlink(lock_path, missing_ok=True)
                                     except FileNotFoundError:
                                         pass

@@ -10,7 +10,15 @@ import anyio
 import anyio.lowlevel
 
 from app.log import escape_tag
-from app.storage.abstract import AbstractStorage, BytesLike, FileInfo, PathLike, make_cache_identity
+from app.storage.abstract import (
+    AbstractStorage,
+    BytesLike,
+    EntryKind,
+    FileInfo,
+    PathLike,
+    WalkEntry,
+    make_cache_identity,
+)
 from app.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
 from .client import (
@@ -158,7 +166,7 @@ class S3Storage(AbstractStorage):
         except FileNotFoundError:
             pass
         else:
-            if info.is_dir:
+            if info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Is a directory: {remote_path}")
             if not overwrite:
                 raise FileExistsError(f"File already exists: {remote_path}")
@@ -457,7 +465,7 @@ class S3Storage(AbstractStorage):
         info = FileInfo(
             path=np.as_posix(),
             name=np.name,
-            is_dir=True,
+            kind=EntryKind.DIRECTORY,
             size=0,
             modified=now,
             created=now,
@@ -478,9 +486,11 @@ class S3Storage(AbstractStorage):
         # 先收集再删除：避免删除操作干扰 walk 的 list_objects 分页迭代
         file_keys: list[str] = []
         dir_paths: list[str] = []
-        async for _sp, _sd, sf in self.walk(path):
-            file_keys.extend(self._remote_path_to_key(f.path) for f in sf)
-            dir_paths.extend(d.path for d in _sd)
+        async for walked in self.walk(path):
+            file_keys.extend(
+                self._remote_path_to_key(entry.path) for entry in walked.entries if entry.kind is EntryKind.FILE
+            )
+            dir_paths.extend(entry.path for entry in walked.entries if entry.kind is EntryKind.DIRECTORY)
 
         # 批量删除文件
         deleted_files = 0
@@ -612,9 +622,13 @@ class S3Storage(AbstractStorage):
         # walk 收集源树所有文件和目录
         file_paths: list[PurePosixPath] = []
         dir_paths: list[PurePosixPath] = []
-        async for _sp, _sd, sf in self.walk(src):
-            file_paths.extend(self.normalize_path(f.path) for f in sf)
-            dir_paths.extend(self.normalize_path(d.path) for d in _sd)
+        async for walked in self.walk(src):
+            file_paths.extend(
+                self.normalize_path(entry.path) for entry in walked.entries if entry.kind is EntryKind.FILE
+            )
+            dir_paths.extend(
+                self.normalize_path(entry.path) for entry in walked.entries if entry.kind is EntryKind.DIRECTORY
+            )
 
         self.log.info(
             f"CopyTree: <y>{escape_tag(src)}</y> → <y>{escape_tag(dst)}</y> "
@@ -640,7 +654,7 @@ class S3Storage(AbstractStorage):
                     info = FileInfo(
                         path=directory.as_posix(),
                         name=directory.name,
-                        is_dir=True,
+                        kind=EntryKind.DIRECTORY,
                         size=0,
                         modified=dir_created,
                         created=dir_created,
@@ -677,22 +691,11 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to check existence of {path}")
     async def exists(self, path: PathLike) -> bool:
-        key = self._remote_path_to_key(path)
-        if key == "":
-            return True  # 根目录始终存在
-
-        client = self._ensure_client()
-
-        # 文件
-        if await client.head_object(key=key) is not None:
-            return True
-
-        # 目录标记
-        dir_key = self._dir_key(path)
-        if dir_key is not None and await client.head_object(key=dir_key) is not None:  # noqa: SIM103
-            return True
-
-        return False
+        try:
+            await self.stat(path)
+        except FileNotFoundError:
+            return False
+        return True
 
     @override
     @translator.wrap("Failed to check if path is a file: {path}")
@@ -704,14 +707,11 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to check if path is a directory: {path}")
     async def is_dir(self, path: PathLike) -> bool:
-        key = self._remote_path_to_key(path)
-        if key == "":
-            return True  # 根目录始终为目录
-
-        dir_key = self._dir_key(path)
-        if dir_key is None:  # pragma: no cover
+        try:
+            info = await self.stat(path)
+        except FileNotFoundError:
             return False
-        return await self._ensure_client().head_object(key=dir_key) is not None
+        return info.kind is EntryKind.DIRECTORY
 
     @override
     @translator.wrap("Failed to stat {path}")
@@ -722,7 +722,7 @@ class S3Storage(AbstractStorage):
 
         # 根目录：不需要 S3 请求
         if key == "":
-            return FileInfo(path=np.as_posix(), name="", is_dir=True, size=0)
+            return FileInfo(path=np.as_posix(), name="", kind=EntryKind.DIRECTORY, size=0)
 
         # 1. 尝试作为常规文件
         head = await client.head_object(key=key)
@@ -730,8 +730,8 @@ class S3Storage(AbstractStorage):
             return FileInfo(
                 path=np.as_posix(),
                 name=np.name,
+                kind=EntryKind.FILE,
                 size=head.content_length,
-                is_dir=False,
                 modified=head.last_modified,
             )
 
@@ -753,9 +753,16 @@ class S3Storage(AbstractStorage):
 
     @override
     @translator.wrap_agen("Failed to walk directory {path}")
-    def walk(self, path: PathLike) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
+    async def walk(self, path: PathLike) -> AsyncIterator[WalkEntry]:
         key = self._remote_path_to_key(path)
-        return self._walk(key)
+        try:
+            info = await self.lstat(path)
+        except FileNotFoundError:
+            raise NotADirectoryError(f"Not a directory: {path}") from None
+        if info.kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {path}")
+        async for entry in self._walk(key):
+            yield entry
 
     async def _iterdir(self, key: str) -> AsyncIterator[FileInfo]:
         client = self._ensure_client()
@@ -784,21 +791,18 @@ class S3Storage(AbstractStorage):
             yield FileInfo(
                 path=self.normalize_path(obj.key).as_posix(),
                 name=rest,
-                is_dir=False,
+                kind=EntryKind.FILE,
                 size=obj.size,
                 modified=obj.last_modified,
             )
 
-    async def _walk(self, key: str) -> AsyncIterator[tuple[str, list[FileInfo], list[FileInfo]]]:
-        dirs: list[FileInfo] = []
-        files: list[FileInfo] = []
-        async for file in self._iterdir(key):
-            (dirs if file.is_dir else files).append(file)
-
-        yield self.normalize_path(key).as_posix(), dirs, files
-        for dir in dirs:
-            async for sp, sd, sf in self._walk(dir.path):
-                yield sp, sd, sf
+    async def _walk(self, key: str) -> AsyncIterator[WalkEntry]:
+        entries = tuple(sorted([entry async for entry in self._iterdir(key)], key=lambda entry: entry.path))
+        yield WalkEntry(path=self.normalize_path(key).as_posix(), entries=entries)
+        for entry in entries:
+            if entry.kind is EntryKind.DIRECTORY:
+                async for walked in self._walk(entry.path):
+                    yield walked
 
     @override
     @translator.wrap("Failed to list directory {path}")
@@ -835,7 +839,7 @@ class S3Storage(AbstractStorage):
                     FileInfo(
                         path=self.normalize_path(obj.key).as_posix(),
                         name=rest,
-                        is_dir=False,
+                        kind=EntryKind.FILE,
                         size=obj.size,
                         modified=obj.last_modified,
                     )

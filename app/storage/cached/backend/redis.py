@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, final, override
 
-from app.storage.abstract import FileInfo
+from app.storage.abstract import EntryKind, FileInfo
 
 from .base import CacheBackend
 
@@ -25,42 +25,25 @@ def _bytes_to_bool(v: bytes | None) -> bool | None:
 
 
 def _file_info_to_json(info: FileInfo) -> bytes:
-    data: dict[str, object] = {
-        "path": info.path,
-        "name": info.name,
-        "is_dir": info.is_dir,
-        "size": info.size,
-    }
-    if info.modified is not None:
-        data["modified"] = info.modified.isoformat()
-    if info.created is not None:
-        data["created"] = info.created.isoformat()
-    return json.dumps(data, separators=(",", ":")).encode()
+    return json.dumps(_file_info_to_json_plain(info), separators=(",", ":")).encode()
 
 
 def _json_to_file_info(raw: bytes) -> FileInfo:
     obj = json.loads(raw.decode())
-    modified = datetime.fromisoformat(obj["modified"]) if "modified" in obj else None
-    created = datetime.fromisoformat(obj["created"]) if "created" in obj else None
-    return FileInfo(
-        path=obj.get("path", ""),
-        name=obj.get("name", ""),
-        is_dir=obj.get("is_dir", False),
-        size=obj.get("size", 0),
-        modified=modified,
-        created=created,
-    )
+    if not isinstance(obj, dict):
+        raise TypeError("FileInfo JSON must be an object")
+    return _json_to_file_info_from_dict(obj)
 
 
 def _file_info_list_to_json(infos: list[FileInfo]) -> bytes:
-    return json.dumps([_file_info_to_json_plain(fi) for fi in infos], separators=(",", ":")).encode()
+    return json.dumps([_file_info_to_json_plain(info) for info in infos], separators=(",", ":")).encode()
 
 
 def _file_info_to_json_plain(info: FileInfo) -> dict[str, object]:
     data: dict[str, object] = {
         "path": info.path,
         "name": info.name,
-        "is_dir": info.is_dir,
+        "kind": info.kind.value,
         "size": info.size,
     }
     if info.modified is not None:
@@ -72,16 +55,21 @@ def _file_info_to_json_plain(info: FileInfo) -> dict[str, object]:
 
 def _json_to_file_info_list(raw: bytes) -> list[FileInfo]:
     items = json.loads(raw.decode())
+    if not isinstance(items, list):
+        raise TypeError("FileInfo list JSON must be an array")
+    if not all(isinstance(item, dict) for item in items):
+        raise TypeError("FileInfo list entries must be objects")
     return [_json_to_file_info_from_dict(item) for item in items]
 
 
 def _json_to_file_info_from_dict(obj: dict[str, Any]) -> FileInfo:
+    kind = EntryKind(obj["kind"])
     modified = datetime.fromisoformat(obj["modified"]) if "modified" in obj else None
     created = datetime.fromisoformat(obj["created"]) if "created" in obj else None
     return FileInfo(
         path=obj.get("path", ""),
         name=obj.get("name", ""),
-        is_dir=obj.get("is_dir", False),
+        kind=kind,
         size=obj.get("size", 0),
         modified=modified,
         created=created,
@@ -92,10 +80,10 @@ def _json_to_file_info_from_dict(obj: dict[str, Any]) -> FileInfo:
 class RedisCacheBackend(CacheBackend):
     """Redis-backed cache backend using :mod:`redis.asyncio`.
 
-    Each namespace is stored below a storage-specific prefix.  With the
-    default ``key_prefix="auto"``, :meth:`bind_storage` derives
-    ``storegate:v1:{sha256}:{namespace}:{key}`` from the wrapped storage's
-    stable, non-secret cache identity.  Per-key TTL is set via ``SET … EX``.
+    Each namespace is stored below a storage-specific prefix. With the default
+    ``key_prefix="auto"``, :meth:`bind_storage` derives
+    ``storegate:v2:{sha256}:{namespace}:{key}`` from the wrapped storage's
+    stable, non-secret cache identity. Per-key TTL is set via ``SET … EX``.
 
     Parameters
     ----------
@@ -176,7 +164,7 @@ class RedisCacheBackend(CacheBackend):
         if identity is None:
             raise ValueError("RedisCacheBackend requires a stable cache identity when key_prefix='auto'")
 
-        instance_prefix = f"{self._PREFIX}:v1:{hashlib.sha256(identity.encode()).hexdigest()}"
+        instance_prefix = f"{self._PREFIX}:v2:{hashlib.sha256(identity.encode()).hexdigest()}"
         if self._bound_identity is not None and self._bound_identity != identity:
             raise ValueError("RedisCacheBackend cannot be bound to multiple storage identities")
         self._bound_identity = identity
@@ -291,9 +279,9 @@ class RedisCacheBackend(CacheBackend):
 
 def _serializers_for(ns: str) -> tuple[Callable[[Any], bytes], Callable[[bytes], Any]]:
     """Return ``(serializer, deserializer)`` for *ns*."""
-    if ns in ("exists", "is_file", "is_dir"):
+    if ns in ("exists", "is_file", "is_dir", "is_symlink"):
         return _bool_to_bytes, _bytes_to_bool
-    if ns == "stat":
+    if ns in ("stat", "lstat"):
         return _file_info_to_json, _json_to_file_info
     if ns == "iterdir":
         return _file_info_list_to_json, _json_to_file_info_list

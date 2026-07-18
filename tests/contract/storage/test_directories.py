@@ -4,7 +4,7 @@ import contextlib
 
 import pytest
 
-from app.storage import AbstractStorage
+from app.storage import AbstractStorage, EntryKind, WalkEntry
 from tests.support.ids import uid
 
 
@@ -187,9 +187,10 @@ class TestWalk:
 
             all_files: set[str] = set()
             dir_count = 0
-            async for _sp, _sd, sf in storage.walk(base):
+            async for walk_entry in storage.walk(base):
+                assert isinstance(walk_entry, WalkEntry)
                 dir_count += 1
-                all_files.update(f.name for f in sf)
+                all_files.update(entry.name for entry in walk_entry.entries if entry.kind is EntryKind.FILE)
 
             # Should have at least base + d1 + d2 directories
             assert dir_count >= 3
@@ -210,12 +211,14 @@ class TestWalk:
             await storage.mkdir(f"{base}/sub", parents=True)
             await storage.upload_bytes(b"x", f"{base}/f.txt")
 
-            async for root_path, dirs, files in storage.walk(base):
-                assert root_path.startswith("/"), f"Walk root path must be absolute, got {root_path!r}"
-                for d in dirs:
-                    assert d.path.startswith("/"), f"Dir path must be absolute, got {d.path!r}"
-                for f in files:
-                    assert f.path.startswith("/"), f"File path must be absolute, got {f.path!r}"
+            async for walk_entry in storage.walk(base):
+                assert isinstance(walk_entry, WalkEntry)
+                assert walk_entry.path.startswith("/"), f"Walk root path must be absolute, got {walk_entry.path!r}"
+                assert tuple(entry.path for entry in walk_entry.entries) == tuple(
+                    sorted(entry.path for entry in walk_entry.entries)
+                )
+                for entry in walk_entry.entries:
+                    assert entry.path.startswith("/"), f"Entry path must be absolute, got {entry.path!r}"
         finally:
             await storage.rmtree(base)
 
@@ -227,12 +230,14 @@ class TestWalk:
             await storage.upload_bytes(b"x", f"{path}/f.txt")
 
             found = False
-            async for sp, sd, _sf in storage.walk("/"):
-                assert sp.startswith("/"), f"Root path must be absolute, got {sp!r}"
-                for d in sd:
-                    if d.name == path:
+            async for walk_entry in storage.walk("/"):
+                assert isinstance(walk_entry, WalkEntry)
+                assert walk_entry.path.startswith("/"), f"Root path must be absolute, got {walk_entry.path!r}"
+                for entry in walk_entry.entries:
+                    if entry.name == path:
                         found = True
-                        assert d.is_dir
+                        assert entry.kind is EntryKind.DIRECTORY
+                        assert (entry.is_file, entry.is_dir, entry.is_symlink) == (False, True, False)
             assert found, f"{path!r} not found in root walk"
         finally:
             await storage.rmtree(path)

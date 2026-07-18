@@ -5,7 +5,23 @@ from typing import override
 
 import anyio
 
-from app.storage import AbstractStorage
+from app.storage import AbstractStorage, EntryKind
+
+
+async def _guard_not_symlink(
+    storage: AbstractStorage,
+    path: PurePosixPath,
+    *,
+    missing_ok: bool = False,
+) -> None:
+    try:
+        info = await storage.lstat(path)
+    except FileNotFoundError:
+        if missing_ok:
+            return
+        raise
+    if info.kind is EntryKind.SYMLINK:
+        raise FileNotFoundError(f"File unavailable: {path}")
 
 
 class FileHandle(ABC):
@@ -55,6 +71,7 @@ class ReadHandle(FileHandle):
         if self.closed:
             raise ValueError("I/O operation on closed file.")
         if self.agen is None:
+            await _guard_not_symlink(self.storage, self.path)
             self.agen = self.storage.download_stream(self.path, offset=self.offset)
 
         while len(self.buffer) < size:
@@ -102,6 +119,7 @@ class WriteHandle(FileHandle):
         raise OSError("Read operation is not supported for WriteHandle")
 
     async def _writer(self) -> None:
+        await _guard_not_symlink(self.storage, self.path, missing_ok=True)
         async with self.recv as stream:
             await self.storage.upload_stream(stream, self.path)
 
@@ -125,5 +143,6 @@ class WriteHandle(FileHandle):
         if self.task_group is not None:
             await self.task_group.__aexit__(None, None, None)
         else:
-            # Create an empty file if no data was written
+            # Create an empty file if no data was written.
+            await _guard_not_symlink(self.storage, self.path, missing_ok=True)
             await self.storage.upload_bytes(b"", self.path)

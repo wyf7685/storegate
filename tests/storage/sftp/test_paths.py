@@ -1,5 +1,8 @@
+from pathlib import PurePosixPath
+
 import pytest
 
+from app.storage import EntryKind
 from app.storage.sftp import SFTPStorage
 from tests.fixtures.protocol_servers import SFTPServerInfo
 from tests.storage.sftp.test_lifecycle import make_config
@@ -19,8 +22,10 @@ async def test_paths_metadata_listing_and_walk(sftp_server: SFTPServerInfo) -> N
         assert await storage.is_file(f"{root}/a/file.txt")
         assert [item.name async for item in storage.iterdir(root)] == ["a", "b"]
         walked = [item async for item in storage.walk(root)]
-        assert [current for current, _, _ in walked] == [root, f"{root}/a", f"{root}/b"]
+        assert [item.path for item in walked] == [root, f"{root}/a", f"{root}/b"]
+        assert [[entry.name for entry in item.entries] for item in walked] == [["a", "b"], ["file.txt"], []]
         file_info = await storage.stat(f"{root}/a/file.txt")
+        assert file_info.kind is EntryKind.FILE
         assert file_info.size == 7
         assert file_info.modified is not None
         await storage.rmtree(root)
@@ -34,9 +39,13 @@ async def test_rejects_unsafe_paths(sftp_server: SFTPServerInfo, path: str) -> N
             await storage.exists(path)
 
 
-def test_identity_excludes_secrets(sftp_server: SFTPServerInfo) -> None:
+def test_identity_excludes_secrets_and_uses_configured_root(sftp_server: SFTPServerInfo) -> None:
     storage = SFTPStorage(make_config(sftp_server))
-    assert storage.id == f"sftp:{sftp_server.username}@{sftp_server.host}:{sftp_server.port}/"
+    expected_id = f"sftp:{sftp_server.username}@{sftp_server.host}:{sftp_server.port}{sftp_server.root_prefix}"
+    assert storage.id == expected_id
     assert sftp_server.password not in storage.id
     assert sftp_server.password not in storage.cache_identity
     assert str(sftp_server.known_hosts) not in storage.cache_identity
+    identity = storage.cache_identity
+    storage._canonical_root = PurePosixPath("/different-canonical-root")
+    assert storage.cache_identity == identity

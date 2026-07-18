@@ -72,8 +72,12 @@ class DavResource:
     """A single ``<D:response>`` element from a WebDAV PROPFIND multistatus body."""
 
     href: str
-    is_collection: bool
+    resource_types: tuple[str, ...]
     content_length: int | None
     last_modified: datetime | None
     creation_date: datetime | None
     display_name: str | None
+
+    @property
+    def is_collection(self) -> bool:
+        return "{DAV:}collection" in self.resource_types

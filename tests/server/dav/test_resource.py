@@ -11,7 +11,8 @@ from pytest_mock import MockerFixture
 
 from app.server.dav.resource import ResourceReader, ResourceWriter, StorageResource
 from app.server.dav.utils import current_event_loop_token
-from app.storage.memory import MemoryStorage
+
+from ._storage import SymlinkTrapStorage
 
 
 @pytest.fixture
@@ -27,8 +28,8 @@ pytestmark = pytest.mark.usefixtures("dav_thread_bridge")
 
 
 async def test_reader_seek_buffer_close_and_closed_state() -> None:
-    storage = MemoryStorage("/")
-    await storage.upload_bytes(b"abcdef", "/file.bin")
+    storage = SymlinkTrapStorage()
+    storage.files["/file.bin"] = b"abcdef"
     reader = ResourceReader(storage, "/file.bin")
     reader.seek(1)
 
@@ -44,8 +45,8 @@ async def test_reader_seek_buffer_close_and_closed_state() -> None:
 
 
 async def test_reader_negative_size_reads_to_eof_and_zero_is_non_consuming() -> None:
-    storage = MemoryStorage("/")
-    await storage.upload_bytes(b"abcdef", "/file.bin")
+    storage = SymlinkTrapStorage()
+    storage.files["/file.bin"] = b"abcdef"
 
     reader = ResourceReader(storage, "/file.bin")
     assert await anyio.to_thread.run_sync(reader.read, 0) == b""
@@ -58,8 +59,8 @@ async def test_reader_negative_size_reads_to_eof_and_zero_is_non_consuming() -> 
 
 
 async def test_reader_seek_then_negative_size_reads_remaining_file() -> None:
-    storage = MemoryStorage("/")
-    await storage.upload_bytes(b"abcdef", "/file.bin")
+    storage = SymlinkTrapStorage()
+    storage.files["/file.bin"] = b"abcdef"
     reader = ResourceReader(storage, "/file.bin")
     reader.seek(3)
 
@@ -108,27 +109,28 @@ async def test_writer_abort_cancels_active_upload() -> None:
     await anyio.to_thread.run_sync(writer.close)
 
 
-def test_storage_resource_write_state_transitions(mocker: MockerFixture) -> None:
-    storage = MemoryStorage("/")
+async def test_storage_resource_write_state_transitions(mocker: MockerFixture) -> None:
+    storage = SymlinkTrapStorage()
+    storage.files["/file.bin"] = b"original"
     resource = StorageResource("/file.bin", {"wsgidav.provider": MagicMock()}, storage)
     writer = MagicMock(spec=ResourceWriter)
     writer_cls = mocker.patch("app.server.dav.resource.ResourceWriter", return_value=writer)
 
     with pytest.raises(RuntimeError, match="No write operation"):
-        resource.end_write(with_errors=False)
+        await anyio.to_thread.run_sync(lambda: resource.end_write(with_errors=False))
 
-    assert resource.begin_write() is writer
+    assert await anyio.to_thread.run_sync(resource.begin_write) is writer
     writer.start.assert_called_once_with()
     writer_cls.assert_called_once()
     with pytest.raises(RuntimeError, match="already in progress"):
-        resource.begin_write()
+        await anyio.to_thread.run_sync(resource.begin_write)
 
-    resource.end_write(with_errors=True)
+    await anyio.to_thread.run_sync(lambda: resource.end_write(with_errors=True))
     writer.abort.assert_called_once_with()
     writer.close.assert_called_once_with()
 
     writer.reset_mock()
-    resource.begin_write()
-    resource.end_write(with_errors=False)
+    await anyio.to_thread.run_sync(resource.begin_write)
+    await anyio.to_thread.run_sync(lambda: resource.end_write(with_errors=False))
     writer.abort.assert_not_called()
     writer.close.assert_called_once_with()

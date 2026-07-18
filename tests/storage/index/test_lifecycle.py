@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.storage.abstract import BytesLike, PathLike
+from app.storage.abstract import BytesLike, EntryKind, FileInfo, PathLike
 from app.storage.ftp import FTPConfig, FTPStorage
 from app.storage.index import IndexStorage
 from app.storage.index.storage import CHUNKS_INDEX_FILE
@@ -21,6 +21,15 @@ class FailingDownloadStorage(MemoryStorage):  # ty: ignore[subclass-of-final-cla
 
     async def close(self) -> None:
         self.close_calls += 1
+
+    async def lstat(self, path: PathLike) -> FileInfo:
+        if self.fail_download and self.normalize_path(path).as_posix() == CHUNKS_INDEX_FILE:
+            return FileInfo(
+                path=CHUNKS_INDEX_FILE,
+                name=CHUNKS_INDEX_FILE.removeprefix("/"),
+                kind=EntryKind.FILE,
+            )
+        return await super().lstat(path)
 
     async def download_bytes(self, remote_path: PathLike) -> bytes:
         if self.fail_download:
@@ -78,6 +87,15 @@ class RollbackStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
         if self.close_failures:
             self.close_failures -= 1
             raise OSError(f"{self.label} rollback close failed")
+
+    async def lstat(self, path: PathLike) -> FileInfo:
+        if self.read_error is not None and self.normalize_path(path).as_posix() == CHUNKS_INDEX_FILE:
+            return FileInfo(
+                path=CHUNKS_INDEX_FILE,
+                name=CHUNKS_INDEX_FILE.removeprefix("/"),
+                kind=EntryKind.FILE,
+            )
+        return await super().lstat(path)
 
     async def download_bytes(self, remote_path: PathLike) -> bytes:
         if self.read_error is not None:
@@ -141,9 +159,19 @@ async def test_ftp_chunks_pool_is_recreated_after_index_binding_rollback(monkeyp
     monkeypatch.setattr(ftp, "_new_pool", lambda: replacement_pool)
     monkeypatch.setattr(
         ftp,
-        "download_bytes",
-        AsyncMock(side_effect=[RuntimeError("binding read failed"), FileNotFoundError]),
+        "lstat",
+        AsyncMock(
+            side_effect=[
+                FileInfo(
+                    path=CHUNKS_INDEX_FILE,
+                    name=CHUNKS_INDEX_FILE.removeprefix("/"),
+                    kind=EntryKind.FILE,
+                ),
+                FileNotFoundError(),
+            ]
+        ),
     )
+    monkeypatch.setattr(ftp, "download_bytes", AsyncMock(side_effect=RuntimeError("binding read failed")))
     monkeypatch.setattr(ftp, "upload_bytes", AsyncMock())
     storage = IndexStorage(MemoryStorage("/"), ftp)
 

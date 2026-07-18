@@ -8,7 +8,14 @@ from wsgidav.dav_provider import DAVNonCollection
 
 from app.storage import AbstractStorage, FileInfo
 
-from .utils import NativeHandlerResult, call_with_catch, current_event_loop_token, run_async
+from .utils import (
+    NativeHandlerResult,
+    call_with_catch,
+    current_event_loop_token,
+    reject_hidden_destination,
+    require_visible_file,
+    run_async,
+)
 
 
 class DAVReader(Protocol):  # pragma: no cover
@@ -41,6 +48,8 @@ class ResourceReader:
         self._read_started = True
         if size == 0:
             return b""
+        if self._agen is None:
+            await require_visible_file(self._storage, self._path)
         if self._agen is None:
             self._agen = self._storage.download_stream(self._path, offset=self._offset)
 
@@ -149,7 +158,7 @@ class StorageResource(DAVNonCollection):
 
     def _get_file_info(self) -> FileInfo:
         if self._info is None:
-            self._info = run_async(self._storage.stat, self.path)
+            self._info = run_async(require_visible_file, self._storage, self.path)
         return self._info
 
     @override
@@ -191,20 +200,20 @@ class StorageResource(DAVNonCollection):
 
     @override
     def get_content(self) -> DAVReader:
+        run_async(require_visible_file, self._storage, self.path)
         return ResourceReader(self._storage, self.path)
+
+    async def _upload_visible(self, stream: AsyncIterable[bytes]) -> None:
+        await require_visible_file(self._storage, self.path)
+        await self._storage.upload_stream(stream, remote_path=self.path, overwrite=True)
 
     @override
     def begin_write(self, *, content_type: object = None) -> DAVWriter:
         if self._writer is not None:
             raise RuntimeError("Write operation already in progress.")
 
-        self._writer = ResourceWriter(
-            functools.partial(
-                self._storage.upload_stream,
-                remote_path=self.path,
-                overwrite=True,
-            )
-        )
+        run_async(require_visible_file, self._storage, self.path)
+        self._writer = ResourceWriter(self._upload_visible)
         self._writer.start()
         return self._writer
 
@@ -217,20 +226,36 @@ class StorageResource(DAVNonCollection):
         self._writer.close()
         self._writer = None
 
+    async def _delete_visible(self) -> None:
+        await require_visible_file(self._storage, self.path)
+        await self._storage.unlink(self.path, missing_ok=False)
+
+    async def _copy_visible(self, dest_path: str) -> None:
+        await require_visible_file(self._storage, self.path)
+        await reject_hidden_destination(self._storage, dest_path)
+        await self._storage.copy(self.path, dest_path)
+
+    async def _move_visible(self, dest_path: str) -> None:
+        await require_visible_file(self._storage, self.path)
+        await reject_hidden_destination(self._storage, dest_path)
+        await self._storage.move(self.path, dest_path)
+
     @override
     def handle_delete(self) -> NativeHandlerResult:
-        return run_async(call_with_catch, self, functools.partial(self._storage.unlink, self.path, missing_ok=False))
+        return run_async(call_with_catch, self, self._delete_visible)
 
     @override
     def handle_copy(self, dest_path: str, *, depth_infinity: bool) -> NativeHandlerResult:
-        return run_async(call_with_catch, self, functools.partial(self._storage.copy, self.path, dest_path))
+        return run_async(call_with_catch, self, functools.partial(self._copy_visible, dest_path))
 
     @override
     def handle_move(self, dest_path: str) -> NativeHandlerResult:
-        return run_async(call_with_catch, self, functools.partial(self._storage.move, self.path, dest_path))
+        return run_async(call_with_catch, self, functools.partial(self._move_visible, dest_path))
 
     @override
     def copy_move_single(self, dest_path: str, *, is_move: bool) -> None:
+        run_async(require_visible_file, self._storage, self.path)
+        run_async(reject_hidden_destination, self._storage, dest_path)
         if is_move:
             run_async(self._storage.move, self.path, dest_path)
         else:
