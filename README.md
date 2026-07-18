@@ -55,13 +55,7 @@ flowchart LR
 | `CachedStorage` | 装饰其他后端 | 元数据交叉回填、写后回填、内存/Redis 缓存 |
 | `IndexStorage` | 大文件分块与去重 | SHA-256 内容寻址、引用计数、并发上传、文件锁 |
 
-`LocalStorage` canonicalizes the configured root once (so a symlinked root is
-stable) and rejects symlink, junction, and Windows reparse-point components
-in every logical path, including operation destinations and tree operations.
-This policy addresses static path configuration and accidental link traversal;
-it is not a general OS sandbox and does not claim to close check-to-use (TOCTOU)
-races against a concurrent local attacker. Descriptor/handle-relative access is
-outside this backend's threat model.
+> `LocalStorage` 会在初始化时规范化配置的根目录，并在每次操作中拒绝路径中出现符号链接、连接点或 Windows 重解析点组件，包括操作目标和树操作。此策略旨在防止静态路径配置和意外的链接遍历；它并非通用的操作系统沙箱，也不能防止针对本地并发攻击者的检查到使用（TOCTOU）竞态条件。描述符/句柄相对访问不在此后端的威胁模型范围内。
 
 ## 环境要求
 
