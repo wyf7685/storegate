@@ -14,6 +14,7 @@ from typing import final, override
 import anyio
 import asyncssh
 
+from app.log import escape_tag
 from app.storage.abstract import (
     AbstractStorage,
     BytesLike,
@@ -269,7 +270,7 @@ class SFTPStorage(AbstractStorage):
             if translated is exc:
                 raise
             raise translated from exc
-        self.log.debug("Connected")
+        self.log.info(f"Connected to <c>{escape_tag(self._config.host)}</c>:<c>{self._config.port}</c>")
 
     @override
     async def close(self) -> None:
@@ -554,6 +555,7 @@ class SFTPStorage(AbstractStorage):
         link = self._logical_path(link_path)
         if link == _ROOT:
             raise FileExistsError("Cannot replace the storage root with a symlink")
+        self.log.info(f"SymLink: <y>{escape_tag(link.as_posix())}</y> → <y>{escape_tag(raw_target)}</y>")
         async with self._client_lease(f"Failed to create symbolic link {link_path}") as lease:
             client = lease.client
             parent = await self._lstat_info(client, link.parent)
@@ -626,7 +628,7 @@ class SFTPStorage(AbstractStorage):
             if kind in {_RawKind.SPECIAL, _RawKind.UNKNOWN}:
                 if strict:
                     self._entry_kind(kind, child)
-                self.log.debug(f"Skipping unsupported SFTP entry {child.as_posix()}")
+                self.log.debug(f"Skipping unsupported SFTP entry <y>{escape_tag(child.as_posix())}</y>")
                 continue
             entries.append(_RawEntry(child, attrs, kind))
         entries.sort(key=lambda item: item.logical.as_posix())
@@ -728,6 +730,8 @@ class SFTPStorage(AbstractStorage):
 
     @override
     async def mkdir(self, path: PathLike, *, parents: bool = False, exist_ok: bool = False) -> None:
+        logical = self._logical_path(path)
+        self.log.info(f"MkDir: <y>{escape_tag(logical.as_posix())}</y>")
         async with self._client_lease(f"Failed to create directory {path}") as lease:
             await self._mkdir(lease.client, path, parents=parents, exist_ok=exist_ok)
 
@@ -815,6 +819,7 @@ class SFTPStorage(AbstractStorage):
                     self._entry_kind(kind, target)
                 if not overwrite:
                     raise FileExistsError(f"Destination already exists: {target.as_posix()}")
+            self.log.info(f"Upload: <y>{escape_tag(target.as_posix())}</y>")
             await self._mkdir(client, target.parent, parents=True, exist_ok=True)
             temporary = self._temporary_path(target, "upload")
             handle: asyncssh.SFTPClientFile[bytes] | None = None
@@ -846,6 +851,9 @@ class SFTPStorage(AbstractStorage):
                 raise IsADirectoryError(f"Path is not a regular file: {logical.as_posix()}")
             if offset >= info.size:
                 return
+            self.log.debug(
+                f"Download: <y>{escape_tag(logical.as_posix())}</y> (<g>{info.size}</g> bytes, offset=<g>{offset}</g>)"
+            )
             handle: asyncssh.SFTPClientFile[bytes] | None = None
             try:
                 handle = await self._io(client.open(resolved.as_posix(), "rb", encoding=None))
@@ -877,6 +885,7 @@ class SFTPStorage(AbstractStorage):
                 raise FileNotFoundError(f"Path does not exist: {logical.as_posix()}")
             if info.is_dir:
                 raise IsADirectoryError(f"Path is a directory: {logical.as_posix()}")
+            self.log.info(f"Delete: <y>{escape_tag(logical.as_posix())}</y>")
             await self._io(lease.client.remove(self._remote_path(logical)))
 
     @override
@@ -884,6 +893,7 @@ class SFTPStorage(AbstractStorage):
         logical = self._logical_path(path)
         if logical == _ROOT:
             raise OSError("Cannot remove root directory")
+        self.log.info(f"Delete dir: <y>{escape_tag(logical.as_posix())}</y>")
         async with self._client_lease(f"Failed to remove directory {path}") as lease:
             info = await self._lstat_or_none(lease.client, logical)
             if info is None:
@@ -927,6 +937,8 @@ class SFTPStorage(AbstractStorage):
 
     @override
     async def rmtree(self, path: PathLike) -> None:
+        logical = self._logical_path(path)
+        self.log.info(f"RmTree: <y>{escape_tag(logical.as_posix())}</y>")
         async with self._client_lease(f"Failed to remove directory tree {path}") as lease:
             await self._rmtree(lease.client, path)
 
@@ -979,6 +991,7 @@ class SFTPStorage(AbstractStorage):
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
+        self.log.info(f"Copy: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
         if source == _ROOT:
             raise IsADirectoryError("Cannot copy root directory as a file")
         async with self._client_lease(f"Failed to copy {src} to {dst}") as lease:
@@ -1016,6 +1029,7 @@ class SFTPStorage(AbstractStorage):
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
+        self.log.info(f"Move: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
         if source == _ROOT:
             raise IsADirectoryError("Cannot move root directory as a file")
         async with self._client_lease(f"Failed to move {src} to {dst}") as lease:
@@ -1224,6 +1238,7 @@ class SFTPStorage(AbstractStorage):
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
+        self.log.info(f"CopyTree: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
         async with self._client_lease(f"Failed to copy tree {src} to {dst}") as lease:
             await self._copytree_transaction(lease.client, source, destination, overwrite=overwrite)
 
@@ -1231,6 +1246,7 @@ class SFTPStorage(AbstractStorage):
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
+        self.log.info(f"MoveTree: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
         if source == _ROOT:
             raise OSError("Cannot move root directory")
         if source == destination:

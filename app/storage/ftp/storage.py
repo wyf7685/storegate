@@ -451,6 +451,8 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to create directory {path} (parents={parents}, exist_ok={exist_ok})")
     async def mkdir(self, path: PathLike, *, parents: bool = False, exist_ok: bool = False) -> None:
+        logical = self._logical_path(path)
+        self.log.info(f"MkDir: <y>{escape_tag(logical.as_posix())}</y>")
         async with self._client_lease() as lease:
             await self._mkdir(lease.client, path, parents=parents, exist_ok=exist_ok)
 
@@ -488,6 +490,7 @@ class FTPStorage(AbstractStorage):
                 if not overwrite:
                     raise FileExistsError(f"File already exists: {logical.as_posix()}")
 
+            self.log.info(f"Upload: <y>{escape_tag(logical.as_posix())}</y>")
             await self._mkdir(client, logical.parent, parents=True, exist_ok=True)
             try:
                 async with client.upload_stream(self._remote_path(logical)) as writer:
@@ -523,6 +526,10 @@ class FTPStorage(AbstractStorage):
                     if "size" in facts and offset >= info.size:
                         return
 
+                    self.log.debug(
+                        f"Download: <y>{escape_tag(logical.as_posix())}</y> "
+                        f"(<g>{info.size}</g> bytes, offset=<g>{offset}</g>)"
+                    )
                     reader = await lease.client.download_stream(self._remote_path(logical), offset=offset)
                     try:
                         async for chunk in reader.iter_by_block(self._config.chunk_size):
@@ -567,6 +574,7 @@ class FTPStorage(AbstractStorage):
                 raise UnsupportedOperationError(
                     _UNSUPPORTED_ERRNO, f"Unsupported FTP unlink entry kind: {logical.as_posix()}"
                 )
+            self.log.info(f"Delete: <y>{escape_tag(logical.as_posix())}</y>")
             await lease.client.remove_file(self._remote_path(logical))
 
     async def _rmdir(self, client: aioftp.Client, path: PathLike) -> None:
@@ -584,6 +592,8 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to remove directory {path}")
     async def rmdir(self, path: PathLike) -> None:
+        logical = self._logical_path(path)
+        self.log.info(f"Delete dir: <y>{escape_tag(logical.as_posix())}</y>")
         async with self._client_lease() as lease:
             await self._rmdir(lease.client, path)
 
@@ -611,6 +621,8 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to remove directory tree {path}")
     async def rmtree(self, path: PathLike) -> None:
+        logical = self._logical_path(path)
+        self.log.info(f"RmTree: <y>{escape_tag(logical.as_posix())}</y>")
         async with self._client_lease() as lease:
             await self._rmtree(lease.client, path)
 
@@ -718,6 +730,7 @@ class FTPStorage(AbstractStorage):
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
+        self.log.info(f"Move: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
         if source == PurePosixPath("/"):
             raise OSError("Cannot move root directory")
 
@@ -786,6 +799,7 @@ class FTPStorage(AbstractStorage):
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
+        self.log.info(f"Copy: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
         if source == PurePosixPath("/"):
             raise IsADirectoryError("Cannot copy root directory as a file")
         async with self._client_lease() as lease:
@@ -1016,6 +1030,7 @@ class FTPStorage(AbstractStorage):
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
+        self.log.info(f"CopyTree: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
         async with self._client_lease() as lease, self._temporary_client() as destination_client:
             await self._copytree(lease.client, destination_client, source, destination, overwrite=overwrite)
 
@@ -1024,6 +1039,7 @@ class FTPStorage(AbstractStorage):
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         source = self._logical_path(src)
         destination = self._logical_path(dst)
+        self.log.info(f"MoveTree: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
         if source == PurePosixPath("/"):
             raise OSError("Cannot move root directory")
         if source == destination:
