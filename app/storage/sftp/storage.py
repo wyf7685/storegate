@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
-from typing import TypeVar, final, override
+from typing import final, override
 
 import anyio
 import asyncssh
@@ -18,7 +18,6 @@ from app.utils import coalesce_chunks
 from .config import SFTPConfig
 from .pool import SFTPChannelLease, SFTPChannelPool
 
-_T = TypeVar("_T")
 _ROOT = PurePosixPath("/")
 _CONNECTION_ERRORS = (
     asyncssh.ConnectionLost,
@@ -127,7 +126,7 @@ class SFTPStorage(AbstractStorage):
             raise OSError(f"SFTP server returned a path outside root_prefix: {path}") from None
         return _ROOT if relative == PurePosixPath(".") else PurePosixPath("/", relative)
 
-    async def _io(self, awaitable: Awaitable[_T]) -> _T:
+    async def _io[T](self, awaitable: Awaitable[T]) -> T:
         with anyio.fail_after(self._config.io_timeout):
             return await awaitable
 
