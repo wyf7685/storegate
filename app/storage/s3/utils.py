@@ -6,11 +6,10 @@ from typing import Self
 
 import anyio
 import anyio.lowlevel
-import httpx
 
 from app.log import escape_tag
 from app.storage.abstract import EntryKind, FileInfo
-from app.utils import logger_wrapper
+from app.utils import httpx, logger_wrapper
 
 from .client import AsyncS3Client, CompletedPart
 

@@ -6,7 +6,8 @@ from typing import Literal, Self
 from urllib.parse import quote
 
 import anyio
-import httpx
+
+from app.utils import httpx
 
 from .auth import build_auth
 from .errors import DavClientError, DavHttpStatusError

@@ -4,7 +4,6 @@ from collections.abc import AsyncIterator
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
 import pytest
 from pydantic import SecretStr
 from pytest_mock import MockerFixture
@@ -12,6 +11,9 @@ from pytest_mock import MockerFixture
 from app.storage.s3.client import AsyncS3Client, S3Config
 from app.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
 from app.storage.s3.utils import MultipartUploadTask
+from app.utils import httpx
+
+pytestmark = pytest.mark.httpx
 
 
 def _config() -> S3Config:

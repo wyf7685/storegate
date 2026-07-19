@@ -81,7 +81,7 @@ def configure_logging() -> None:
     logging.config.dictConfig(LOGGING_CONFIG)
 
 
-_HIDDEN_NAMES = ("uvicorn", "starlette", "httpx", "wsgidav", "aioftp")
+_HIDDEN_NAMES = ("uvicorn", "starlette", "httpx", "httpx2", "wsgidav", "aioftp")
 
 
 def _hidden_upstream(record: loguru.Record) -> None:

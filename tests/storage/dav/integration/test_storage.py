@@ -8,7 +8,7 @@ from app.storage.abstract import EntryKind, WalkEntry
 from app.storage.dav import DavStorage
 from tests.support.ids import uid
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.httpx]
 
 
 class TestDavStorageIntegration:

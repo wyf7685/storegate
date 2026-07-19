@@ -13,7 +13,7 @@ Storegate 是一个异步、多后端文件存储服务。项目以 `AbstractSto
   - `IndexStorage`：将大文件切分为内容寻址分块，支持 SHA-256 去重和引用计数。
 - 双协议服务端：将任意 `AbstractStorage` 暴露为 WebDAV 或 FTP 服务。
 - JSON 对象工厂：通过嵌套配置组合存储和服务，无需在代码中手动组装对象图。
-- 异步 I/O：基于 AnyIO、HTTPX、aioftp、AsyncSSH、Uvicorn 和 WsgiDAV。
+- 异步 I/O：基于 AnyIO、HTTPX（可选 [httpx2](https://github.com/pydantic/httpx2)）、aioftp、AsyncSSH、Uvicorn 和 WsgiDAV。
 
 ## 架构概览
 
@@ -69,6 +69,14 @@ flowchart LR
 ```bash
 uv sync --group dev
 ```
+
+S3 / WebDAV 客户端默认使用 `httpx`。若要切换到兼容的 [httpx2](https://github.com/pydantic/httpx2)，安装可选 extra：
+
+```bash
+uv sync --group dev --extra httpx2
+```
+
+代码统一通过 `from app.utils import httpx` 导入；运行时优先使用已安装的 `httpx2`，否则回退到 `httpx`。CI 可对 `pytest -m httpx` 子集分别在默认依赖与 `uv sync --extra httpx2` 下验证两条路径。
 
 ## 快速开始
 

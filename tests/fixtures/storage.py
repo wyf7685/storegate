@@ -21,11 +21,11 @@ def host_symlink_create() -> bool:
     params=[
         pytest.param("memory", id="memory"),
         pytest.param("local", id="local"),
-        pytest.param("s3", marks=pytest.mark.integration, id="s3"),
+        pytest.param("s3", marks=[pytest.mark.integration, pytest.mark.httpx], id="s3"),
         pytest.param("cached", id="cached"),
         pytest.param("index", id="index"),
         pytest.param("ftp", marks=pytest.mark.integration, id="ftp"),
-        pytest.param("dav", marks=pytest.mark.integration, id="dav"),
+        pytest.param("dav", marks=[pytest.mark.integration, pytest.mark.httpx], id="dav"),
         pytest.param("sftp", marks=pytest.mark.integration, id="sftp"),
     ]
 )

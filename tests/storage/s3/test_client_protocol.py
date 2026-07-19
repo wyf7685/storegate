@@ -4,7 +4,6 @@ import contextlib
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator, Callable
 
-import httpx
 import pytest
 from pydantic import SecretStr
 
@@ -16,6 +15,9 @@ from app.storage.s3.client import (
     S3HttpStatusError,
     S3ResponseParseError,
 )
+from app.utils import httpx
+
+pytestmark = pytest.mark.httpx
 
 
 def _config() -> S3Config:

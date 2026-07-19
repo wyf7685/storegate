@@ -1,11 +1,14 @@
 """WebDAV client configuration tests."""
 
-import httpx
+import pytest
 from pydantic import SecretStr
 
 from app.storage.dav.client import build_auth
 from app.storage.dav.client.auth import _BearerAuth
 from app.storage.dav.client.models import DavConfig
+from app.utils import httpx
+
+pytestmark = pytest.mark.httpx
 
 
 class TestBuildAuth:

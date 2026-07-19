@@ -1,4 +1,4 @@
-import httpx
+from app.utils import httpx
 
 from .models import DavConfig
 

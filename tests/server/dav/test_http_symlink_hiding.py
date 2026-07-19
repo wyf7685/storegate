@@ -5,12 +5,12 @@ from typing import Literal
 import anyio
 import anyio.lowlevel
 import anyio.to_thread
-import httpx
 import pytest
 from wsgidav.wsgidav_app import WsgiDAVApp
 
 from app.server.dav.server import create_wsgi_app
 from app.server.dav.utils import current_event_loop_token
+from app.utils import httpx
 
 from ._storage import SymlinkTrapStorage
 
@@ -24,7 +24,7 @@ async def dav_thread_bridge() -> AsyncIterator[None]:
         current_event_loop_token.reset(reset_token)
 
 
-pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("dav_thread_bridge")]
+pytestmark = [pytest.mark.integration, pytest.mark.httpx, pytest.mark.usefixtures("dav_thread_bridge")]
 
 
 def _request(

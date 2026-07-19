@@ -19,6 +19,14 @@ from app.const import DEFAULT_CHUNK_SIZE
 
 from .log import logger
 
+if TYPE_CHECKING:
+    import httpx as httpx
+else:
+    try:
+        import httpx2 as httpx
+    except ImportError:
+        import httpx as httpx
+
 type _ValidLogLevel = Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]
 _valid_log_levels: set[_ValidLogLevel] = {
     "TRACE",

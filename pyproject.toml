@@ -20,6 +20,8 @@ dependencies = [
   "winloop>=0.6.3 ; sys_platform == 'win32'",
   "wsgidav>=4.3.5",
 ]
+[project.optional-dependencies]
+httpx2 = ["httpx2[http2]>=2.7.0,<3"]
 
 [dependency-groups]
 dev = [{ include-group = "lint" }, { include-group = "test" }]
@@ -41,6 +43,7 @@ markers = [
   "integration: tests starting local protocol servers",
   "s3: tests requiring external S3 credentials",
   "slow: tests that are unusually slow",
+  "httpx: tests exercising app.utils.httpx for CI httpx/httpx2 matrix",
 ]
 
 [tool.coverage.report]

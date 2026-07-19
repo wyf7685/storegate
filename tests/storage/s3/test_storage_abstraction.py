@@ -111,6 +111,8 @@ async def test_s3_uses_default_unsupported_symlink_contract(mocker: MockerFixtur
     assert symlink_error.value.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}
 
 
+@pytest.mark.httpx
+@pytest.mark.integration
 async def test_moto_file_directory_walk_and_strict_marker_cutover(moto_s3_storage: S3Storage) -> None:
     storage = moto_s3_storage
     base = f"abstraction-{uid()}"
@@ -149,6 +151,8 @@ async def test_moto_file_directory_walk_and_strict_marker_cutover(moto_s3_storag
         await client.delete_object(key=f"{legacy}/")
 
 
+@pytest.mark.httpx
+@pytest.mark.integration
 async def test_moto_walk_uses_file_precedence_for_file_marker_collision(moto_s3_storage: S3Storage) -> None:
     storage = moto_s3_storage
     path = f"collision-{uid()}"
@@ -169,6 +173,8 @@ async def test_moto_walk_uses_file_precedence_for_file_marker_collision(moto_s3_
         await client.delete_object(key=f"{path}/")
 
 
+@pytest.mark.httpx
+@pytest.mark.integration
 async def test_moto_directory_recognition_rejects_incompatible_root_markers(
     moto_s3_storage: S3Storage,
 ) -> None:

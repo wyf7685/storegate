@@ -8,7 +8,8 @@ from typing import Literal, Self
 from urllib.parse import quote
 
 import anyio.lowlevel
-import httpx
+
+from app.utils import httpx
 
 from .auth import AWSSigV4Signer, _encode_query_kv, _format_query_kv
 from .errors import S3ClientError, S3HttpStatusError, S3ResponseParseError
