@@ -1,4 +1,17 @@
+<div align="center">
+
 # Storegate
+
+[![python](https://img.shields.io/badge/python-3.14+-blue?logo=python&logoColor=edb641)](https://www.python.org/)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![ty](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ty/main/assets/badge/v0.json)](https://github.com/astral-sh/ty)
+
+[![codecov](https://codecov.io/gh/wyf7685/storegate/graph/badge.svg?token=9tutGBYaz8)](https://codecov.io/gh/wyf7685/storegate)
+[![wakatime](https://wakatime.com/badge/user/b097681b-c224-44ec-8e04-e1cf71744655/project/a4f8d9e1-526d-4407-8456-cb6c2e1ddec5.svg)](https://wakatime.com/badge/user/b097681b-c224-44ec-8e04-e1cf71744655/project/a4f8d9e1-526d-4407-8456-cb6c2e1ddec5)
+![works on my machine](https://img.shields.io/badge/works%20on-my%20machine-green)
+
+</div>
 
 Storegate 是一个异步、多后端文件存储服务。项目以 `AbstractStorage` 作为统一接口，可直接操作内存、本地文件系统、S3、WebDAV、FTP 和 SFTP，也可以叠加缓存与分块索引层；同一套存储实现还能通过 WebDAV 或 FTP 协议对外提供服务。
 
