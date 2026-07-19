@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "app/**"
+      - "tests/**"
+      - ".github/workflows/ci.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "ruff.toml"
+      - "ty.toml"
+  pull_request:
+    paths:
+      - "app/**"
+      - "tests/**"
+      - ".github/workflows/ci.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "ruff.toml"
+      - "ty.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group lint
+
+      - name: Run ruff check
+        run: uv run --no-sync ruff check && uv run --no-sync ruff format --check
+
+      - name: Run ty check
+        run: uv run --no-sync ty check
+
+  test:
+    name: Test & Coverage
+    runs-on: ubuntu-latest
+    needs: lint
+    concurrency:
+      group: test-coverage-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group test && uv run python -c "from app.utils import httpx; assert httpx.__name__ == 'httpx', httpx.__name__"
+
+      - name: Run Pytest
+        run: uv run --no-sync pytest -m "not s3" --cov=app --cov-branch --cov-report=xml
+
+      - name: Install dependencies with httpx2
+        run: uv sync --group test --extra httpx2 && uv run python -c "from app.utils import httpx; assert httpx.__name__ == 'httpx2', httpx.__name__"
+
+      - name: Run Pytest with httpx2
+        run: uv run --no-sync pytest -m "httpx and not s3" --no-cov
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v7
+        with:
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
