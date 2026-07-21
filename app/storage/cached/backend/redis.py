@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, final, override
 
 from app.storage.abstract import EntryKind, FileInfo
+from app.utils import requires_extra
 
 from .base import CacheBackend
 
@@ -107,6 +108,7 @@ class RedisCacheBackend(CacheBackend):
         key_prefix: str = "auto",
         **kw: Any,
     ) -> None:
+        requires_extra("redis", extra_name="redis")
         super().__init__()
         if key_prefix != "auto" and self._PREFIX_RE.fullmatch(key_prefix) is None:
             raise ValueError("key_prefix must contain only letters, digits, ':', '_' or '-'")

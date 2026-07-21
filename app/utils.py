@@ -1,6 +1,9 @@
+import contextlib
 import functools
 import importlib
+import importlib.metadata
 import inspect
+import sys
 from collections.abc import (
     AsyncGenerator,
     AsyncIterable,
@@ -10,6 +13,7 @@ from collections.abc import (
     Generator,
     Iterable,
 )
+from pathlib import Path
 from types import CoroutineType
 from typing import TYPE_CHECKING, Any, Concatenate, Literal, TypedDict, Unpack, cast
 
@@ -26,6 +30,58 @@ else:
         import httpx2 as httpx
     except ImportError:
         import httpx as httpx
+
+
+try:
+    import ayafileio as _ayafileio
+
+    async def open_file_rb(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> AsyncGenerator[memoryview[int]]:
+        async with _ayafileio.open(path, "rb") as file:
+            async for chunk in file.chunk(chunk_size):
+                yield chunk
+
+    @contextlib.asynccontextmanager
+    async def open_file_wb(path: Path) -> AsyncIterator[Callable[[bytes], Awaitable[object]]]:
+        async with _ayafileio.open(path, "wb") as file:
+            yield file.write
+
+except ImportError:
+    import anyio as _anyio
+
+    async def open_file_rb(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> AsyncGenerator[memoryview[int]]:
+        async with await _anyio.open_file(path, "rb") as file:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                yield memoryview(chunk)
+
+    @contextlib.asynccontextmanager
+    async def open_file_wb(path: Path) -> AsyncIterator[Callable[[bytes], Awaitable[object]]]:
+        async with await _anyio.open_file(path, "wb") as file:
+            yield file.write
+
+
+@functools.cache
+def is_uvloop_available() -> bool:
+    module_name = "winloop" if sys.platform == "win32" else "uvloop"
+    try:
+        importlib.metadata.version(module_name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+def requires_extra(*check_package_names: str, extra_name: str) -> None:
+    for name in check_package_names:
+        try:
+            importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            raise ImportError(
+                f"Missing required package '{name}' from the '{extra_name}' extra. "
+                f"Please install the package with `pip install storegate[{extra_name}]`."
+            ) from None
+
 
 type _ValidLogLevel = Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]
 _valid_log_levels: set[_ValidLogLevel] = {

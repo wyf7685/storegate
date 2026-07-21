@@ -1,3 +1,4 @@
+import contextlib
 import errno
 import functools
 import json
@@ -11,10 +12,9 @@ from typing import Self, cast
 
 import anyio
 import anyio.lowlevel
-import ayafileio
 
 from app.log import escape_tag
-from app.utils import LoggerWrapper, logger_wrapper
+from app.utils import LoggerWrapper, logger_wrapper, open_file_rb, open_file_wb
 
 
 class EntryKind(StrEnum):
@@ -374,8 +374,8 @@ class AbstractStorage(ABC):
     ) -> None:
         """Upload a local file."""
 
-        async with ayafileio.open(Path(local_path), "rb") as file:
-            await self.upload_stream(file.chunk(1024 * 1024), remote_path, overwrite=overwrite)
+        async with contextlib.aclosing(open_file_rb(Path(local_path))) as stream:
+            await self.upload_stream(stream, remote_path, overwrite=overwrite)
 
     # ------------------------------------------------------------------
     # Download
@@ -421,9 +421,9 @@ class AbstractStorage(ABC):
         local_path: PathLike,
     ) -> None:
         """Download to a local file."""
-        async with ayafileio.open(Path(local_path), "wb") as file:
+        async with open_file_wb(Path(local_path)) as write:
             async for chunk in self.download_stream(remote_path):
-                await file.write(chunk)
+                await write(chunk)
 
     # ------------------------------------------------------------------
     # File operations

@@ -5,28 +5,44 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-  "a2wsgi>=1.10.10",
-  "aioftp>=0.27.2",
   "anyio>=4.14.1",
-  "asyncssh>=2.24.0",
-  "ayafileio>=1.4.7",
   "expiringdictx>=1.1.0",
   "httpx[http2]>=0.28.1",
   "loguru>=0.7.3",
   "pydantic>=2.13.4",
-  "redis>=8.0.1",
-  "uvicorn[standard]>=0.50.2",
-  "uvloop>=0.22.1 ; sys_platform != 'win32'",
-  "winloop>=0.6.3 ; sys_platform == 'win32'",
-  "wsgidav>=4.3.5",
 ]
 [project.optional-dependencies]
+ftp-server = ["aioftp>=0.27.2"]
+dav-server = ["a2wsgi>=1.10.10", "uvicorn[standard]>=0.50.2", "wsgidav>=4.3.5"]
+ftp-storage = ["aioftp>=0.27.2"]
+sftp-storage = ["asyncssh>=2.24.0"]
+redis = ["redis>=8.0.1"]
+full = [
+  "a2wsgi>=1.10.10",
+  "aioftp>=0.27.2",
+  "asyncssh>=2.24.0",
+  "redis>=8.0.1",
+  "uvicorn[standard]>=0.50.2",
+  "wsgidav>=4.3.5",
+]
+
+ayafileio = ["ayafileio>=1.4.7"]
 httpx2 = ["httpx2[http2]>=2.7.0,<3"]
+uvloop = [
+  "uvloop>=0.22.1 ; sys_platform != 'win32'",
+  "winloop>=0.6.3 ; sys_platform == 'win32'",
+]
+
 
 [dependency-groups]
-dev = [{ include-group = "lint" }, { include-group = "test" }]
+dev = [
+  "storegate[full,ayafileio,httpx2,uvloop]>=0.1.0",
+  { include-group = "lint" },
+  { include-group = "test" },
+]
 lint = ["prek>=0.4.10", "ruff>=0.15.21", "ty>=0.0.61"]
 test = [
+  "storegate[ftp-server,dav-server,ftp-storage,sftp-storage,redis]",
   "moto[server]>=5.2.2,<6",
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",

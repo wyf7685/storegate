@@ -65,13 +65,13 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --group test && uv run python -c "from app.utils import httpx; assert httpx.__name__ == 'httpx', httpx.__name__"
+        run: uv sync --no-dev --group test && uv run python -c "from app.utils import httpx; assert httpx.__name__ == 'httpx', httpx.__name__"
 
       - name: Run Pytest
         run: uv run --no-sync pytest -m "not s3" --cov=app --cov-branch --cov-report=xml
 
       - name: Install dependencies with httpx2
-        run: uv sync --group test --extra httpx2 && uv run python -c "from app.utils import httpx; assert httpx.__name__ == 'httpx2', httpx.__name__"
+        run: uv sync --no-dev --group test --extra httpx2 && uv run python -c "from app.utils import httpx; assert httpx.__name__ == 'httpx2', httpx.__name__"
 
       - name: Run Pytest with httpx2
         run: uv run --no-sync pytest -m "httpx and not s3" --no-cov

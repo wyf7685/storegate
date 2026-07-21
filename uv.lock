@@ -1479,25 +1479,48 @@ name = "storegate"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "a2wsgi" },
-    { name = "aioftp" },
     { name = "anyio" },
-    { name = "asyncssh" },
-    { name = "ayafileio" },
     { name = "expiringdictx" },
     { name = "httpx", extra = ["http2"] },
     { name = "loguru" },
     { name = "pydantic" },
-    { name = "redis" },
-    { name = "uvicorn", extra = ["standard"] },
-    { name = "uvloop", marker = "sys_platform != 'win32'" },
-    { name = "winloop", marker = "sys_platform == 'win32'" },
-    { name = "wsgidav" },
 ]
 
 [package.optional-dependencies]
+ayafileio = [
+    { name = "ayafileio" },
+]
+dav-server = [
+    { name = "a2wsgi" },
+    { name = "uvicorn", extra = ["standard"] },
+    { name = "wsgidav" },
+]
+ftp-server = [
+    { name = "aioftp" },
+]
+ftp-storage = [
+    { name = "aioftp" },
+]
+full = [
+    { name = "a2wsgi" },
+    { name = "aioftp" },
+    { name = "asyncssh" },
+    { name = "redis" },
+    { name = "uvicorn", extra = ["standard"] },
+    { name = "wsgidav" },
+]
 httpx2 = [
     { name = "httpx2", extra = ["http2"] },
+]
+redis = [
+    { name = "redis" },
+]
+sftp-storage = [
+    { name = "asyncssh" },
+]
+uvloop = [
+    { name = "uvloop", marker = "sys_platform != 'win32'" },
+    { name = "winloop", marker = "sys_platform == 'win32'" },
 ]
 
 [package.dev-dependencies]
@@ -1510,6 +1533,7 @@ dev = [
     { name = "pytest-mock" },
     { name = "pytest-xdist" },
     { name = "ruff" },
+    { name = "storegate", extra = ["ayafileio", "dav-server", "ftp-server", "ftp-storage", "full", "httpx2", "redis", "sftp-storage", "uvloop"] },
     { name = "ty" },
 ]
 lint = [
@@ -1524,27 +1548,35 @@ test = [
     { name = "pytest-cov" },
     { name = "pytest-mock" },
     { name = "pytest-xdist" },
+    { name = "storegate", extra = ["dav-server", "ftp-server", "ftp-storage", "redis", "sftp-storage"] },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "a2wsgi", specifier = ">=1.10.10" },
-    { name = "aioftp", specifier = ">=0.27.2" },
+    { name = "a2wsgi", marker = "extra == 'dav-server'", specifier = ">=1.10.10" },
+    { name = "a2wsgi", marker = "extra == 'full'", specifier = ">=1.10.10" },
+    { name = "aioftp", marker = "extra == 'ftp-server'", specifier = ">=0.27.2" },
+    { name = "aioftp", marker = "extra == 'ftp-storage'", specifier = ">=0.27.2" },
+    { name = "aioftp", marker = "extra == 'full'", specifier = ">=0.27.2" },
     { name = "anyio", specifier = ">=4.14.1" },
-    { name = "asyncssh", specifier = ">=2.24.0" },
-    { name = "ayafileio", specifier = ">=1.4.7" },
+    { name = "asyncssh", marker = "extra == 'full'", specifier = ">=2.24.0" },
+    { name = "asyncssh", marker = "extra == 'sftp-storage'", specifier = ">=2.24.0" },
+    { name = "ayafileio", marker = "extra == 'ayafileio'", specifier = ">=1.4.7" },
     { name = "expiringdictx", specifier = ">=1.1.0" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.28.1" },
     { name = "httpx2", extras = ["http2"], marker = "extra == 'httpx2'", specifier = ">=2.7.0,<3" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "pydantic", specifier = ">=2.13.4" },
-    { name = "redis", specifier = ">=8.0.1" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.50.2" },
-    { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.22.1" },
-    { name = "winloop", marker = "sys_platform == 'win32'", specifier = ">=0.6.3" },
-    { name = "wsgidav", specifier = ">=4.3.5" },
+    { name = "redis", marker = "extra == 'full'", specifier = ">=8.0.1" },
+    { name = "redis", marker = "extra == 'redis'", specifier = ">=8.0.1" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'dav-server'", specifier = ">=0.50.2" },
+    { name = "uvicorn", extras = ["standard"], marker = "extra == 'full'", specifier = ">=0.50.2" },
+    { name = "uvloop", marker = "sys_platform != 'win32' and extra == 'uvloop'", specifier = ">=0.22.1" },
+    { name = "winloop", marker = "sys_platform == 'win32' and extra == 'uvloop'", specifier = ">=0.6.3" },
+    { name = "wsgidav", marker = "extra == 'dav-server'", specifier = ">=4.3.5" },
+    { name = "wsgidav", marker = "extra == 'full'", specifier = ">=4.3.5" },
 ]
-provides-extras = ["httpx2"]
+provides-extras = ["ftp-server", "dav-server", "ftp-storage", "sftp-storage", "redis", "full", "ayafileio", "httpx2", "uvloop"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1556,6 +1588,8 @@ dev = [
     { name = "pytest-mock", specifier = ">=3.15.1" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "ruff", specifier = ">=0.15.21" },
+    { name = "storegate", extras = ["ftp-server", "dav-server", "ftp-storage", "sftp-storage", "redis"] },
+    { name = "storegate", extras = ["full", "ayafileio", "httpx2", "uvloop"], specifier = ">=0.1.0" },
     { name = "ty", specifier = ">=0.0.61" },
 ]
 lint = [
@@ -1570,6 +1604,7 @@ test = [
     { name = "pytest-cov", specifier = ">=7.1.0" },
     { name = "pytest-mock", specifier = ">=3.15.1" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
+    { name = "storegate", extras = ["ftp-server", "dav-server", "ftp-storage", "sftp-storage", "redis"] },
 ]
 
 [[package]]
