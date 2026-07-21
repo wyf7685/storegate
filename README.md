@@ -7,7 +7,7 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![ty](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ty/main/assets/badge/v0.json)](https://github.com/astral-sh/ty)
 
-[![codecov](https://codecov.io/gh/wyf7685/storegate/graph/badge.svg?token=9tutGBYaz8)](https://codecov.io/gh/wyf7685/storegate)
+[![codecov](https://codecov.io/gh/wyf7685/storegate/branch/master/graph/badge.svg?token=9tutGBYaz8)](https://codecov.io/gh/wyf7685/storegate)
 [![wakatime](https://wakatime.com/badge/user/b097681b-c224-44ec-8e04-e1cf71744655/project/a4f8d9e1-526d-4407-8456-cb6c2e1ddec5.svg)](https://wakatime.com/badge/user/b097681b-c224-44ec-8e04-e1cf71744655/project/a4f8d9e1-526d-4407-8456-cb6c2e1ddec5)
 ![works on my machine](https://img.shields.io/badge/works%20on-my%20machine-green)
 
