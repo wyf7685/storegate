@@ -10,7 +10,7 @@ from storegate.storage.memory import MemoryStorage
 
 
 class TestResolveStorage:
-    """Tests for app.storage.factory.resolve_storage — type-guarding the result."""
+    """Tests for storegate.storage.factory.resolve_storage — type-guarding the result."""
 
     def test_accepts_storage_instance(self):
         spec = {"$factory": "~memory", "root": "direct"}
@@ -25,7 +25,7 @@ class TestResolveStorage:
 
 
 class TestResolveStorageFromFile:
-    """Tests for app.storage.factory.resolve_storage_from_file — JSON file input."""
+    """Tests for storegate.storage.factory.resolve_storage_from_file — JSON file input."""
 
     def test_reads_json_and_resolves_nested_spec(self, tmp_path: Path):
         data = {

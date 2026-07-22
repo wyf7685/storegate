@@ -9,7 +9,7 @@ from storegate.utils import resolve_object
 
 
 class TestResolveObject:
-    """Tests for app.utils.resolve_object — the core dict-driven factory function."""
+    """Tests for storegate.utils.resolve_object — the core dict-driven factory function."""
 
     # -- happy paths -------------------------------------------------------
 
@@ -21,7 +21,7 @@ class TestResolveObject:
         assert obj.id.endswith(":/fullpath")
 
     def test_storage_shorthand_default_cls(self):
-        """~memory  →  app.storage.memory.Storage (= MemoryStorage)."""
+        """~memory  →  storegate.storage.memory.Storage (= MemoryStorage)."""
         spec = {"$factory": "~memory"}
         obj = resolve_object(spec)
         assert isinstance(obj, MemoryStorage)
@@ -70,7 +70,7 @@ class TestResolveObject:
         assert obj.id == "sftp:user@sftp.example.test:22/tenant"
 
     def test_server_shorthand_default_cls(self):
-        """@ftp  →  app.server.ftp.Server (= FTPServer), with nested storage."""
+        """@ftp  →  storegate.server.ftp.Server (= FTPServer), with nested storage."""
         from storegate.server.ftp import FTPServer
 
         spec = {

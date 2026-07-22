@@ -5,7 +5,7 @@ on:
     branches:
       - master
     paths:
-      - "app/**"
+      - "storegate/**"
       - "tests/**"
       - ".github/workflows/ci.yml"
       - "pyproject.toml"
@@ -14,7 +14,7 @@ on:
       - "ty.toml"
   pull_request:
     paths:
-      - "app/**"
+      - "storegate/**"
       - "tests/**"
       - ".github/workflows/ci.yml"
       - "pyproject.toml"
