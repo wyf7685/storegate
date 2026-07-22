@@ -9,9 +9,9 @@ from typing import cast
 import aioftp
 import pytest
 
-from app.storage import EntryKind, StorageCapabilities, UnsupportedOperationError, WalkEntry
-from app.storage.ftp import FTPConfig, FTPStorage
-from app.storage.ftp.pool import FTPClientLease, FTPClientPool
+from storegate.storage import EntryKind, StorageCapabilities, UnsupportedOperationError, WalkEntry
+from storegate.storage.ftp import FTPConfig, FTPStorage
+from storegate.storage.ftp.pool import FTPClientLease, FTPClientPool
 
 _FactListing = list[tuple[PurePosixPath, dict[str, str]]]
 

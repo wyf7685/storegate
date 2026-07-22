@@ -5,9 +5,9 @@ from pathlib import PurePosixPath
 import aioftp
 import pytest
 
-from app.server.ftp.handle import ReadHandle, WriteHandle
-from app.server.ftp.pathio import _file_info_to_stat
-from app.storage import AbstractStorage, EntryKind, FileInfo
+from storegate.server.ftp.handle import ReadHandle, WriteHandle
+from storegate.server.ftp.pathio import _file_info_to_stat
+from storegate.storage import AbstractStorage, EntryKind, FileInfo
 
 pytestmark = pytest.mark.integration
 

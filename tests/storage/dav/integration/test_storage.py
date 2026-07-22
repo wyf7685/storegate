@@ -4,8 +4,8 @@ import contextlib
 
 import pytest
 
-from app.storage.abstract import EntryKind, WalkEntry
-from app.storage.dav import DavStorage
+from storegate.storage.abstract import EntryKind, WalkEntry
+from storegate.storage.dav import DavStorage
 from tests.support.ids import uid
 
 pytestmark = [pytest.mark.integration, pytest.mark.httpx]

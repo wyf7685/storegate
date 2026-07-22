@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.storage.sftp.config import SFTPConfig
+from storegate.storage.sftp.config import SFTPConfig
 
 
 class TestSFTPConfig:

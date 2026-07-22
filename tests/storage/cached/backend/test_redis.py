@@ -8,11 +8,11 @@ from typing import Any, Self, cast
 import pytest
 from pydantic import SecretStr
 
-from app.storage import EntryKind, FileInfo
-from app.storage.cached import CachedStorage, RedisCacheBackend
-from app.storage.dav.client import DavConfig
-from app.storage.local import LocalStorage
-from app.storage.s3.client import S3Config
+from storegate.storage import EntryKind, FileInfo
+from storegate.storage.cached import CachedStorage, RedisCacheBackend
+from storegate.storage.dav.client import DavConfig
+from storegate.storage.local import LocalStorage
+from storegate.storage.s3.client import S3Config
 
 
 class FakePipeline:

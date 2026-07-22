@@ -2,7 +2,7 @@ import contextlib
 
 import pytest
 
-from app.storage.sftp import SFTPStorage
+from storegate.storage.sftp import SFTPStorage
 from tests.fixtures.protocol_servers import SFTPServerInfo
 from tests.storage.sftp.test_lifecycle import make_config
 

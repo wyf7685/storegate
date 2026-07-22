@@ -4,8 +4,8 @@ from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Literal, override
 
-from app.storage import AbstractStorage, BytesLike, EntryKind, FileInfo, WalkEntry
-from app.storage.abstract import PathLike
+from storegate.storage import AbstractStorage, BytesLike, EntryKind, FileInfo, WalkEntry
+from storegate.storage.abstract import PathLike
 
 
 class SymlinkTrapStorage(AbstractStorage):

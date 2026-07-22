@@ -10,7 +10,7 @@ from a2wsgi import WSGIMiddleware
 from wsgidav.fs_dav_provider import FilesystemProvider
 from wsgidav.wsgidav_app import WsgiDAVApp
 
-from app.storage.dav import DavConfig, DavStorage
+from storegate.storage.dav import DavConfig, DavStorage
 
 
 def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> None:

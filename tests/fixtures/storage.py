@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
-from app.storage.abstract import AbstractStorage
+from storegate.storage.abstract import AbstractStorage
 
 
 @pytest.fixture(scope="session")
@@ -33,13 +33,13 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
     """Yield every storage backend for the shared storage contract tests."""
     match request.param:
         case "memory":
-            from app.storage.memory import MemoryStorage
+            from storegate.storage.memory import MemoryStorage
 
             async with MemoryStorage("/shared-contract-root") as instance:
                 yield instance
 
         case "local":
-            from app.storage.local import LocalStorage
+            from storegate.storage.local import LocalStorage
 
             root = Path(tempfile.mkdtemp(prefix="storegate_test_"))
             try:
@@ -49,7 +49,7 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
                 shutil.rmtree(root, ignore_errors=True)
 
         case "s3":
-            from app.storage.s3 import S3Config, S3Storage
+            from storegate.storage.s3 import S3Config, S3Storage
 
             endpoint, bucket = request.getfixturevalue("_s3_server")
             config = S3Config(
@@ -65,15 +65,15 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
                 yield instance
 
         case "cached":
-            from app.storage.cached import CachedStorage
-            from app.storage.memory import MemoryStorage
+            from storegate.storage.cached import CachedStorage
+            from storegate.storage.memory import MemoryStorage
 
             async with CachedStorage(MemoryStorage("/shared-contract-root")) as instance:
                 yield instance
 
         case "index":
-            from app.storage.index import IndexStorage
-            from app.storage.memory import MemoryStorage
+            from storegate.storage.index import IndexStorage
+            from storegate.storage.memory import MemoryStorage
 
             async with IndexStorage(
                 index=MemoryStorage("/"),
@@ -83,7 +83,7 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
                 yield instance
 
         case "dav":
-            from app.storage.dav import DavConfig, DavStorage
+            from storegate.storage.dav import DavConfig, DavStorage
 
             base_url = request.getfixturevalue("_dav_server")
             config = DavConfig(base_url=base_url, auth_mode="anonymous")
@@ -91,7 +91,7 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
                 yield instance
 
         case "ftp":
-            from app.storage.ftp import FTPConfig, FTPStorage
+            from storegate.storage.ftp import FTPConfig, FTPStorage
 
             host, port = request.getfixturevalue("_ftp_server")
             config = FTPConfig(host=host, port=port, root_prefix="/")
@@ -99,7 +99,7 @@ async def storage(request: pytest.FixtureRequest) -> AsyncIterator[AbstractStora
                 yield instance
 
         case "sftp":
-            from app.storage.sftp import SFTPConfig, SFTPStorage
+            from storegate.storage.sftp import SFTPConfig, SFTPStorage
 
             server = request.getfixturevalue("_sftp_server")
             config = SFTPConfig(

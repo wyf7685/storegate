@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
-from app.storage.dav.client.models import DavConfig
+from storegate.storage.dav.client.models import DavConfig
 
 
 class TestDavConfigValidation:

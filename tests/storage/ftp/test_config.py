@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.storage.factory import resolve_storage_from_file
-from app.storage.ftp import FTPConfig, FTPStorage
+from storegate.storage.factory import resolve_storage_from_file
+from storegate.storage.ftp import FTPConfig, FTPStorage
 
 
 class TestFTPConfig:

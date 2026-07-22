@@ -7,10 +7,10 @@ from typing import cast
 import asyncssh
 import pytest
 
-from app.storage import EntryKind, FileInfo
-from app.storage.sftp import SFTPStorage
-from app.storage.sftp.pool import SFTPChannelPool
-from app.storage.sftp.storage import translate_sftp_error
+from storegate.storage import EntryKind, FileInfo
+from storegate.storage.sftp import SFTPStorage
+from storegate.storage.sftp.pool import SFTPChannelPool
+from storegate.storage.sftp.storage import translate_sftp_error
 from tests.fixtures.protocol_servers import SFTPServerInfo
 from tests.storage.sftp.test_lifecycle import make_config
 

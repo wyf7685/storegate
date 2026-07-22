@@ -2,8 +2,8 @@
 
 import contextlib
 
-from app.storage.index import IndexStorage
-from app.storage.memory import MemoryStorage
+from storegate.storage.index import IndexStorage
+from storegate.storage.memory import MemoryStorage
 from tests.storage.index.helpers import BLOCK_SIZE, hash_to_path_stem, suppress_exc
 from tests.support.ids import uid
 

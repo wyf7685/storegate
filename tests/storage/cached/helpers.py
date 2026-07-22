@@ -1,4 +1,4 @@
-from app.storage.cached import CachedStorage
+from storegate.storage.cached import CachedStorage
 
 
 async def _clear_path(cached: CachedStorage, path: str) -> None:

@@ -9,9 +9,9 @@ from typing import cast
 
 import pytest
 
-from app.storage import EntryKind, UnsupportedOperationError, WalkEntry
-from app.storage.local import LocalStorage
-from app.storage.local.storage import _RawKind
+from storegate.storage import EntryKind, UnsupportedOperationError, WalkEntry
+from storegate.storage.local import LocalStorage
+from storegate.storage.local.storage import _RawKind
 
 
 async def _storage(root: Path) -> LocalStorage:
@@ -236,7 +236,7 @@ async def test_copytree_failure_rolls_back_created_destination_parents(
     def fail_copy(_source: Path, _destination: Path) -> None:
         raise OSError("forced copy failure")
 
-    monkeypatch.setattr("app.storage.local.storage.shutil.copy2", fail_copy)
+    monkeypatch.setattr("storegate.storage.local.storage.shutil.copy2", fail_copy)
     with pytest.raises(OSError, match="forced copy failure"):
         await storage.copytree("/source", "/created/parent/destination")
 
@@ -313,8 +313,8 @@ def _install_fake_resolver_filesystem(
             return _RawKind.DIRECTORY
         return _RawKind.FILE
 
-    monkeypatch.setattr("app.storage.local.storage.os.lstat", fake_lstat)
-    monkeypatch.setattr("app.storage.local.storage.os.readlink", fake_readlink)
+    monkeypatch.setattr("storegate.storage.local.storage.os.lstat", fake_lstat)
+    monkeypatch.setattr("storegate.storage.local.storage.os.readlink", fake_readlink)
     monkeypatch.setattr(LocalStorage, "_classify_entry", staticmethod(fake_classify))
 
 

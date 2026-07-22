@@ -7,7 +7,7 @@ https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
 
 from datetime import UTC, datetime
 
-from app.storage.s3.client.auth import AWSSigV4Signer
+from storegate.storage.s3.client.auth import AWSSigV4Signer
 
 # AWS documented test credentials (well-known example values, not real keys).
 _AKID = "AKIAIOSFODNN7EXAMPLE"

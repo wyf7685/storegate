@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import asyncssh
 
-from app.storage.sftp.pool import SFTPChannelPool
+from storegate.storage.sftp.pool import SFTPChannelPool
 
 
 @dataclass(slots=True)

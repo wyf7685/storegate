@@ -4,7 +4,7 @@ import contextlib
 
 import pytest
 
-from app.storage import AbstractStorage, EntryKind, WalkEntry
+from storegate.storage import AbstractStorage, EntryKind, WalkEntry
 from tests.support.ids import uid
 
 

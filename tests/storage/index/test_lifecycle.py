@@ -2,11 +2,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.storage.abstract import BytesLike, EntryKind, FileInfo, PathLike
-from app.storage.ftp import FTPConfig, FTPStorage
-from app.storage.index import IndexStorage
-from app.storage.index.storage import CHUNKS_INDEX_FILE
-from app.storage.memory import MemoryStorage
+from storegate.storage.abstract import BytesLike, EntryKind, FileInfo, PathLike
+from storegate.storage.ftp import FTPConfig, FTPStorage
+from storegate.storage.index import IndexStorage
+from storegate.storage.index.storage import CHUNKS_INDEX_FILE
+from storegate.storage.memory import MemoryStorage
 
 
 class FailingDownloadStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]

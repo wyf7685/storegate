@@ -6,8 +6,8 @@ from pathlib import Path, PurePosixPath
 import aioftp
 import pytest
 
-from app.storage import EntryKind, WalkEntry
-from app.storage.ftp import FTPConfig, FTPStorage
+from storegate.storage import EntryKind, WalkEntry
+from storegate.storage.ftp import FTPConfig, FTPStorage
 
 pytestmark = pytest.mark.integration
 

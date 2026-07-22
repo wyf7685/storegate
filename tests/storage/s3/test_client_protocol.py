@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Callable
 import pytest
 from pydantic import SecretStr
 
-from app.storage.s3.client import (
+from storegate.storage.s3.client import (
     AsyncS3Client,
     ListObjectsCommonPrefix,
     ListObjectsContents,
@@ -15,7 +15,7 @@ from app.storage.s3.client import (
     S3HttpStatusError,
     S3ResponseParseError,
 )
-from app.utils import httpx
+from storegate.utils import httpx
 
 pytestmark = pytest.mark.httpx
 

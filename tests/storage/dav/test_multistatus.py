@@ -2,8 +2,8 @@
 
 import pytest
 
-from app.storage.abstract import EntryKind, UnsupportedOperationError
-from app.storage.dav.utils import (
+from storegate.storage.abstract import EntryKind, UnsupportedOperationError
+from storegate.storage.dav.utils import (
     dav_resource_to_file_info,
     href_to_storage_path,
     parse_multistatus,

@@ -2,8 +2,8 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from app.storage.cached import CachedStorage
-from app.storage.memory import MemoryStorage
+from storegate.storage.cached import CachedStorage
+from storegate.storage.memory import MemoryStorage
 
 
 @pytest.fixture

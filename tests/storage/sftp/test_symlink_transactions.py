@@ -4,8 +4,8 @@ from pathlib import PurePosixPath
 import pytest
 from pydantic import SecretStr
 
-from app.storage import EntryKind
-from app.storage.sftp import SFTPConfig, SFTPStorage
+from storegate.storage import EntryKind
+from storegate.storage.sftp import SFTPConfig, SFTPStorage
 from tests.storage.sftp.fake_client import FakePool, FakeSFTPClient, install_fake_pool
 
 

@@ -6,8 +6,8 @@ from typing import cast
 import asyncssh
 import pytest
 
-from app.storage import EntryKind, FileInfo, UnsupportedOperationError
-from app.storage.sftp import SFTPStorage
+from storegate.storage import EntryKind, FileInfo, UnsupportedOperationError
+from storegate.storage.sftp import SFTPStorage
 from tests.fixtures.protocol_servers import SFTPServerInfo
 from tests.storage.sftp.test_lifecycle import make_config
 

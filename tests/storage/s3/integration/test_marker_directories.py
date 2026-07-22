@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.storage.s3 import S3Storage
+from storegate.storage.s3 import S3Storage
 from tests.support.ids import uid
 
 pytestmark = [pytest.mark.s3, pytest.mark.httpx]

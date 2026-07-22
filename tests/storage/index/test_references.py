@@ -1,6 +1,6 @@
 """IndexStorage behavior tests."""
 
-from app.storage.index import IndexStorage
+from storegate.storage.index import IndexStorage
 from tests.storage.index.helpers import BLOCK_SIZE, _hash_block, hash_to_path_stem, suppress_exc
 from tests.support.ids import uid
 

@@ -3,9 +3,9 @@ from pathlib import PurePosixPath
 
 import pytest
 
-from app.server.ftp import FTPServer
-from app.storage import AbstractStorage, BytesLike, EntryKind, FileInfo, WalkEntry
-from app.storage.abstract import PathLike
+from storegate.server.ftp import FTPServer
+from storegate.storage import AbstractStorage, BytesLike, EntryKind, FileInfo, WalkEntry
+from storegate.storage.abstract import PathLike
 
 
 class ProtocolStorage(AbstractStorage):

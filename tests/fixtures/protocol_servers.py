@@ -15,8 +15,8 @@ import pytest
 @pytest.fixture(scope="session")
 def _dav_server() -> Generator[str]:
     """Start a local wsgidav server backed by MemoryStorage."""
-    from app.server.dav.server import DAVServer
-    from app.storage.memory import MemoryStorage
+    from storegate.server.dav.server import DAVServer
+    from storegate.storage.memory import MemoryStorage
 
     stop_event = asyncio.Event()
 
@@ -83,8 +83,8 @@ def _s3_server() -> Generator[tuple[str, str]]:
 @pytest.fixture(scope="session")
 def _ftp_server() -> Generator[tuple[str, int]]:
     """Start a local aioftp server in a dedicated thread and event loop."""
-    from app.server.ftp import FTPServer
-    from app.storage.memory import MemoryStorage
+    from storegate.server.ftp import FTPServer
+    from storegate.storage.memory import MemoryStorage
 
     host = "127.0.0.1"
     stop_event = threading.Event()

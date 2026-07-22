@@ -5,7 +5,7 @@ import anyio
 import anyio.lowlevel
 import pytest
 
-from app.storage.ftp.pool import FTPClientPool, PoolState
+from storegate.storage.ftp.pool import FTPClientPool, PoolState
 
 
 class FakeClient:

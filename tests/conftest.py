@@ -13,7 +13,7 @@ pytest_plugins = (
 @pytest.fixture(autouse=True, scope="session")
 def configure_logging() -> None:
     """Configure logging for tests."""
-    from app.log import log_format, log_level_filter, logger, remove_loguru_sinks
+    from storegate.log import log_format, log_level_filter, logger, remove_loguru_sinks
 
     remove_loguru_sinks()
     logger.add(

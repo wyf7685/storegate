@@ -5,8 +5,8 @@ import anyio
 import anyio.lowlevel
 import pytest
 
-from app.storage.s3.client import S3Config
-from app.storage.s3.storage import S3Storage
+from storegate.storage.s3.client import S3Config
+from storegate.storage.s3.storage import S3Storage
 
 
 class FakeS3Client:
@@ -33,7 +33,7 @@ async def test_ping_failure_with_cleanup_failure_preserves_client_and_error_orde
     client = FakeS3Client()
     cleanup_error = OSError("cleanup failed")
     client.__aexit__ = AsyncMock(side_effect=cleanup_error)  # type: ignore[method-assign]
-    monkeypatch.setattr("app.storage.s3.storage.AsyncS3Client", lambda _config: client)
+    monkeypatch.setattr("storegate.storage.s3.storage.AsyncS3Client", lambda _config: client)
     storage = S3Storage(s3_config)
     monkeypatch.setattr(storage, "ping", AsyncMock(return_value=False))
 
@@ -52,7 +52,7 @@ async def test_ping_failure_with_cleanup_failure_preserves_client_and_error_orde
 
 async def test_ping_success_publishes_connected_client(s3_config: S3Config, monkeypatch: pytest.MonkeyPatch) -> None:
     client = FakeS3Client()
-    monkeypatch.setattr("app.storage.s3.storage.AsyncS3Client", lambda _config: client)
+    monkeypatch.setattr("storegate.storage.s3.storage.AsyncS3Client", lambda _config: client)
     storage = S3Storage(s3_config)
     monkeypatch.setattr(storage, "ping", AsyncMock(return_value=True))
 
@@ -69,7 +69,7 @@ async def test_retry_cleans_retained_client_before_replacing_it(
     first.__aexit__ = AsyncMock(side_effect=[OSError("cleanup failed"), None])  # type: ignore[method-assign]
     second.__aexit__ = AsyncMock(return_value=None)  # type: ignore[method-assign]
     clients = iter((first, second))
-    monkeypatch.setattr("app.storage.s3.storage.AsyncS3Client", lambda _config: next(clients))
+    monkeypatch.setattr("storegate.storage.s3.storage.AsyncS3Client", lambda _config: next(clients))
     storage = S3Storage(s3_config)
     monkeypatch.setattr(storage, "ping", AsyncMock(side_effect=[False, True]))
 
@@ -111,7 +111,7 @@ async def test_cancellation_during_retained_client_cleanup_is_safe(
     second.__aenter__ = AsyncMock(side_effect=cancelled_enter)  # type: ignore[method-assign]
     second.__aexit__ = AsyncMock(return_value=None)  # type: ignore[method-assign]
     clients = iter((first, second, third))
-    monkeypatch.setattr("app.storage.s3.storage.AsyncS3Client", lambda _config: next(clients))
+    monkeypatch.setattr("storegate.storage.s3.storage.AsyncS3Client", lambda _config: next(clients))
     storage = S3Storage(s3_config)
     monkeypatch.setattr(storage, "ping", AsyncMock(side_effect=[False, True]))
 

@@ -8,15 +8,15 @@ import pytest
 from pydantic import SecretStr
 from pytest_mock import MockerFixture
 
-from app.storage.abstract import (
+from storegate.storage.abstract import (
     AbstractStorage,
     EntryKind,
     FileInfo,
     UnsupportedOperationError,
     WalkEntry,
 )
-from app.storage.s3 import S3Config, S3Storage
-from app.storage.s3.utils import deserialize_file_info, serialize_file_info
+from storegate.storage.s3 import S3Config, S3Storage
+from storegate.storage.s3.utils import deserialize_file_info, serialize_file_info
 from tests.support.ids import uid
 
 

@@ -97,7 +97,7 @@ fixture-parentheses = false
 mark-parentheses = false
 
 [lint.isort]
-known-first-party = ["app", "tests/*"]
+known-first-party = ["storegate", "tests/*"]
 extra-standard-library = ["typing_extensions"]
 
 [lint.pyupgrade]

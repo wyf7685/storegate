@@ -3,7 +3,7 @@
 import hashlib
 import os
 
-from app.storage.index import IndexStorage
+from storegate.storage.index import IndexStorage
 from tests.storage.index.helpers import BLOCK_SIZE
 from tests.support.ids import uid
 

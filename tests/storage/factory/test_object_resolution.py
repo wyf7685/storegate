@@ -4,8 +4,8 @@ from copy import deepcopy
 
 import pytest
 
-from app.storage.memory import MemoryStorage
-from app.utils import resolve_object
+from storegate.storage.memory import MemoryStorage
+from storegate.utils import resolve_object
 
 
 class TestResolveObject:
@@ -15,7 +15,7 @@ class TestResolveObject:
 
     def test_full_module_path_with_args(self):
         """Full 'module:Class' factory string with kwargs."""
-        spec = {"$factory": "app.storage.memory:MemoryStorage", "root": "fullpath"}
+        spec = {"$factory": "storegate.storage.memory:MemoryStorage", "root": "fullpath"}
         obj = resolve_object(spec)
         assert isinstance(obj, MemoryStorage)
         assert obj.id.endswith(":/fullpath")
@@ -38,7 +38,7 @@ class TestResolveObject:
 
     def test_ftp_storage_shorthand_with_config_dict(self):
         """~ftp coerces a nested config dict into FTPConfig."""
-        from app.storage.ftp import FTPStorage
+        from storegate.storage.ftp import FTPStorage
 
         spec = {
             "$factory": "~ftp",
@@ -54,7 +54,7 @@ class TestResolveObject:
 
     def test_sftp_storage_shorthand_with_config_dict(self):
         """~sftp coerces a nested config dict into SFTPConfig."""
-        from app.storage.sftp import SFTPStorage
+        from storegate.storage.sftp import SFTPStorage
 
         spec = {
             "$factory": "~sftp",
@@ -71,7 +71,7 @@ class TestResolveObject:
 
     def test_server_shorthand_default_cls(self):
         """@ftp  →  app.server.ftp.Server (= FTPServer), with nested storage."""
-        from app.server.ftp import FTPServer
+        from storegate.server.ftp import FTPServer
 
         spec = {
             "$factory": "@ftp",

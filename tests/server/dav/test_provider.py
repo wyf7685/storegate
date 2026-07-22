@@ -10,10 +10,10 @@ import pytest
 from pytest_mock import MockerFixture
 from wsgidav.dav_error import DAVError
 
-from app.server.dav.collection import StorageCollection
-from app.server.dav.provider import StorageProvider
-from app.server.dav.resource import StorageResource
-from app.server.dav.utils import (
+from storegate.server.dav.collection import StorageCollection
+from storegate.server.dav.provider import StorageProvider
+from storegate.server.dav.resource import StorageResource
+from storegate.server.dav.utils import (
     current_event_loop_token,
     reject_hidden_destination,
     require_visible_directory,

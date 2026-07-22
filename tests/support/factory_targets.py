@@ -1,4 +1,4 @@
-from app.storage.abstract import AbstractStorage
+from storegate.storage.abstract import AbstractStorage
 
 
 def bundle(

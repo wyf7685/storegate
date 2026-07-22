@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from app.storage import EntryKind, UnsupportedOperationError
-from app.storage.local import LocalStorage
+from storegate.storage import EntryKind, UnsupportedOperationError
+from storegate.storage.local import LocalStorage
 
 
 async def _storage(root: Path) -> LocalStorage:

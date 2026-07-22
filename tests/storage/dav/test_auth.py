@@ -3,10 +3,10 @@
 import pytest
 from pydantic import SecretStr
 
-from app.storage.dav.client import build_auth
-from app.storage.dav.client.auth import _BearerAuth
-from app.storage.dav.client.models import DavConfig
-from app.utils import httpx
+from storegate.storage.dav.client import build_auth
+from storegate.storage.dav.client.auth import _BearerAuth
+from storegate.storage.dav.client.models import DavConfig
+from storegate.utils import httpx
 
 pytestmark = pytest.mark.httpx
 

@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
-from app.storage.sftp import SFTPConfig, SFTPStorage
+from storegate.storage.sftp import SFTPConfig, SFTPStorage
 from tests.fixtures.protocol_servers import SFTPServerInfo
 
 

@@ -2,8 +2,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.storage.cached import CachedStorage
-from app.storage.memory import MemoryStorage
+from storegate.storage.cached import CachedStorage
+from storegate.storage.memory import MemoryStorage
 
 
 async def test_child_connect_failure_closes_cache_and_allows_retry(monkeypatch: pytest.MonkeyPatch) -> None:

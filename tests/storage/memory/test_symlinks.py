@@ -2,8 +2,8 @@ import errno
 
 import pytest
 
-from app.storage import EntryKind, WalkEntry
-from app.storage.memory import MemoryStorage
+from storegate.storage import EntryKind, WalkEntry
+from storegate.storage.memory import MemoryStorage
 
 
 async def test_capabilities_and_mutually_exclusive_namespace() -> None:

@@ -8,10 +8,10 @@ import pytest
 from pydantic import SecretStr
 from pytest_mock import MockerFixture
 
-from app.storage.s3.client import AsyncS3Client, S3Config
-from app.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
-from app.storage.s3.utils import MultipartUploadTask
-from app.utils import httpx
+from storegate.storage.s3.client import AsyncS3Client, S3Config
+from storegate.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
+from storegate.storage.s3.utils import MultipartUploadTask
+from storegate.utils import httpx
 
 pytestmark = pytest.mark.httpx
 

@@ -1,6 +1,6 @@
 """CachedStorage behavior tests."""
 
-from app.storage.cached import CachedStorage
+from storegate.storage.cached import CachedStorage
 from tests.support.ids import uid
 
 

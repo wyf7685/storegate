@@ -7,7 +7,7 @@ import anyio.lowlevel
 import asyncssh
 import pytest
 
-from app.storage.sftp.pool import SFTPChannelPool
+from storegate.storage.sftp.pool import SFTPChannelPool
 
 
 class FakeTransport:

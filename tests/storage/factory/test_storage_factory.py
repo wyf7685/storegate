@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from app.storage.factory import resolve_storage, resolve_storage_from_file
-from app.storage.memory import MemoryStorage
+from storegate.storage.factory import resolve_storage, resolve_storage_from_file
+from storegate.storage.memory import MemoryStorage
 
 
 class TestResolveStorage:

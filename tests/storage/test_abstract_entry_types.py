@@ -6,7 +6,7 @@ from typing import cast, get_type_hints
 
 import pytest
 
-from app.storage import (
+from storegate.storage import (
     AbstractStorage,
     EntryKind,
     FileInfo,
@@ -14,7 +14,7 @@ from app.storage import (
     UnsupportedOperationError,
     WalkEntry,
 )
-from app.storage.abstract import BytesLike, PathLike
+from storegate.storage.abstract import BytesLike, PathLike
 
 
 class ProbeStorage(AbstractStorage):

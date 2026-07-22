@@ -5,11 +5,11 @@ import errno
 
 import pytest
 
-from app.storage import AbstractStorage, EntryKind, FileInfo, UnsupportedOperationError, WalkEntry
-from app.storage.cached import CachedStorage
-from app.storage.local import LocalStorage
-from app.storage.memory import MemoryStorage
-from app.storage.sftp import SFTPStorage
+from storegate.storage import AbstractStorage, EntryKind, FileInfo, UnsupportedOperationError, WalkEntry
+from storegate.storage.cached import CachedStorage
+from storegate.storage.local import LocalStorage
+from storegate.storage.memory import MemoryStorage
+from storegate.storage.sftp import SFTPStorage
 from tests.support.ids import uid
 
 _UNSUPPORTED_ERRNOS = {errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)}

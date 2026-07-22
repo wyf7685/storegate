@@ -4,9 +4,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.storage import AbstractStorage, EntryKind, FileInfo, WalkEntry
-from app.storage.cached import CachedStorage
-from app.storage.memory import MemoryStorage
+from storegate.storage import AbstractStorage, EntryKind, FileInfo, WalkEntry
+from storegate.storage.cached import CachedStorage
+from storegate.storage.memory import MemoryStorage
 from tests.storage.cached.helpers import _clear_path
 
 _FOLLOW_NAMESPACES = ("stat", "exists", "is_file", "is_dir", "download")

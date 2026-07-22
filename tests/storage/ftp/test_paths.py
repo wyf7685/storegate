@@ -4,7 +4,7 @@ import aioftp
 import pytest
 from pydantic import SecretStr
 
-from app.storage.ftp import FTPConfig, FTPStorage
+from storegate.storage.ftp import FTPConfig, FTPStorage
 from tests.support.ids import uid
 
 pytestmark = pytest.mark.integration

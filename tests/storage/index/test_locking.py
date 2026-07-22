@@ -8,11 +8,11 @@ from datetime import UTC, datetime, timedelta
 import anyio
 import pytest
 
-from app.storage.abstract import BytesLike, FileInfo, PathLike
-from app.storage.index import IndexStorage
-from app.storage.index.lock import LockLeaseLostError, StorageFileLocker
-from app.storage.index.ref import hash_to_path
-from app.storage.memory import MemoryStorage
+from storegate.storage.abstract import BytesLike, FileInfo, PathLike
+from storegate.storage.index import IndexStorage
+from storegate.storage.index.lock import LockLeaseLostError, StorageFileLocker
+from storegate.storage.index.ref import hash_to_path
+from storegate.storage.memory import MemoryStorage
 
 
 class _CommitThenBlockStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]

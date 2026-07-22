@@ -2,8 +2,8 @@ from pathlib import PurePosixPath
 
 import pytest
 
-from app.storage import EntryKind
-from app.storage.sftp import SFTPStorage
+from storegate.storage import EntryKind
+from storegate.storage.sftp import SFTPStorage
 from tests.fixtures.protocol_servers import SFTPServerInfo
 from tests.storage.sftp.test_lifecycle import make_config
 from tests.support.ids import uid

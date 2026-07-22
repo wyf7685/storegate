@@ -4,7 +4,7 @@ import contextlib
 
 import pytest
 
-from app.storage import AbstractStorage
+from storegate.storage import AbstractStorage
 from tests.support.ids import uid
 
 

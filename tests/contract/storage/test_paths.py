@@ -2,7 +2,7 @@
 
 from pathlib import PurePosixPath
 
-from app.storage import AbstractStorage
+from storegate.storage import AbstractStorage
 
 
 class TestNormalizePath:

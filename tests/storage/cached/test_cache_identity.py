@@ -4,12 +4,12 @@ from pathlib import Path
 
 from pydantic import SecretStr
 
-from app.storage.dav import DavConfig, DavStorage
-from app.storage.index import IndexStorage
-from app.storage.local import LocalStorage
-from app.storage.memory import MemoryStorage
-from app.storage.s3 import S3Storage
-from app.storage.s3.client import S3Config
+from storegate.storage.dav import DavConfig, DavStorage
+from storegate.storage.index import IndexStorage
+from storegate.storage.local import LocalStorage
+from storegate.storage.memory import MemoryStorage
+from storegate.storage.s3 import S3Storage
+from storegate.storage.s3.client import S3Config
 
 
 def _s3_config(*, secret_access_key: str, endpoint_url: str) -> S3Config:

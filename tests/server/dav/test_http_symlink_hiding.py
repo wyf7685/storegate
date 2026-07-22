@@ -8,9 +8,9 @@ import anyio.to_thread
 import pytest
 from wsgidav.wsgidav_app import WsgiDAVApp
 
-from app.server.dav.server import create_wsgi_app
-from app.server.dav.utils import current_event_loop_token
-from app.utils import httpx
+from storegate.server.dav.server import create_wsgi_app
+from storegate.server.dav.utils import current_event_loop_token
+from storegate.utils import httpx
 
 from ._storage import SymlinkTrapStorage
 

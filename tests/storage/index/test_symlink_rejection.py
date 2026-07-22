@@ -4,11 +4,11 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from app.storage import EntryKind, FileInfo, StorageCapabilities, UnsupportedOperationError, WalkEntry
-from app.storage.index import IndexStorage
-from app.storage.index.ref import hash_to_path
-from app.storage.index.storage import CHUNKS_INDEX_FILE, FileMeta
-from app.storage.memory import MemoryStorage
+from storegate.storage import EntryKind, FileInfo, StorageCapabilities, UnsupportedOperationError, WalkEntry
+from storegate.storage.index import IndexStorage
+from storegate.storage.index.ref import hash_to_path
+from storegate.storage.index.storage import CHUNKS_INDEX_FILE, FileMeta
+from storegate.storage.memory import MemoryStorage
 
 
 def _inject_memory_symlink(storage: MemoryStorage, link_path: str, target: str) -> None:

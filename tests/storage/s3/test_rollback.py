@@ -12,11 +12,11 @@ import pytest
 from pydantic import SecretStr
 from pytest_mock import MockerFixture
 
-from app.storage.abstract import EntryKind, FileInfo, PathLike, WalkEntry
-from app.storage.s3.client import CopyPartResult, S3Config, S3HttpStatusError
-from app.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
-from app.storage.s3.utils import serialize_file_info
-from app.utils import flatten_exception_group
+from storegate.storage.abstract import EntryKind, FileInfo, PathLike, WalkEntry
+from storegate.storage.s3.client import CopyPartResult, S3Config, S3HttpStatusError
+from storegate.storage.s3.storage import UPLOAD_CHUNK_SIZE, S3Storage
+from storegate.storage.s3.utils import serialize_file_info
+from storegate.utils import flatten_exception_group
 
 
 @pytest.fixture

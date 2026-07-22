@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from app.server.factory import resolve_server, resolve_server_from_file
-from app.server.ftp import FTPServer
-from app.storage.memory import MemoryStorage
+from storegate.server.factory import resolve_server, resolve_server_from_file
+from storegate.server.ftp import FTPServer
+from storegate.storage.memory import MemoryStorage
 
 
 class TestResolveServer:

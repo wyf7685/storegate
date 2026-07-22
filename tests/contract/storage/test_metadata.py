@@ -4,7 +4,7 @@ from pathlib import PurePosixPath
 
 import pytest
 
-from app.storage import AbstractStorage, EntryKind, FileInfo
+from storegate.storage import AbstractStorage, EntryKind, FileInfo
 from tests.support.ids import uid
 
 

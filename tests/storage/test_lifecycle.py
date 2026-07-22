@@ -5,8 +5,8 @@ import anyio
 import anyio.lowlevel
 import pytest
 
-from app.storage.abstract import LifecycleImplementation
-from app.storage.memory import MemoryStorage
+from storegate.storage.abstract import LifecycleImplementation
+from storegate.storage.memory import MemoryStorage
 
 
 class CountingStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]

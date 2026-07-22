@@ -2,8 +2,8 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from app.storage.index import IndexStorage
-from app.storage.memory import MemoryStorage
+from storegate.storage.index import IndexStorage
+from storegate.storage.memory import MemoryStorage
 from tests.storage.index.helpers import BLOCK_SIZE
 
 

@@ -1,7 +1,7 @@
 """WebDAV client configuration tests."""
 
-from app.storage.dav.client import AsyncDavClient
-from app.storage.dav.client.models import DavConfig
+from storegate.storage.dav.client import AsyncDavClient
+from storegate.storage.dav.client.models import DavConfig
 
 
 class TestBuildPath:

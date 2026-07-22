@@ -11,8 +11,6 @@ wheels/
 
 /data
 /logs
-
-# Root-level test scripts (real tests are in tests/)
 /test*.py
 /run*.py
 .coverage*

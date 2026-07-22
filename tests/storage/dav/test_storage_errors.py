@@ -7,16 +7,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pytest_mock import MockerFixture
 
-from app.storage.abstract import EntryKind, FileInfo, UnsupportedOperationError, WalkEntry
-from app.storage.dav import DavStorage
-from app.storage.dav.client import DavResource
-from app.storage.dav.client.errors import DavHttpStatusError
-from app.utils import flatten_exception_group
+from storegate.storage.abstract import EntryKind, FileInfo, UnsupportedOperationError, WalkEntry
+from storegate.storage.dav import DavStorage
+from storegate.storage.dav.client import DavResource
+from storegate.storage.dav.client.errors import DavHttpStatusError
+from storegate.utils import flatten_exception_group
 
 
 @pytest.fixture
 def dav_mocked(mocker: MockerFixture) -> DavStorage:
-    from app.storage.dav import DavConfig
+    from storegate.storage.dav import DavConfig
 
     cfg = DavConfig(base_url="http://localhost/dav", auth_mode="anonymous")
     s = DavStorage(cfg)

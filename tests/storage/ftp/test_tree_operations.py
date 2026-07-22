@@ -5,7 +5,7 @@ from pathlib import PurePosixPath
 import aioftp
 import pytest
 
-from app.storage.ftp import FTPStorage
+from storegate.storage.ftp import FTPStorage
 from tests.support.ids import uid
 
 pytestmark = pytest.mark.integration

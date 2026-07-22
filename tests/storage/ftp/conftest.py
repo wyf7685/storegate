@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from app.storage.ftp import FTPConfig, FTPStorage
+from storegate.storage.ftp import FTPConfig, FTPStorage
 
 
 @pytest.fixture

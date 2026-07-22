@@ -9,8 +9,8 @@ import anyio.to_thread
 import pytest
 from pytest_mock import MockerFixture
 
-from app.server.dav.resource import ResourceReader, ResourceWriter, StorageResource
-from app.server.dav.utils import current_event_loop_token
+from storegate.server.dav.resource import ResourceReader, ResourceWriter, StorageResource
+from storegate.server.dav.utils import current_event_loop_token
 
 from ._storage import SymlinkTrapStorage
 
@@ -114,7 +114,7 @@ async def test_storage_resource_write_state_transitions(mocker: MockerFixture) -
     storage.files["/file.bin"] = b"original"
     resource = StorageResource("/file.bin", {"wsgidav.provider": MagicMock()}, storage)
     writer = MagicMock(spec=ResourceWriter)
-    writer_cls = mocker.patch("app.server.dav.resource.ResourceWriter", return_value=writer)
+    writer_cls = mocker.patch("storegate.server.dav.resource.ResourceWriter", return_value=writer)
 
     with pytest.raises(RuntimeError, match="No write operation"):
         await anyio.to_thread.run_sync(lambda: resource.end_write(with_errors=False))

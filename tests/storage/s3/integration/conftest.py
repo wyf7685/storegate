@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from app.storage.s3 import S3Storage
+from storegate.storage.s3 import S3Storage
 
 
 @pytest.fixture
