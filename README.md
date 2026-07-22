@@ -54,8 +54,8 @@ flowchart LR
 
 项目分为两层：
 
-1. **存储层 `app/storage/`**：定义统一文件系统语义，并实现各存储后端和组合层。
-2. **协议层 `app/server/`**：将存储接口适配为 WebDAV 或 FTP 服务。
+1. **存储层 `storegate/storage/`**：定义统一文件系统语义，并实现各存储后端和组合层。
+2. **协议层 `storegate/server/`**：将存储接口适配为 WebDAV 或 FTP 服务。
 
 ### 存储后端
 
@@ -77,19 +77,36 @@ flowchart LR
 - Python `>= 3.14`
 - [uv](https://docs.astral.sh/uv/)（推荐的依赖与运行环境管理工具）
 
-安装项目及开发依赖：
+开发环境安装：
 
 ```bash
 uv sync --group dev
 ```
 
-S3 / WebDAV 客户端默认使用 `httpx`。若要切换到兼容的 [httpx2](https://github.com/pydantic/httpx2)，安装可选 extra：
+`dev` 依赖组会安装 `storegate[full]`、测试工具和静态检查工具。作为库使用时可按需选择安装范围：
 
 ```bash
-uv sync --group dev --extra httpx2
+pip install storegate                 # 核心：Memory、Local、S3、WebDAV 客户端、Index、内存缓存
+pip install "storegate[standard]"     # 常用运行时：再加入 FTP/SFTP、协议服务端与 Redis
+pip install "storegate[full]"         # standard + ayafileio + httpx2 + uvloop/winloop
 ```
 
-代码统一通过 `from app.utils import httpx` 导入；运行时优先使用已安装的 `httpx2`，否则回退到 `httpx`。CI 可对 `pytest -m httpx` 子集分别在默认依赖与 `uv sync --extra httpx2` 下验证两条路径。
+| Extra | 提供的能力 |
+| --- | --- |
+| `ftp-storage` | `FTPStorage` |
+| `sftp-storage` | `SFTPStorage` |
+| `redis` | `RedisCacheBackend` |
+| `ftp-server` | `FTPServer` |
+| `dav-server` | `DAVServer` |
+| `standard` | 上述常用存储、缓存和服务端能力 |
+| `ayafileio` | 本地文件上传/下载的可选异步文件 I/O；未安装时回退 AnyIO |
+| `httpx2` | S3 / WebDAV HTTP 客户端优先使用 `httpx2`，未安装时回退 `httpx` |
+| `uvloop` | Unix 安装 `uvloop`，Windows 安装 `winloop` |
+| `full` | `standard` 与全部可选性能/HTTP 运行时 |
+
+导入依赖可选包的 FTP/SFTP 存储、FTP/WebDAV 服务端，或构造 Redis 缓存后端时，若缺少对应 extra，会抛出带安装命令的 `ImportError`。
+
+HTTP 代码统一通过 `from storegate.utils import httpx` 导入。CI 对 `pytest -m httpx` 子集分别在默认 `httpx` 与 `uv sync --extra httpx2` 环境下验证两条路径。
 
 ## 快速开始
 
@@ -98,7 +115,7 @@ uv sync --group dev --extra httpx2
 ```python
 import anyio
 
-from app.storage.memory import MemoryStorage
+from storegate.storage.memory import MemoryStorage
 
 
 async def main() -> None:
@@ -119,7 +136,7 @@ anyio.run(main)
 本地文件系统只需替换后端：
 
 ```python
-from app.storage.local import LocalStorage
+from storegate.storage.local import LocalStorage
 
 storage = LocalStorage("./runtime/files")
 ```
@@ -131,8 +148,8 @@ storage = LocalStorage("./runtime/files")
 ```python
 import anyio
 
-from app.server.dav import DAVServer
-from app.storage.local import LocalStorage
+from storegate.server.dav import DAVServer
+from storegate.storage.local import LocalStorage
 
 
 async def main() -> None:
@@ -154,8 +171,8 @@ anyio.run(main)
 ```python
 import anyio
 
-from app.server.ftp import FTPServer
-from app.storage.local import LocalStorage
+from storegate.server.ftp import FTPServer
+from storegate.storage.local import LocalStorage
 
 
 async def main() -> None:
@@ -176,9 +193,9 @@ anyio.run(main)
 
 Storegate 使用 `$factory` 描述要创建的对象：
 
-- `~name`：解析为 `app.storage.name.Storage`
+- `~name`：解析为 `storegate.storage.name.Storage`
 - `~name:ClassName`：解析为指定存储类
-- `@name`：解析为 `app.server.name.Server`
+- `@name`：解析为 `storegate.server.name.Server`
 - `@name:ClassName`：解析为指定服务类
 - 包含 `$factory` 的嵌套对象会被递归创建
 
@@ -206,7 +223,7 @@ Storegate 使用 `$factory` 描述要创建的对象：
 ```python
 import anyio
 
-from app.server import resolve_server_from_file
+from storegate.server import resolve_server_from_file
 
 server = resolve_server_from_file("server.json")
 anyio.run(server.serve)
@@ -231,7 +248,7 @@ anyio.run(server.serve)
 ```
 
 ```python
-from app.storage.s3 import S3Storage
+from storegate.storage.s3 import S3Storage
 
 storage = S3Storage("s3.json")
 ```
@@ -329,7 +346,7 @@ SFTP 默认执行 SSH host key 校验。测试或受控环境中只有显式设�
 `copy()` / `move()` 默认覆盖目标文件，传入 `overwrite=False` 时目标文件冲突抛出
 `FileExistsError`，源或目标目录始终抛出 `IsADirectoryError`。同一路径仅在
 `overwrite=True` 且源为文件时是无操作；缺少源仍抛出 `FileNotFoundError`。具体异常语义以
-`app/storage/abstract.py` 中的接口文档和契约测试为准；远端协议无法分类的错误才保留为 `OSError`。
+`storegate/storage/abstract.py` 中的接口文档和契约测试为准；远端协议无法分类的错误才保留为 `OSError`。
 
 ## 开发与测试
 
@@ -360,7 +377,7 @@ uv run prek install
 ## 目录结构
 
 ```text
-app/
+storegate/
 ├── storage/
 │   ├── abstract.py       # AbstractStorage 与 FileInfo
 │   ├── factory.py        # 存储配置解析

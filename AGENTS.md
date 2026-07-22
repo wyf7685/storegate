@@ -12,7 +12,7 @@ This file provides guidance to AI coding agents when working with code in this r
 uv run pytest                                # 全部测试（本地 Moto S3；外部 S3 有配置时运行）
 uv run pytest -m "not s3"                    # 跳过需要外部 credentials 的真实 S3 测试
 uv run pytest -m integration                 # 本地 Moto S3 / DAV / FTP 协议集成测试
-uv run pytest -m httpx                       # 所有走 app.utils.httpx 的路径（CI 双矩阵子集）
+uv run pytest -m httpx                       # 所有走 storegate.utils.httpx 的路径（CI 双矩阵子集）
 uv run pytest tests/contract/storage -k memory  # 仅 MemoryStorage 公共契约
 
 # 静态检查
@@ -20,12 +20,20 @@ uv run ruff check --fix          # lint 检查 + 自动修复
 uv run ruff format               # 格式化（修改文件）
 uv run ty check                  # 静态类型检查
 
-# 可选：使用 httpx2 替代默认 httpx（S3 / DAV HTTP 客户端）
-# CI 对 httpx 子集分别跑：默认依赖 与  --extra httpx2
-uv sync --group dev --extra httpx2
+# `dev` 组安装 storegate[full]；CI 的运行时测试组只安装 storegate[standard]
+uv sync --group dev
+uv sync --no-dev --group test
 ```
 
 本项目使用 Python 3.14，包管理器为 `uv`。pytest 配置在 `pyproject.toml` 的 `[tool.pytest.ini_options]`，含 `asyncio_mode = "auto"`。已配置 `prek` pre-commit hooks（ruff 检查 + 格式化 + ty 检查）。
+
+### 包命名空间与可选依赖
+
+- Python 包根命名空间是 `storegate`；业务代码、测试、覆盖率目标和动态工厂路径不得再使用旧的 `app` 命名空间。
+- 核心依赖支持 Memory、Local、S3、WebDAV 客户端、Index 与内存缓存；可选运行时按 extra 拆分：`ftp-storage`、`sftp-storage`、`redis`、`ftp-server`、`dav-server`。
+- `standard` 聚合上述常用运行时；`ayafileio`、`httpx2`、`uvloop` 分别提供可选文件 I/O、HTTP 客户端和事件循环；`full` 聚合 `standard` 及这三个可选运行时。
+- FTP/SFTP 存储、FTP/WebDAV 服务端在包入口调用 `requires_extra()`；Redis 后端在构造时调用。缺失依赖必须抛出指向 `storegate[<extra>]` 的 `ImportError`，不得静默降级。
+- `ayafileio`、`httpx2` 属于显式兼容回退：未安装时分别回退 AnyIO 文件 I/O 和标准 `httpx`。业务代码仍只能从 `storegate.utils` 使用这些兼容入口。
 
 ## 开发要求
 
@@ -96,7 +104,7 @@ tests/
 
 **参数化契约**：`tests/fixtures/storage.py` 的 `storage` fixture 将 `tests/contract/storage/` 对 8 个后端执行：`memory` / `local` / `s3` / `cached` / `index` / `ftp` / `dav` / `sftp`。S3 契约通过 `tests/fixtures/protocol_servers.py` 启动 session 级 Moto Server，使用随机端口、预创建 bucket 和 path-style `http://127.0.0.1:<port>` endpoint，无需外部 credentials；必须使用 IPv4 地址而非 `localhost`，避免 Windows 上 IPv6 连接回退造成逐请求延迟。`cached` 和 `index` 使用 `MemoryStorage` 保证可重现；DAV、FTP 和 SFTP 同样通过本地随机端口服务执行，SFTP fixture 使用临时 Ed25519 host key、known_hosts 和 chroot。
 
-**测试分层**：目录路径表达被测组件，marker 只表达运行性质。`integration` 表示启动本地 Moto S3 / DAV / FTP / SFTP 协议服务，`s3` 仅表示需要外部 S3 credentials，`slow` 表示异常耗时测试，`httpx` 表示会真实经 `app.utils.httpx` 发出/模拟 HTTP 的路径（含 S3/DAV 契约参数、相关 unit 与 integration），供 CI 在默认 `httpx` 与 optional `httpx2` 两套环境中分别执行。纯单元测试不得仅因属于某个后端而标记为 integration；仅 mock 掉 client、不触达 HTTP 栈的测试不要打 `httpx`。
+**测试分层**：目录路径表达被测组件，marker 只表达运行性质。`integration` 表示启动本地 Moto S3 / DAV / FTP / SFTP 协议服务，`s3` 仅表示需要外部 S3 credentials，`slow` 表示异常耗时测试，`httpx` 表示会真实经 `storegate.utils.httpx` 发出/模拟 HTTP 的路径（含 S3/DAV 契约参数、相关 unit 与 integration），供 CI 在默认 `httpx` 与 optional `httpx2` 两套环境中分别执行。纯单元测试不得仅因属于某个后端而标记为 integration；仅 mock 掉 client、不触达 HTTP 栈的测试不要打 `httpx`。
 
 **测试辅助代码**：可导入辅助函数放在 `tests/support/`。`conftest.py` 只用于 fixture 和 pytest 配置，不作为普通 Python 模块导入。后端专属 fixture 放在对应目录的 `conftest.py`。
 
@@ -107,7 +115,7 @@ tests/
 ### 分层结构
 
 ```
-app/
+storegate/
 ├── const.py               # ROOT, DEFAULT_CHUNK_SIZE
 ├── log.py                 # loguru 日志配置 + logging→loguru 桥接
 ├── utils.py               # LoggerWrapper (+ LoguruOpts), resolve_object, ExceptionTranslator, coalesce_chunks, flatten_exception_group；httpx 兼容入口（优先 httpx2）
@@ -115,7 +123,7 @@ app/
 │   ├── abstract.py        # AbstractStorage ABC + FileInfo dataclass
 │   ├── factory.py         # resolve_storage / resolve_storage_from_file（基于 resolve_object）
 │   ├── s3/                # S3 兼容实现（AWS SigV4，支持 AWS S3 / MinIO / 腾讯云 COS 等）
-│   │   ├── client/        # 自研 S3 SDK（经 app.utils.httpx，AWS SigV4 签名）
+│   │   ├── client/        # 自研 S3 SDK（经 storegate.utils.httpx，AWS SigV4 签名）
 │   │   │   ├── auth.py     # AWSSigV4Signer: SigV4 签名算法
 │   │   │   ├── client.py   # AsyncS3Client: httpx/httpx2 HTTP 客户端
 │   │   │   ├── errors.py   # S3ClientError, S3HttpStatusError, S3ResponseParseError
@@ -141,7 +149,7 @@ app/
 │   │   ├── pool.py        # 单 SSH transport、多 SFTP channel 的有界复用
 │   │   └── storage.py     # SFTPStorage: SFTP → AbstractStorage 映射与树事务
 │   └── dav/               # WebDAV 客户端实现（访问远程 WebDAV 服务器）
-│       ├── client/        # 自研 WebDAV SDK（经 app.utils.httpx）
+│       ├── client/        # 自研 WebDAV SDK（经 storegate.utils.httpx）
 │       │   ├── auth.py     # build_auth: Basic / Bearer / Anonymous
 │       │   ├── client.py   # AsyncDavClient: httpx/httpx2，PROPFIND/MKCOL/COPY/MOVE
 │       │   ├── errors.py   # DavClientError, DavHttpStatusError, DavResponseParseError
@@ -176,18 +184,18 @@ tests/
 
 **`AbstractStorage`** 是唯一存储接口，所有后端之间互相对称：
 - **简单后端**: `LocalStorage`, `MemoryStorage` — 直接实现存储
-- **网络后端**: `S3Storage`, `DavStorage`, `FTPStorage`, `SFTPStorage` — 使用异步网络客户端并映射为统一存储契约；S3/DAV 使用自研 HTTP SDK（经 `app.utils.httpx`，默认 `httpx`，安装 optional extra `httpx2` 后优先 `httpx2`），FTP 使用 aioftp 独占 client pool，SFTP 使用 AsyncSSH 单 transport、多 channel pool
+- **网络后端**: `S3Storage`, `DavStorage`, `FTPStorage`, `SFTPStorage` — 使用异步网络客户端并映射为统一存储契约；S3/DAV 使用自研 HTTP SDK（经 `storegate.utils.httpx`，默认 `httpx`，安装 optional extra `httpx2` 后优先 `httpx2`），FTP 使用 aioftp 独占 client pool，SFTP 使用 AsyncSSH 单 transport、多 channel pool
 - **中间件模式**: `CachedStorage` 和 `IndexStorage` 都包装其他 `AbstractStorage` 实例，形成装饰器链。典型堆叠: `IndexStorage(CachedStorage(S3Storage(...), S3Storage(...)))`
 - **文件操作**: `upload/download_stream`、`unlink/rmdir/delete/delete_many`、`move/copy`
 - **目录操作**: `mkdir/rmtree`、`copytree/movetree`（`movetree` 默认实现为 copy + rmtree，后端可覆盖为更高效的实现）
 
-**`resolve_object`** (`utils.py`) 是基于 dict 的依赖注入函数，使用 `$factory` 键约定动态构建对象图。`app/storage/factory.py` 和 `app/server/factory.py` 分别提供类型守卫的 `resolve_storage` / `resolve_server`：
+**`resolve_object`** (`utils.py`) 是基于 dict 的依赖注入函数，使用 `$factory` 键约定动态构建对象图。`storegate/storage/factory.py` 和 `storegate/server/factory.py` 分别提供类型守卫的 `resolve_storage` / `resolve_server`：
 ```json
 {"$factory": "~s3", "config": "data/config.json"}
 {"$factory": "~cached", "storage": {"$factory": "~memory", "root": "cache-root"}, "ttl": 60}
 ```
-- `~name` 简写 → `app.storage.name.Storage`（默认 cls），或 `~name:ClassName`
-- `@name` 简写 → `app.server.name.Server`（默认 cls），或 `@name:ClassName`
+- `~name` 简写 → `storegate.storage.name.Storage`（默认 cls），或 `~name:ClassName`
+- `@name` 简写 → `storegate.server.name.Server`（默认 cls），或 `@name:ClassName`
 - 嵌套 spec 通过 dict + `$factory` 键递归识别
 
 ### 各后端行为差异
@@ -205,8 +213,8 @@ tests/
 
 ### 关键实现细节
 
-- **S3 目录模拟**: 以 `<key>/` 标记对象表示目录，其内容为序列化的 `FileInfo`。`client/` 是手写的 S3 API 封装（经 `app.utils.httpx`，AWS SigV4 签名），支持 AWS S3 及所有 S3 兼容服务（MinIO、腾讯云 COS 等），通过 `S3Config.endpoint_url` + `path_style` 配置端点寻址（virtual-hosted / path-style）。大文件分片上传（`MultipartUploadTask`，支持重试和并发），大文件服务端拷贝自动切换为 multipart copy（>4MiB）。`move`、`copytree`、`_copy_multipart` 失败时自动回滚；move 的主失败和任何源/目标恢复失败作为 primary-first exception group 保留。
-- **DavStorage**: WebDAV 客户端后端，与 `S3Storage` 对称（自研 `client/` SDK + `storage.py` 适配器，经 `app.utils.httpx`）。支持 Basic / Bearer / 匿名认证与 HTTPS/TLS（含自定义 CA `ca_cert_path`）。方法映射：`PROPFIND`（Depth:0/1）→ stat/iterdir，`PUT`（流式 body）→ upload_stream，`GET`（Range）→ download_stream，`MKCOL` → mkdir，`DELETE` → unlink/rmdir/rmtree，`COPY`/`MOVE`（Overwrite 头）→ copy/move/copytree/movetree。`rmdir` 需 DELETE 前用 `iterdir` 预检空（WebDAV DELETE 天然递归）；`rmtree` 单次 DELETE 递归删集合；`walk` 用递归 Depth:1（避开被 Nextcloud/mod_dav 默认禁用的 infinity）；`copytree`/`movetree` 优先服务端 `COPY`/`MOVE` Depth:infinity，服务器返回 403/405/409/501 时回退 walk+逐文件 copy。fallback 对每个待覆盖文件用临时 MOVE 备份，中途失败恢复备份并保留回滚错误。`move` 对 412（服务器拒覆盖）先删目标再重试以维持覆盖语义。
+- **S3 目录模拟**: 以 `<key>/` 标记对象表示目录，其内容为序列化的 `FileInfo`。`client/` 是手写的 S3 API 封装（经 `storegate.utils.httpx`，AWS SigV4 签名），支持 AWS S3 及所有 S3 兼容服务（MinIO、腾讯云 COS 等），通过 `S3Config.endpoint_url` + `path_style` 配置端点寻址（virtual-hosted / path-style）。大文件分片上传（`MultipartUploadTask`，支持重试和并发），大文件服务端拷贝自动切换为 multipart copy（>4MiB）。`move`、`copytree`、`_copy_multipart` 失败时自动回滚；move 的主失败和任何源/目标恢复失败作为 primary-first exception group 保留。
+- **DavStorage**: WebDAV 客户端后端，与 `S3Storage` 对称（自研 `client/` SDK + `storage.py` 适配器，经 `storegate.utils.httpx`）。支持 Basic / Bearer / 匿名认证与 HTTPS/TLS（含自定义 CA `ca_cert_path`）。方法映射：`PROPFIND`（Depth:0/1）→ stat/iterdir，`PUT`（流式 body）→ upload_stream，`GET`（Range）→ download_stream，`MKCOL` → mkdir，`DELETE` → unlink/rmdir/rmtree，`COPY`/`MOVE`（Overwrite 头）→ copy/move/copytree/movetree。`rmdir` 需 DELETE 前用 `iterdir` 预检空（WebDAV DELETE 天然递归）；`rmtree` 单次 DELETE 递归删集合；`walk` 用递归 Depth:1（避开被 Nextcloud/mod_dav 默认禁用的 infinity）；`copytree`/`movetree` 优先服务端 `COPY`/`MOVE` Depth:infinity，服务器返回 403/405/409/501 时回退 walk+逐文件 copy。fallback 对每个待覆盖文件用临时 MOVE 备份，中途失败恢复备份并保留回滚错误。`move` 对 412（服务器拒覆盖）先删目标再重试以维持覆盖语义。
 - **IndexStorage**: 大文件按 `BLOCK_SIZE (64MB)` 拆分分块，SHA-256 去重，引用计数管理。文件锁带 owner、lease 和绝对 acquisition deadline：持锁期间自动续租，慢速 handoff、取消和清理均受 deadline/guard 约束，释放只删除自己仍持有的锁。索引和 chunk 子后端连接失败时关闭已启动子项；回滚关闭失败会保存并在下一次 `connect()` 前重试。树 copy/move 持有 source/destination tree 锁；覆盖目标 chunk 保留临时 rollback ref，失败时逐文件恢复 source、目标和 refs，并保留 rollback 失败。所有公开入口方法统一调用 `_to_abs_path()` 规范化路径为绝对路径，确保 `FileMeta` 和 chunk ref 文件中存储的路径一致。
 - **CachedStorage**: 6 个命名空间缓存 (`exists/is_file/is_dir/stat/iterdir/download`)。正结果交叉后填（如 `is_file=True` → 同时缓存 `exists=True, is_dir=False`）。写入操作回填已知状态。`CacheBackend` 抽象接口支持批量操作（`mget`/`mset`/`mdelete`），内置 `MemoryCacheBackend` 和 `RedisCacheBackend`。**`snapshot()` / `dump_cache()`** 内省 API 暴露缓存内部状态供测试验证命中/未命中/回填/失效行为。`list_()` 永远绕过 `iterdir` 缓存直接查询底层存储但回填逐条目元数据缓存；tree copy/move 无论成功或失败都会在 finally 使源、目标及全局树缓存失效。
 - **FTPStorage**: plain FTP 客户端后端，`root_prefix` 将逻辑根隔离到远端绝对 POSIX 子目录；路径拒绝 NUL/`..` 越界。`FTPClientPool` 通过 `max_connections`（默认 1）按需创建 client，每个 lease 独占控制通道，transfer 在 EOF/`aclose()` 前持续持有 lease；取消、timeout 或控制通道失步会 invalidate 并淘汰连接。listing/walk 在 lease 内完整物化并排序，释放后才 yield。FTP 无服务端 COPY，`copy`/`copytree` 使用一个 pool source client + 一个操作级临时 destination client 流式中继；copytree 覆盖文件先 rename 到临时 backup，失败时删除新文件、恢复 backup，并保留 rollback failures。当前仅支持 plain FTP，不支持 FTPS/FTPES。
@@ -216,7 +224,7 @@ tests/
 - **FTP 服务端**: 基于 `aioftp`，`StoragePathIO` 将协议文件操作映射到 `AbstractStorage`，`ReadHandle` / `WriteHandle` 保持下载和上传流式传输。仅支持 `rb` / `wb`，禁用 APPE；REST 仅用于 RETR 下载 offset，非零 REST + STOR 返回 504 且不修改目标文件。
 - **日志**: 使用 loguru，`LoggerWrapper` 为每个类提供带色彩标签的实例日志器。支持 `LoguruOpts` 灵活配置日志选项（exception/record/lazy/colors/raw/capture/depth/ansi）。`LoguruHandler` 将标准库 logging 桥接到 loguru；上游 logger 名隐藏列表包含 `httpx` / `httpx2`。
 - **异常处理**: `ExceptionTranslator` 提供统一的异常翻译装饰器，支持 `bypass`、`catch`、`default` 异常分类和自定义异常映射。同时支持 `wrap`（普通异步函数）和 `wrap_agen`（异步生成器）。
-- **HTTP 客户端兼容**: `app.utils.httpx` 是 S3/DAV 与相关测试的唯一 HTTP 导入入口。`TYPE_CHECKING` 绑定标准 `httpx` 类型；运行时优先 `import httpx2 as httpx`，`ImportError` 时回退 `httpx`。optional extra：`uv sync --extra httpx2`（`httpx2[http2]>=2.7.0,<3`）。业务代码禁止直接 `import httpx` / `import httpx2`。CI 用 `pytest -m httpx` 选中会触达该入口的测试，分别在默认依赖与 `--extra httpx2` 环境中回归。
+- **HTTP 客户端兼容**: `storegate.utils.httpx` 是 S3/DAV 与相关测试的唯一 HTTP 导入入口。`TYPE_CHECKING` 绑定标准 `httpx` 类型；运行时优先 `import httpx2 as httpx`，`ImportError` 时回退 `httpx`。optional extra：`uv sync --extra httpx2`（`httpx2[http2]>=2.7.0,<3`）。业务代码禁止直接 `import httpx` / `import httpx2`。CI 用 `pytest -m httpx` 选中会触达该入口的测试，分别在默认依赖与 `--extra httpx2` 环境中回归。
 
 ### 配置与数据目录
 
