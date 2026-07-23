@@ -16,6 +16,8 @@ from storegate.storage.abstract import (
     EntryKind,
     FileInfo,
     PathLike,
+    StorageCapabilities,
+    VersionedBytes,
     WalkEntry,
     make_namespace_identity,
 )
@@ -33,7 +35,7 @@ from .client import (
 from .utils import MultipartUploadTask, deserialize_file_info, serialize_file_info
 
 UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB
-DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB — retained for copy multipart sizing only
 # Files larger than this are copied via multipart upload to stay within
 # the CopyObject 5 GiB limit and to allow parallel part copies.
 COPY_MULTIPART_THRESHOLD = 4 * 1024 * 1024  # 4MB
@@ -49,6 +51,9 @@ translator = ExceptionTranslator(
 @translator.handles(S3HttpStatusError)
 def _(exc: S3HttpStatusError, msg: str) -> OSError:
     return {404: FileNotFoundError, 403: PermissionError}.get(exc.status_code, OSError)(f"{msg}: {exc}")
+
+
+_S3_CAPABILITIES = StorageCapabilities(compare_exchange=True)
 
 
 @final
@@ -77,6 +82,61 @@ class S3Storage(AbstractStorage):
             region=config.region,
             scheme=config.scheme,
         )
+
+    @property
+    @override
+    def capabilities(self) -> StorageCapabilities:
+        return _S3_CAPABILITIES
+
+    @override
+    @translator.wrap("Failed to read versioned object {path}")
+    async def read_versioned(self, path: PathLike) -> VersionedBytes | None:
+        client = self._ensure_client()
+        key = self._remote_path_to_key(path)
+        # Read data and ETag from one GET so the token identifies the returned bytes.
+        try:
+            async with client.stream_get(key) as response:
+                etag = response.headers.get("ETag")
+                if etag is None or etag == "":
+                    raise S3ClientError("Missing ETag in versioned GET response")
+                data = await response.aread()
+        except S3HttpStatusError as exc:
+            if exc.status_code == 404:
+                if await self.is_dir(path):
+                    raise IsADirectoryError(f"Not a regular file: {path}") from None
+                return None
+            raise
+        return VersionedBytes(data=data, token=etag)
+
+    @override
+    @translator.wrap("Failed to compare-exchange {path}")
+    async def compare_exchange(
+        self,
+        path: PathLike,
+        *,
+        expected_token: str | None,
+        data: BytesLike,
+    ) -> VersionedBytes | None:
+        path = self.normalize_path(path)
+        client = self._ensure_client()
+        key = self._remote_path_to_key(path)
+
+        # Refuse directory markers / directory targets before conditional PUT.
+        # Conflict path must not create parents or perform other writes.
+        if await self.is_dir(path):
+            raise IsADirectoryError(f"Is a directory: {path}")
+
+        payload = bytes(data)
+        headers = {"If-None-Match": "*"} if expected_token is None else {"If-Match": expected_token}
+
+        try:
+            etag = await client.put_object(key=key, data=payload, headers=headers)
+        except S3HttpStatusError as exc:
+            if exc.status_code == 412:
+                return None
+            raise
+
+        return VersionedBytes(data=payload, token=etag)
 
     @override
     async def connect(self) -> None:
@@ -209,24 +269,23 @@ class S3Storage(AbstractStorage):
         key = self._remote_path_to_key(remote_path)
         head = await client.head_object(key=key)
         if head is None:
+            # Preserve directory/404 contract: directory markers are not downloadable files.
+            if await self.is_dir(remote_path):
+                raise IsADirectoryError(f"Is a directory: {remote_path}")
             raise FileNotFoundError(f"Object not found: {remote_path}")
         total_size = head.content_length
 
         if offset >= total_size:
             return
 
-        num_chunks = (total_size - offset + DOWNLOAD_CHUNK_SIZE - 1) // DOWNLOAD_CHUNK_SIZE
-
+        range_start = offset if offset > 0 else None
         self.log.debug(
-            f"Download: <y>{escape_tag(key)}</y> (<g>{total_size}</g> bytes, "
-            f"offset=<g>{offset}</g>, <g>{num_chunks}</g> chunks)"
+            f"Download: <y>{escape_tag(key)}</y> (<g>{total_size}</g> bytes, offset=<g>{offset}</g>, single stream GET)"
         )
-
-        for i in range(num_chunks):
-            start = offset + i * DOWNLOAD_CHUNK_SIZE
-            end = min(start + DOWNLOAD_CHUNK_SIZE - 1, total_size - 1)
-            chunk = await client.get_object(key=key, range=(start, end))
-            yield chunk
+        async with client.stream_get(key, range_start=range_start) as response:
+            async for chunk in response.aiter_bytes():
+                if chunk:
+                    yield chunk
 
     @override
     @translator.wrap("Failed to unlink {path} (missing_ok={missing_ok})")
