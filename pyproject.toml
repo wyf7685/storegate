@@ -26,6 +26,9 @@ uvloop = [
 ]
 full = ["storegate[standard,ayafileio,httpx2,uvloop]"]
 
+[project.scripts]
+storegate = "storegate.cli:main"
+
 [dependency-groups]
 dev = [
   "storegate[full]",
