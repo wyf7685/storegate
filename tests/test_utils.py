@@ -128,12 +128,32 @@ async def test_exception_translator_wrap_agen_maps_group_tree() -> None:
     assert isinstance(group.exceptions[1], KeyError)
 
 
-async def test_cached_storage_masks_compare_exchange_capability() -> None:
-    cached = CachedStorage(MemoryStorage("/"))
-    assert MemoryStorage("/").capabilities.compare_exchange is True
-    assert cached.capabilities.compare_exchange is False
-    with pytest.raises(OSError, match="compare-exchange is not supported"):
-        await cached.compare_exchange("/x", expected_token=None, data=b"x")
+async def test_cached_storage_preserves_memory_compare_exchange_contract() -> None:
+    child = MemoryStorage("/")
+    created = await child.compare_exchange("/x", expected_token=None, data=b"old")
+    assert created is not None
+
+    async with CachedStorage(child) as cached:
+        assert cached.capabilities.compare_exchange is True
+
+        observed = await cached.read_versioned("/x")
+        assert observed is not None
+        assert observed.data == created.data
+        assert observed.token == created.token
+
+        # Prime public cached reads so successful CAS must replace/invalidate them.
+        assert await cached.download_bytes("/x") == b"old"
+        assert (await cached.stat("/x")).size == 3
+
+        updated = await cached.compare_exchange("/x", expected_token=observed.token, data=b"replacement")
+        assert updated is not None
+
+        delegated = await child.read_versioned("/x")
+        assert delegated is not None
+        assert delegated.data == b"replacement"
+        assert delegated.token == updated.token
+        assert await cached.download_bytes("/x") == b"replacement"
+        assert (await cached.stat("/x")).size == len(b"replacement")
 
 
 async def test_cached_storage_rejects_invalid_paths_before_cache_lookup() -> None:
