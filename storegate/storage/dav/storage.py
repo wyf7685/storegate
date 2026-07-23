@@ -536,7 +536,9 @@ class DavStorage(AbstractStorage):
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        # Validate both caller paths before any network I/O (including source PROPFIND).
         src_rel = self._remote_path(src)
+        dst_rel = self._remote_path(dst)
         if src_rel == "":
             raise OSError(f"Cannot move root: {src}")
         try:
@@ -548,7 +550,6 @@ class DavStorage(AbstractStorage):
         if source_info.kind is not EntryKind.FILE:
             raise _unsupported_entry(src)
 
-        dst_rel = self._remote_path(dst)
         if self.normalize_path(src) == self.normalize_path(dst):
             if not overwrite:
                 raise FileExistsError(f"Source and destination are the same: {src}")
@@ -602,7 +603,9 @@ class DavStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to copy {src} → {dst}")
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        # Validate both caller paths before any network I/O (including source PROPFIND).
         src_rel = self._remote_path(src)
+        dst_rel = self._remote_path(dst)
         if src_rel == "":
             raise IsADirectoryError(f"Cannot copy root: {src}")
         try:
@@ -617,7 +620,6 @@ class DavStorage(AbstractStorage):
             if not overwrite:
                 raise FileExistsError(f"Source and destination are the same: {src}")
             return
-        dst_rel = self._remote_path(dst)
         if await self.is_dir(dst):
             raise IsADirectoryError(f"Destination is a directory: {dst}")
         await self.mkdir(self.normalize_path(dst).parent.as_posix(), parents=True, exist_ok=True)
@@ -670,6 +672,9 @@ class DavStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to move tree {src} → {dst} (overwrite={overwrite})")
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src_np = self.normalize_path(src)
+        dst_np = self.normalize_path(dst)
+
         try:
             info = await self.stat(src)
         except FileNotFoundError:
@@ -679,10 +684,10 @@ class DavStorage(AbstractStorage):
         if not overwrite and await self.exists(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
 
-        await self._strict_walk_snapshot(src, root=info)
+        await self._strict_walk_snapshot(src_np, root=info)
 
         client = self._ensure_client()
-        await self.mkdir(self.normalize_path(dst).parent.as_posix(), parents=True, exist_ok=True)
+        await self.mkdir(dst_np.parent.as_posix(), parents=True, exist_ok=True)
         src_rel = self._remote_path(src)
         dst_rel = self._remote_path(dst)
         self.log.info(f"MoveTree: <y>{escape_tag(src_rel)}</y> → <y>{escape_tag(dst_rel)}</y>")

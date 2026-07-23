@@ -771,3 +771,163 @@ class TestCopytreeFallbackRollback:
         assert len(flattened) == 2
         assert "copy failed" in str(flattened[0])
         assert "restore failed" in str(flattened[1])
+
+
+class TestPathEscapeRejection:
+    """Public storage ops reject escape/NUL paths before any client request."""
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    async def test_stat_rejects_escape_before_propfind(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        path: str,
+    ) -> None:
+        propfind = mocker.patch.object(dav_mocked._client, "propfind", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.stat(path)
+        propfind.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    async def test_download_rejects_escape_before_get(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        path: str,
+    ) -> None:
+        stream_get = mocker.patch.object(dav_mocked._client, "stream_get")
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            async for _ in dav_mocked.download_stream(path):
+                pass
+        stream_get.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    async def test_upload_rejects_escape_before_put(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        path: str,
+    ) -> None:
+        put = mocker.patch.object(dav_mocked._client, "put", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.upload_bytes(b"data", path)
+        put.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    async def test_unlink_rejects_escape_before_delete(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        path: str,
+    ) -> None:
+        delete = mocker.patch.object(dav_mocked._client, "delete", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.unlink(path)
+        delete.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("src", "dst"),
+        [
+            ("../x", "safe"),
+            ("safe", "a/../../x"),
+            ("x/../y", "z"),
+            ("safe", "bad\x00name"),
+        ],
+    )
+    async def test_copy_rejects_escape_before_request(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        src: str,
+        dst: str,
+    ) -> None:
+        propfind = mocker.patch.object(dav_mocked._client, "propfind", AsyncMock())
+        copy = mocker.patch.object(dav_mocked._client, "copy", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.copy(src, dst)
+        propfind.assert_not_awaited()
+        copy.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("src", "dst"),
+        [
+            ("../x", "safe"),
+            ("safe", "a/../../x"),
+            ("x/../y", "z"),
+            ("safe", "bad\x00name"),
+        ],
+    )
+    async def test_move_rejects_escape_before_request(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        src: str,
+        dst: str,
+    ) -> None:
+        propfind = mocker.patch.object(dav_mocked._client, "propfind", AsyncMock())
+        move = mocker.patch.object(dav_mocked._client, "move", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.move(src, dst)
+        propfind.assert_not_awaited()
+        move.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "invalid_path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    @pytest.mark.parametrize("invalid_side", ["source", "destination"])
+    async def test_movetree_rejects_escape_before_request(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        invalid_path: str,
+        invalid_side: str,
+    ) -> None:
+        src, dst = (invalid_path, "safe") if invalid_side == "source" else ("safe", invalid_path)
+        propfind = mocker.patch.object(dav_mocked._client, "propfind", AsyncMock())
+        move = mocker.patch.object(dav_mocked._client, "move", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.movetree(src, dst)
+        propfind.assert_not_awaited()
+        move.assert_not_awaited()
+
+    async def test_allows_hidden_and_double_dot_names(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+    ) -> None:
+        mocker.patch.object(
+            dav_mocked._client,
+            "propfind",
+            AsyncMock(
+                return_value=[
+                    _resource("/dav/.hidden", "{DAV:}collection"),
+                ]
+            ),
+        )
+        info = await dav_mocked.stat(".hidden")
+        assert info.path == "/.hidden"
+
+        mocker.patch.object(
+            dav_mocked._client,
+            "propfind",
+            AsyncMock(
+                return_value=[
+                    _resource("/dav/a..b"),
+                ]
+            ),
+        )
+        info = await dav_mocked.stat("a..b")
+        assert info.path == "/a..b"

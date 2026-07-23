@@ -1,10 +1,10 @@
 import dataclasses
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, Self
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 type AuthMode = Literal["basic", "bearer", "anonymous"]
 
@@ -28,10 +28,10 @@ class DavConfig(BaseModel):
     verify_ssl: bool = True
     # Custom CA bundle (PEM) for self-signed deployments (e.g. on-prem Nextcloud).
     ca_cert_path: str | None = None
-    timeout: float = 30.0
-    max_concurrency: int = 8
+    timeout: float = Field(default=30.0, gt=0)
+    max_concurrency: int = Field(default=8, gt=0)
     http2: bool = True
-    chunk_size: int = 4 * 1024 * 1024
+    chunk_size: int = Field(default=4 * 1024 * 1024, gt=0)
 
     @model_validator(mode="after")
     def _validate(self) -> Self:
@@ -44,11 +44,18 @@ class DavConfig(BaseModel):
         # Normalize: no trailing slash on base_url; root_prefix is "" or "/seg".
         self.base_url = self.base_url.rstrip("/")
         prefix = self.root_prefix.strip()
-        if prefix:
+        if "\x00" in prefix:
+            raise ValueError("root_prefix must not contain NUL")
+        if not prefix:
+            self.root_prefix = ""
+        else:
             if not prefix.startswith("/"):
                 prefix = "/" + prefix
-            prefix = prefix.rstrip("/")
-        self.root_prefix = prefix
+            raw_path = PurePosixPath(prefix)
+            if ".." in raw_path.parts:
+                raise ValueError("root_prefix must not contain '..' segments")
+            normalized = PurePosixPath("/", *[part for part in raw_path.parts[1:] if part != "."]).as_posix()
+            self.root_prefix = "" if normalized == "/" else normalized
 
         match self.auth_mode:
             case "basic":
