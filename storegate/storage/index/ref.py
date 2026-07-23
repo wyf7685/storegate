@@ -51,16 +51,26 @@ class ChunkRefManager:
             return None
         return set(ref_bytes.decode().splitlines())
 
-    async def incref(self, chunk_hash: str, *remote_path: PathLike) -> None:
+    async def incref(self, chunk_hash: str, *remote_path: PathLike) -> bool:
         ref_path = hash_to_path(chunk_hash, "ref")
         _colored_hash = f"<c>{chunk_hash[:8]}</c>"
         _colored_remote_paths = ", ".join(f"<i>{escape_tag(p)}</i>" for p in remote_path)
 
         refs: set[str] = await self.load_refs(chunk_hash) or set()
+        added_any = False
+        for path in remote_path:
+            normalized = self.normalize_path(path).as_posix()
+            if normalized not in refs:
+                refs.add(normalized)
+                added_any = True
 
-        refs.update(self.normalize_path(p).as_posix() for p in remote_path)
+        if not added_any:
+            self.log.debug(f"Chunk {_colored_hash} +ref no change ({_colored_remote_paths})")
+            return False
+
         await self.chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)
         self.log.debug(f"Chunk {_colored_hash} +ref → <g>{len(refs)}</g> ({_colored_remote_paths})")
+        return True
 
     async def decref(self, chunk_hash: str, *remote_path: PathLike) -> None:
         ref_path = hash_to_path(chunk_hash, "ref")
