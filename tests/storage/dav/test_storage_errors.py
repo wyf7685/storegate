@@ -721,3 +721,53 @@ class TestCopytreeFallbackRollback:
         flattened = list(flatten_exception_group(caught.value))
         assert "copy failed" in str(flattened[0])
         assert "restore failed" in str(flattened[1])
+
+    async def test_public_copytree_restore_failure_preserves_group(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        snapshot = (
+            WalkEntry(
+                path="/src",
+                entries=(FileInfo(path="/src/a.txt", name="a.txt", kind=EntryKind.FILE),),
+            ),
+            WalkEntry(
+                path="/src/sub",
+                entries=(FileInfo(path="/src/sub/b.txt", name="b.txt", kind=EntryKind.FILE),),
+            ),
+        )
+
+        async def stat(path: str | PurePosixPath) -> FileInfo:
+            text = str(path)
+            if text in {"/src", "src"}:
+                return FileInfo(path="/src", name="src", kind=EntryKind.DIRECTORY)
+            if text.endswith("a.txt"):
+                return FileInfo(path="/dst/a.txt", name="a.txt", kind=EntryKind.FILE)
+            raise FileNotFoundError(text)
+
+        mocker.patch.object(dav_mocked, "stat", new=stat)
+        mocker.patch.object(dav_mocked, "exists", new=AsyncMock(return_value=True))
+        mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        mocker.patch.object(dav_mocked, "copy", new=AsyncMock(side_effect=[None, OSError("copy failed")]))
+        mocker.patch.object(dav_mocked, "unlink", new=AsyncMock())
+        mocker.patch.object(
+            dav_mocked,
+            "_strict_walk_snapshot",
+            new=AsyncMock(return_value=snapshot),
+        )
+        mocker.patch.object(
+            dav_mocked._client,
+            "copy",
+            new=AsyncMock(side_effect=DavHttpStatusError("COPY", "http://u/src", 501, "not implemented")),
+        )
+        mocker.patch.object(
+            dav_mocked._client,
+            "move",
+            new=AsyncMock(side_effect=[None, OSError("restore failed")]),
+        )
+
+        with pytest.raises(BaseExceptionGroup) as caught:
+            await dav_mocked.copytree("/src", "/dst", overwrite=True)
+        flattened = list(flatten_exception_group(caught.value))
+        assert len(flattened) == 2
+        assert "copy failed" in str(flattened[0])
+        assert "restore failed" in str(flattened[1])

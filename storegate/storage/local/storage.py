@@ -26,7 +26,7 @@ from storegate.storage.abstract import (
     StorageCapabilities,
     UnsupportedOperationError,
     WalkEntry,
-    make_cache_identity,
+    make_namespace_identity,
 )
 
 _LOCAL_CAPABILITIES = StorageCapabilities(symlink_metadata=True, readlink=True, symlink_create=True)
@@ -115,13 +115,13 @@ class LocalStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         return f"local:{self._root.as_posix()}"
 
     @property
     @override
-    def cache_identity(self) -> str:
-        return make_cache_identity("local", root=self._root.as_posix())
+    def namespace_identity(self) -> str:
+        return make_namespace_identity("local", root=self._root.as_posix())
 
     @property
     @override

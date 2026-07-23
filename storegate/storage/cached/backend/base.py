@@ -46,7 +46,7 @@ class CacheBackend(ABC):
     # ------------------------------------------------------------------
 
     def bind_storage(self, identity: str | None) -> None:  # noqa: B027
-        """Bind this backend to a storage's stable cache identity.
+        """Bind this backend to a storage's stable namespace identity.
 
         Backends that do not need persistent instance scoping may ignore this.
         """

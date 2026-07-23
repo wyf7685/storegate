@@ -5,6 +5,7 @@ from .abstract import (
     FileInfo,
     StorageCapabilities,
     UnsupportedOperationError,
+    VersionedBytes,
     WalkEntry,
 )
 from .factory import resolve_storage, resolve_storage_from_file
@@ -16,6 +17,7 @@ __all__ = [
     "FileInfo",
     "StorageCapabilities",
     "UnsupportedOperationError",
+    "VersionedBytes",
     "WalkEntry",
     "resolve_storage",
     "resolve_storage_from_file",

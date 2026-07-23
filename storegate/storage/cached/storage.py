@@ -66,7 +66,7 @@ class CachedStorage(AbstractStorage):
             raise ValueError("download_cache_threshold must be None or >= 0")
 
         self._cache: CacheBackend = MemoryCacheBackend(capacity=capacity) if cache == "memory" else cache
-        self._cache.bind_storage(self._storage.cache_identity)
+        self._cache.bind_storage(self._storage.namespace_identity)
         self._cache.configure_namespace("exists", ttl)
         self._cache.configure_namespace("is_file", ttl)
         self._cache.configure_namespace("is_dir", ttl)
@@ -78,18 +78,28 @@ class CachedStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
-        return self._storage.id
+    def display_id(self) -> str:
+        return self._storage.display_id
 
     @property
     @override
-    def cache_identity(self) -> str | None:
-        return self._storage.cache_identity
+    def namespace_identity(self) -> str:
+        return self._storage.namespace_identity
 
     @property
     @override
     def capabilities(self) -> StorageCapabilities:
-        return self._storage.capabilities
+        # Wave 1 owns CAS proxying/invalidation. Until CachedStorage implements
+        # read_versioned/compare_exchange, never advertise wrapped CAS support.
+        caps = self._storage.capabilities
+        if not caps.compare_exchange:
+            return caps
+        return StorageCapabilities(
+            symlink_metadata=caps.symlink_metadata,
+            readlink=caps.readlink,
+            symlink_create=caps.symlink_create,
+            compare_exchange=False,
+        )
 
     @override
     async def connect(self) -> None:
@@ -127,10 +137,10 @@ class CachedStorage(AbstractStorage):
 
     @staticmethod
     def _normalize(path: PathLike) -> str:
-        p = PurePosixPath(path)
-        if p.is_absolute():
-            p = p.relative_to("/")
-        result = str(p)
+        # Validate caller-supplied logical paths before any cache key derivation.
+        absolute = AbstractStorage.normalize_path(path)
+        relative = absolute.relative_to("/")
+        result = relative.as_posix()
         return "" if result == "." else result
 
     @staticmethod

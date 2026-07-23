@@ -24,7 +24,7 @@ from storegate.storage.abstract import (
     StorageCapabilities,
     UnsupportedOperationError,
     WalkEntry,
-    make_cache_identity,
+    make_namespace_identity,
 )
 from storegate.utils import coalesce_chunks
 
@@ -120,15 +120,15 @@ class SFTPStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         config = self._config
         return f"sftp:{config.username}@{config.host}:{config.port}{config.root_prefix}"
 
     @property
     @override
-    def cache_identity(self) -> str:
+    def namespace_identity(self) -> str:
         config = self._config
-        return make_cache_identity(
+        return make_namespace_identity(
             "sftp",
             host=config.host,
             port=config.port,

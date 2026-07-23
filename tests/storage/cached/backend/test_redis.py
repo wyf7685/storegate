@@ -164,7 +164,7 @@ async def test_v2_file_info_roundtrip_and_strict_kind() -> None:
     await backend.set("iterdir", "", [directory, link])
     await backend.set("is_symlink", "link", True)
 
-    assert backend._scope_prefix().startswith("storegate:v2:")
+    assert backend._scope_prefix().startswith("storegate:v3:")
     assert await backend.get("stat", "link") == link
     assert await backend.get("lstat", "link") == link
     assert await backend.get("iterdir", "") == [directory, link]
@@ -211,7 +211,7 @@ async def test_cached_storage_close_preserves_redis_entries(tmp_path: Path) -> N
 
 def test_auto_prefix_rejects_unknown_or_conflicting_storage() -> None:
     backend = RedisCacheBackend()
-    with pytest.raises(ValueError, match="stable cache identity"):
+    with pytest.raises(ValueError, match="stable namespace identity"):
         backend.bind_storage(None)
 
     backend.bind_storage('{"kind":"local","root":"/first"}')

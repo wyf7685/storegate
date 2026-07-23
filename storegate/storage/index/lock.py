@@ -50,7 +50,7 @@ class StorageFileLocker:
         skip_locking: bool,
     ):
         self.log = logger_wrapper(
-            f"{storage.__class__.__name__}.{self.__class__.__name__} <c><i>{escape_tag(storage.id)}</></>"
+            f"{storage.__class__.__name__}.{self.__class__.__name__} <c><i>{escape_tag(storage.display_id)}</></>"
         )
         self.lock_lease = lock_lease
         self.lock_timeout = lock_timeout
@@ -96,7 +96,7 @@ class StorageFileLocker:
 
     async def renew_lock(self, lease: LockLease) -> None:
         interval = self.lock_lease / 3
-        key = f"{lease.storage.id}:{lease.storage.normalize_path(lease.path)}"
+        key = f"{lease.storage.namespace_identity}:{lease.storage.normalize_path(lease.path)}"
         while True:
             try:
                 with anyio.fail_after(self.lock_timeout):
@@ -154,7 +154,7 @@ class StorageFileLocker:
             self.log.trace(f"Lock {_colored_path} disabled, skipping ...")
             return None
 
-        key = f"{storage.id}:{storage.normalize_path(lock_path)}"
+        key = f"{storage.namespace_identity}:{storage.normalize_path(lock_path)}"
         deadline = anyio.current_time() + self.lock_timeout
         while True:
             remaining = deadline - anyio.current_time()
@@ -240,7 +240,7 @@ class StorageFileLocker:
     async def release_lock(self, storage: AbstractStorage, lock_path: PathLike, lease: LockLease | None) -> None:
         if self.skip_locking or lease is None:
             return
-        key = f"{storage.id}:{storage.normalize_path(lock_path)}"
+        key = f"{storage.namespace_identity}:{storage.normalize_path(lock_path)}"
         try:
             with anyio.fail_after(self.lock_timeout, shield=True):
                 async with self.local_lock_guard(key):

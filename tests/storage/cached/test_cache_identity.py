@@ -1,4 +1,4 @@
-"""Storage cache identity tests."""
+"""Storage namespace identity tests."""
 
 from pathlib import Path
 
@@ -32,30 +32,36 @@ def _dav_config(*, password: str, root_prefix: str) -> DavConfig:
     )
 
 
-def test_storage_cache_identities_are_stable_and_non_secret(tmp_path: Path) -> None:
+def test_storage_namespace_identities_are_stable_and_non_secret(tmp_path: Path) -> None:
     local = LocalStorage(tmp_path / "one")
-    assert local.cache_identity == LocalStorage(tmp_path / "one").cache_identity
-    assert local.cache_identity != LocalStorage(tmp_path / "two").cache_identity
+    assert local.namespace_identity == LocalStorage(tmp_path / "one").namespace_identity
+    assert local.namespace_identity != LocalStorage(tmp_path / "two").namespace_identity
+    assert local.namespace_identity.startswith("local:sha256:")
 
     s3 = S3Storage(_s3_config(secret_access_key="secret", endpoint_url="minio.example.test:9000"))
     assert (
-        s3.cache_identity
+        s3.namespace_identity
         == S3Storage(
             _s3_config(secret_access_key="rotated-secret", endpoint_url="minio.example.test:9000")
-        ).cache_identity
+        ).namespace_identity
     )
     assert (
-        s3.cache_identity
-        != S3Storage(_s3_config(secret_access_key="secret", endpoint_url="other.example.test:9000")).cache_identity
+        s3.namespace_identity
+        != S3Storage(_s3_config(secret_access_key="secret", endpoint_url="other.example.test:9000")).namespace_identity
     )
-    assert "secret" not in s3.cache_identity
+    assert "secret" not in s3.namespace_identity
+    assert s3.namespace_identity.startswith("s3:sha256:")
 
     dav = DavStorage(_dav_config(password="password", root_prefix="/files"))
     assert (
-        dav.cache_identity == DavStorage(_dav_config(password="rotated-password", root_prefix="/files")).cache_identity
+        dav.namespace_identity
+        == DavStorage(_dav_config(password="rotated-password", root_prefix="/files")).namespace_identity
     )
-    assert dav.cache_identity != DavStorage(_dav_config(password="password", root_prefix="/other")).cache_identity
-    assert "password" not in dav.cache_identity
+    assert (
+        dav.namespace_identity != DavStorage(_dav_config(password="password", root_prefix="/other")).namespace_identity
+    )
+    assert "password" not in dav.namespace_identity
+    assert dav.namespace_identity.startswith("dav:sha256:")
 
     index = IndexStorage(LocalStorage(tmp_path / "index"), LocalStorage(tmp_path / "chunks"), block_size=1024)
     changed_block_size = IndexStorage(
@@ -63,5 +69,12 @@ def test_storage_cache_identities_are_stable_and_non_secret(tmp_path: Path) -> N
         LocalStorage(tmp_path / "chunks"),
         block_size=2048,
     )
-    assert index.cache_identity != changed_block_size.cache_identity
-    assert MemoryStorage("/").cache_identity is None
+    assert index.namespace_identity != changed_block_size.namespace_identity
+    assert index.namespace_identity.startswith("index:sha256:")
+
+    first_memory = MemoryStorage("/")
+    second_memory = MemoryStorage("/")
+    assert first_memory.namespace_identity.startswith("memory:sha256:")
+    assert second_memory.namespace_identity.startswith("memory:sha256:")
+    assert first_memory.namespace_identity != second_memory.namespace_identity
+    assert first_memory.display_id.endswith(":/")

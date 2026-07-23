@@ -20,9 +20,9 @@ from storegate.storage.abstract import (
     PathLike,
     UnsupportedOperationError,
     WalkEntry,
-    make_cache_identity,
+    make_namespace_identity,
 )
-from storegate.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
+from storegate.utils import ExceptionTranslator, coalesce_chunks
 
 from .config import FTPConfig
 from .pool import FTPClientLease, FTPClientPool
@@ -39,12 +39,11 @@ translator = ExceptionTranslator(
 
 
 @translator.handles(aioftp.StatusCodeError)
-def _(exc_group: ExceptionGroup[aioftp.StatusCodeError], msg: str) -> OSError:
-    first = next(flatten_exception_group(exc_group))
-    code = first.received_codes[-1]
+def _(exc: aioftp.StatusCodeError, msg: str) -> OSError:
+    code = exc.received_codes[-1]
     if code.matches("530"):
-        return PermissionError(f"{msg}: {first}")
-    return OSError(f"{msg}: {first}")
+        return PermissionError(f"{msg}: {exc}")
+    return OSError(f"{msg}: {exc}")
 
 
 def _parse_mlsx_datetime(value: object) -> datetime | None:
@@ -90,13 +89,13 @@ class FTPStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         return f"ftp:{self._config.username}@{self._config.host}:{self._config.port}{self._config.root_prefix}"
 
     @property
     @override
-    def cache_identity(self) -> str:
-        return make_cache_identity(
+    def namespace_identity(self) -> str:
+        return make_namespace_identity(
             "ftp",
             encoding=self._config.encoding,
             host=self._config.host,

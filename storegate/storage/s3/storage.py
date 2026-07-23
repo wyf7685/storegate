@@ -17,9 +17,9 @@ from storegate.storage.abstract import (
     FileInfo,
     PathLike,
     WalkEntry,
-    make_cache_identity,
+    make_namespace_identity,
 )
-from storegate.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
+from storegate.utils import ExceptionTranslator, coalesce_chunks
 
 from .client import (
     AsyncS3Client,
@@ -47,9 +47,8 @@ translator = ExceptionTranslator(
 
 
 @translator.handles(S3HttpStatusError)
-def _(exc_group: ExceptionGroup[S3HttpStatusError], msg: str) -> OSError:
-    first = next(flatten_exception_group(exc_group))
-    return {404: FileNotFoundError, 403: PermissionError}.get(first.status_code, OSError)(f"{msg}: {first}")
+def _(exc: S3HttpStatusError, msg: str) -> OSError:
+    return {404: FileNotFoundError, 403: PermissionError}.get(exc.status_code, OSError)(f"{msg}: {exc}")
 
 
 @final
@@ -63,14 +62,14 @@ class S3Storage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         return f"s3:{self._config.bucket}:{self._config.region}"
 
     @property
     @override
-    def cache_identity(self) -> str:
+    def namespace_identity(self) -> str:
         config = self._config
-        return make_cache_identity(
+        return make_namespace_identity(
             "s3",
             bucket=config.bucket,
             endpoint_url=config.endpoint_url,
@@ -135,10 +134,9 @@ class S3Storage(AbstractStorage):
         return self._client
 
     def _remote_path_to_key(self, remote_path: PathLike) -> str:
-        path = PurePosixPath(remote_path)
-        if path.is_absolute():
-            path = path.relative_to("/")
-        return str(path) if path != PurePosixPath(".") else ""
+        path = self.normalize_path(remote_path)
+        relative = path.relative_to("/")
+        return relative.as_posix() if relative != PurePosixPath(".") else ""
 
     def _dir_key(self, path: PathLike) -> str | None:
         """返回目录标记对象的 S3 键。

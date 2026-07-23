@@ -234,7 +234,7 @@ async def test_renewal_guard_contention_retries_before_expiry() -> None:
     ):
         lease = await storage._locker.acquire_lock(index, "/renew-contention.lock")
         assert lease is not None
-        key = f"{index.id}:/renew-contention.lock"
+        key = f"{index.namespace_identity}:/renew-contention.lock"
         entered = anyio.Event()
         released = anyio.Event()
         done = anyio.Event()
@@ -411,7 +411,7 @@ async def test_local_guard_wait_uses_lock_timeout_and_reclaims_entry() -> None:
         MemoryStorage("/") as chunks,
         IndexStorage(index, chunks, lock_timeout=0.03) as storage,
     ):
-        key = f"{index.id}:/blocked.lock"
+        key = f"{index.namespace_identity}:/blocked.lock"
         entered = anyio.Event()
         release = anyio.Event()
 
@@ -442,7 +442,7 @@ async def test_handoff_upload_respects_acquisition_deadline_and_cleans_lock() ->
     index = _BlockingLockStorage("/handoff-timeout.lock")
     index.block_upload = True
     async with index, MemoryStorage("/") as chunks, IndexStorage(index, chunks, lock_timeout=0.03) as storage:
-        key = f"{index.id}:/handoff-timeout.lock"
+        key = f"{index.namespace_identity}:/handoff-timeout.lock"
         with anyio.fail_after(0.15) as outer_timeout:
             with pytest.raises(TimeoutError, match="Timed out waiting"):
                 await storage._locker.acquire_lock(index, "/handoff-timeout.lock")
@@ -468,7 +468,7 @@ async def test_release_backend_operations_respect_cleanup_deadline(blocked_opera
             index.block_download(2)
         else:
             index.block_unlink = True
-        key = f"{index.id}:/release-timeout.lock"
+        key = f"{index.namespace_identity}:/release-timeout.lock"
         with anyio.fail_after(0.15) as outer_timeout:
             with pytest.raises(TimeoutError, match="Timed out releasing"):
                 await storage._locker.release_lock(index, "/release-timeout.lock", lease)
@@ -486,7 +486,7 @@ async def test_release_guard_wait_respects_cleanup_deadline() -> None:
     ):
         lease = await storage._locker.acquire_lock(index, "/release-guard.lock")
         assert lease is not None
-        key = f"{index.id}:/release-guard.lock"
+        key = f"{index.namespace_identity}:/release-guard.lock"
         entered = anyio.Event()
 
         async def hold_guard() -> None:
@@ -514,7 +514,7 @@ async def test_normal_lock_exit_propagates_cleanup_timeout() -> None:
             async with storage._lock_index("/normal-cleanup"):
                 index.block_download(1)
 
-        key = f"{index.id}:/normal-cleanup.lock"
+        key = f"{index.namespace_identity}:/normal-cleanup.lock"
         with anyio.fail_after(0.15) as outer_timeout:
             with pytest.raises(TimeoutError, match="Timed out releasing"):
                 await exit_lock()
@@ -533,7 +533,7 @@ async def test_cancelled_lock_exit_bounds_cleanup_and_reclaims_registry() -> Non
                 index.block_download(1)
                 await anyio.sleep_forever()
 
-        key = f"{index.id}:/cancel-cleanup.lock"
+        key = f"{index.namespace_identity}:/cancel-cleanup.lock"
         with pytest.raises(TimeoutError):
             with anyio.fail_after(0.15) as outer_timeout:
                 await hold_lock()
@@ -547,7 +547,7 @@ async def test_partial_lock_rollback_bounds_cleanup_failure() -> None:
     index = _BlockingLockStorage("/a.lock", failed_path="/b.lock")
     index.block_download(1)
     async with index, MemoryStorage("/") as chunks, IndexStorage(index, chunks, lock_timeout=0.03) as storage:
-        key = f"{index.id}:/a.lock"
+        key = f"{index.namespace_identity}:/a.lock"
         with anyio.fail_after(0.15) as outer_timeout:
             with pytest.raises(RuntimeError, match="later lock failure"):
                 async with storage._lock_indexes("/b", "/a"):

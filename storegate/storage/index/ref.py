@@ -29,7 +29,7 @@ class ChunkRefManager:
         lock_chunk: Callable[[str], contextlib.AbstractAsyncContextManager[object]],
     ):
         self.log = logger_wrapper(
-            f"{storage.__class__.__name__}.{self.__class__.__name__} <c><i>{escape_tag(storage.id)}</></>"
+            f"{storage.__class__.__name__}.{self.__class__.__name__} <c><i>{escape_tag(storage.display_id)}</></>"
         )
         self.chunks = chunks
         self.normalize_path = AbstractStorage.normalize_path

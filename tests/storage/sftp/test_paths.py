@@ -42,10 +42,10 @@ async def test_rejects_unsafe_paths(sftp_server: SFTPServerInfo, path: str) -> N
 def test_identity_excludes_secrets_and_uses_configured_root(sftp_server: SFTPServerInfo) -> None:
     storage = SFTPStorage(make_config(sftp_server))
     expected_id = f"sftp:{sftp_server.username}@{sftp_server.host}:{sftp_server.port}{sftp_server.root_prefix}"
-    assert storage.id == expected_id
-    assert sftp_server.password not in storage.id
-    assert sftp_server.password not in storage.cache_identity
-    assert str(sftp_server.known_hosts) not in storage.cache_identity
-    identity = storage.cache_identity
+    assert storage.display_id == expected_id
+    assert sftp_server.password not in storage.display_id
+    assert sftp_server.password not in storage.namespace_identity
+    assert str(sftp_server.known_hosts) not in storage.namespace_identity
+    identity = storage.namespace_identity
     storage._canonical_root = PurePosixPath("/different-canonical-root")
-    assert storage.cache_identity == identity
+    assert storage.namespace_identity == identity

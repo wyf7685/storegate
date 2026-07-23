@@ -211,6 +211,9 @@ async def coalesce_chunks(
     aiterable: AsyncIterable[Iterable[int]],
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> AsyncIterator[bytes]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero")
+
     buffer = bytearray()
 
     async for chunk in aiterable:
@@ -244,7 +247,7 @@ class ExceptionTranslator:
         self.bypass = bypass
         self.catch = catch
         self.default = default
-        self.exception_map: dict[type[Exception], Callable[[ExceptionGroup, str], Exception]] = {}
+        self.exception_map: dict[type[Exception], Callable[[Exception, str], Exception]] = {}
 
     def format_msg[S, **P](
         self,
@@ -259,12 +262,33 @@ class ExceptionTranslator:
         bound.apply_defaults()
         return msg.format(**bound.arguments)
 
-    def get_handler(self, exc: BaseException) -> Callable[[ExceptionGroup, str], Exception] | None:
+    def get_handler(self, exc: BaseException) -> Callable[[Exception, str], Exception] | None:
         exception_type = type(exc)
         for exc_cls, handler in self.exception_map.items():
             if issubclass(exception_type, exc_cls):
                 return handler
         return None
+
+    def _map_leaf(self, exc: BaseException, msg: str) -> BaseException:
+        if isinstance(exc, self.bypass):
+            return exc
+        if isinstance(exc, self.catch):
+            if handler := self.get_handler(exc):
+                return handler(exc, msg)
+            return self.default(f"{msg}: {exc}")
+        return exc
+
+    def _map_exception_tree(self, exc: BaseException, msg: str) -> BaseException:
+        if isinstance(exc, BaseExceptionGroup):
+            mapped = tuple(self._map_exception_tree(child, msg) for child in exc.exceptions)
+            if mapped == exc.exceptions:
+                return exc
+            return exc.derive(mapped)
+        return self._map_leaf(exc, msg)
+
+    def translate(self, exc: BaseException, msg: str) -> BaseException:
+        """Map a single exception or recursive exception-group tree."""
+        return self._map_exception_tree(exc, msg)
 
     def wrap[S, **P, R](
         self,
@@ -282,16 +306,16 @@ class ExceptionTranslator:
             async def wrapper(self: S, *args: P.args, **kwargs: P.kwargs) -> R:
                 try:
                     return await func(self, *args, **kwargs)
-                except* translator.bypass as exc_group:
-                    raise next(flatten_exception_group(exc_group)) from exc_group
-                except* translator.catch as exc_group:
-                    msg = translator.format_msg(func, default_message, self, *args, **kwargs)
-                    first = next(flatten_exception_group(exc_group))
-                    if handler := translator.get_handler(first):
-                        raise handler(exc_group, msg) from exc_group
-                    raise translator.default(f"{msg}: {first}") from exc_group
-                except* Exception as exc_group:
-                    raise next(flatten_exception_group(exc_group)) from exc_group
+                except BaseException as exc:
+                    if isinstance(exc, (Exception, BaseExceptionGroup)):
+                        mapped = translator.translate(
+                            exc,
+                            translator.format_msg(func, default_message, self, *args, **kwargs),
+                        )
+                        if mapped is exc:
+                            raise
+                        raise mapped from exc
+                    raise
 
             return wrapper
 
@@ -314,16 +338,16 @@ class ExceptionTranslator:
                 try:
                     async for item in func(self, *args, **kwargs):
                         yield item
-                except* translator.bypass as exc_group:
-                    raise next(flatten_exception_group(exc_group)) from exc_group
-                except* translator.catch as exc_group:
-                    msg = translator.format_msg(func, default_message, self, *args, **kwargs)
-                    first = next(flatten_exception_group(exc_group))
-                    if handler := translator.get_handler(first):
-                        raise handler(exc_group, msg) from exc_group
-                    raise translator.default(f"{msg}: {first}") from exc_group
-                except* Exception as exc_group:
-                    raise next(flatten_exception_group(exc_group)) from exc_group
+                except BaseException as exc:
+                    if isinstance(exc, (Exception, BaseExceptionGroup)):
+                        mapped = translator.translate(
+                            exc,
+                            translator.format_msg(func, default_message, self, *args, **kwargs),
+                        )
+                        if mapped is exc:
+                            raise
+                        raise mapped from exc
+                    raise
 
             return wrapper
 
@@ -332,13 +356,13 @@ class ExceptionTranslator:
     def handles[E: Exception](
         self, exc_type: type[E]
     ) -> Callable[
-        [Callable[[ExceptionGroup[E], str], Exception]],
-        Callable[[ExceptionGroup[E], str], Exception],
+        [Callable[[E, str], Exception]],
+        Callable[[E, str], Exception],
     ]:
         def decorator(
-            handler: Callable[[ExceptionGroup[E], str], Exception],
-        ) -> Callable[[ExceptionGroup[E], str], Exception]:
-            self.exception_map[exc_type] = cast("Callable[[ExceptionGroup, str], Exception]", handler)
+            handler: Callable[[E, str], Exception],
+        ) -> Callable[[E, str], Exception]:
+            self.exception_map[exc_type] = cast("Callable[[Exception, str], Exception]", handler)
             return handler
 
         return decorator

@@ -89,7 +89,13 @@ async def test_walk_returns_walk_entries_with_explicit_kinds(index_storage: Inde
 async def test_connect_rejects_symlink_binding_before_reading_target() -> None:
     index = MemoryStorage("/")
     chunks = MemoryStorage("/")
-    await chunks.upload_bytes(index.id.encode(), "/binding-target")
+    await chunks.upload_bytes(
+        json.dumps(
+            {"version": 2, "index_namespace_identity": index.namespace_identity},
+            separators=(",", ":"),
+        ).encode(),
+        "/binding-target",
+    )
     _inject_memory_symlink(chunks, CHUNKS_INDEX_FILE, "/binding-target")
     storage = IndexStorage(index, chunks)
 

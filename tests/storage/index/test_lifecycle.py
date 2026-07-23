@@ -1,3 +1,4 @@
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -105,6 +106,13 @@ class RollbackStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
         return await super().download_bytes(remote_path)
 
 
+def _binding_payload(index: MemoryStorage) -> bytes:
+    return json.dumps(
+        {"version": 2, "index_namespace_identity": index.namespace_identity},
+        separators=(",", ":"),
+    ).encode()
+
+
 async def test_partial_connect_rollback_is_retryable() -> None:
     index = MemoryStorage("/")
     chunks = FailingDownloadStorage()
@@ -130,7 +138,7 @@ async def test_binding_rollback_is_retryable() -> None:
     assert chunks.close_calls == 1
     await storage.connect()
     assert chunks.connect_calls == 2
-    assert await chunks.download_bytes(CHUNKS_INDEX_FILE) == index.id.encode()
+    assert await chunks.download_bytes(CHUNKS_INDEX_FILE) == _binding_payload(index)
     await storage.close()
 
 
@@ -188,7 +196,7 @@ async def test_binding_conflict_preserves_reverse_close_errors_and_retries_clean
     index = RollbackStorage("index", close_failures=1)
     chunks = RollbackStorage("chunks", close_failures=1)
     storage = IndexStorage(index, chunks)
-    await chunks.upload_bytes(b"other-index", CHUNKS_INDEX_FILE)
+    await chunks.upload_bytes(_binding_payload(MemoryStorage("/other")), CHUNKS_INDEX_FILE)
 
     with pytest.raises(BaseExceptionGroup) as caught:
         await storage.connect()
@@ -201,7 +209,7 @@ async def test_binding_conflict_preserves_reverse_close_errors_and_retries_clean
     assert chunks._lifecycle_state == "CONNECTED"
     assert index._lifecycle_state == "CONNECTED"
 
-    await chunks.upload_bytes(index.id.encode(), CHUNKS_INDEX_FILE, overwrite=True)
+    await chunks.upload_bytes(_binding_payload(index), CHUNKS_INDEX_FILE, overwrite=True)
     await storage.connect()
     assert (chunks.connect_calls, index.connect_calls) == (2, 2)
     assert (chunks.close_calls, index.close_calls) == (2, 2)
@@ -249,3 +257,23 @@ async def test_chunks_connect_failure_retries_failed_index_cleanup_before_connec
     assert (chunks.close_calls, index.close_calls) == (1, 2)
     assert storage._pending_rollback == []
     await storage.close()
+
+
+async def test_binding_rejects_legacy_format() -> None:
+    index = MemoryStorage("/")
+    chunks = MemoryStorage("/")
+    storage = IndexStorage(index, chunks)
+    await chunks.upload_bytes(b"legacy-index-id", CHUNKS_INDEX_FILE)
+
+    with pytest.raises(RuntimeError, match="unsupported legacy format"):
+        await storage.connect()
+
+
+async def test_binding_rejects_non_v2_json() -> None:
+    index = MemoryStorage("/")
+    chunks = MemoryStorage("/")
+    storage = IndexStorage(index, chunks)
+    await chunks.upload_bytes(json.dumps({"version": 1, "index_id": "x"}).encode(), CHUNKS_INDEX_FILE)
+
+    with pytest.raises(RuntimeError, match="unsupported legacy format"):
+        await storage.connect()

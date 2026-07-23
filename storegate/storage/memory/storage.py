@@ -1,5 +1,6 @@
 import errno
 import itertools
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, Iterable
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -12,11 +13,18 @@ from storegate.storage.abstract import (
     FileInfo,
     PathLike,
     StorageCapabilities,
+    VersionedBytes,
     WalkEntry,
+    make_namespace_identity,
 )
 
 _sid = itertools.count()
-_MEMORY_CAPABILITIES = StorageCapabilities(symlink_metadata=True, readlink=True, symlink_create=True)
+_MEMORY_CAPABILITIES = StorageCapabilities(
+    symlink_metadata=True,
+    readlink=True,
+    symlink_create=True,
+    compare_exchange=True,
+)
 _MAX_SYMLINK_HOPS = 40
 
 
@@ -34,6 +42,7 @@ class MemoryStorage(AbstractStorage):
         root_parts = tuple(part for part in raw_root.parts if part not in {"/", "."})
         self._root = PurePosixPath("/", *root_parts)
         self._files: dict[str, bytes] = {}
+        self._file_tokens: dict[str, str] = {}
         self._dirs: set[str] = {self._root.as_posix()}
         self._links: dict[str, str] = {}
         self._now = datetime.now(tz=UTC)
@@ -45,8 +54,13 @@ class MemoryStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         return f"memory:{self._id}:{self._root.as_posix()}"
+
+    @property
+    @override
+    def namespace_identity(self) -> str:
+        return make_namespace_identity("memory", instance=self._id, root=self._root.as_posix())
 
     @property
     @override
@@ -265,11 +279,17 @@ class MemoryStorage(AbstractStorage):
         files: dict[str, bytes],
         dirs: set[str],
         links: dict[str, str],
+        file_tokens: dict[str, str],
     ) -> None:
         key = path.as_posix()
         files.pop(key, None)
         dirs.discard(key)
         links.pop(key, None)
+        file_tokens.pop(key, None)
+
+    @staticmethod
+    def _new_file_token() -> str:
+        return uuid.uuid4().hex
 
     def _ensure_dirs_in_state(
         self,
@@ -290,7 +310,7 @@ class MemoryStorage(AbstractStorage):
         destination: PurePosixPath,
         *,
         overwrite: bool,
-    ) -> tuple[dict[str, bytes], set[str], dict[str, str]]:
+    ) -> tuple[dict[str, bytes], set[str], dict[str, str], dict[str, str]]:
         snapshot = self._tree_entries(source)
         if self._is_descendant(destination, source):
             raise ValueError("Destination must not be inside the source tree")
@@ -298,6 +318,7 @@ class MemoryStorage(AbstractStorage):
         files = self._files.copy()
         dirs = self._dirs.copy()
         links = self._links.copy()
+        file_tokens = self._file_tokens.copy()
         destination_kind = self._entry_kind(destination)
         if destination_kind is not None and not overwrite:
             raise FileExistsError(f"Destination already exists: {self._logical_from_backend(destination)}")
@@ -305,7 +326,7 @@ class MemoryStorage(AbstractStorage):
         parent_dirs = self._missing_parent_dirs(destination)
         self._ensure_dirs_in_state(parent_dirs, files, dirs, links)
         if destination_kind in {EntryKind.FILE, EntryKind.SYMLINK}:
-            self._remove_entry(destination, files, dirs, links)
+            self._remove_entry(destination, files, dirs, links, file_tokens)
         dirs.add(destination.as_posix())
 
         for source_path, source_kind in snapshot[1:]:
@@ -325,19 +346,21 @@ class MemoryStorage(AbstractStorage):
                 if target_kind in {EntryKind.FILE, EntryKind.SYMLINK}:
                     if not overwrite:
                         raise FileExistsError(f"Destination already exists: {self._logical_from_backend(target)}")
-                    self._remove_entry(target, files, dirs, links)
+                    self._remove_entry(target, files, dirs, links, file_tokens)
                 dirs.add(target_key)
                 continue
             if target_kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Destination is a directory: {self._logical_from_backend(target)}")
             if target_kind is not None and not overwrite:
                 raise FileExistsError(f"Destination already exists: {self._logical_from_backend(target)}")
-            self._remove_entry(target, files, dirs, links)
+            self._remove_entry(target, files, dirs, links, file_tokens)
+            source_key = source_path.as_posix()
             if source_kind is EntryKind.FILE:
-                files[target_key] = self._files[source_path.as_posix()]
+                files[target_key] = self._files[source_key]
+                file_tokens[target_key] = self._file_tokens[source_key]
             else:
-                links[target_key] = self._links[source_path.as_posix()]
-        return files, dirs, links
+                links[target_key] = self._links[source_key]
+        return files, dirs, links, file_tokens
 
     # ------------------------------------------------------------------
     # Upload and download
@@ -367,7 +390,58 @@ class MemoryStorage(AbstractStorage):
 
         for directory in missing_parents:
             self._dirs.add(directory.as_posix())
-        self._files[target.as_posix()] = bytes(buffer)
+        key = target.as_posix()
+        self._files[key] = bytes(buffer)
+        self._file_tokens[key] = self._new_file_token()
+
+    @override
+    async def read_versioned(self, path: PathLike) -> VersionedBytes | None:
+        _, lexical = self._path_pair(path)
+        target = self._follow(lexical)
+        kind = self._entry_kind(target)
+        if kind is None:
+            return None
+        if kind is not EntryKind.FILE:
+            raise IsADirectoryError(f"Not a regular file: {path}")
+        key = target.as_posix()
+        token = self._file_tokens.get(key)
+        if token is None:
+            token = self._new_file_token()
+            self._file_tokens[key] = token
+        return VersionedBytes(data=self._files[key], token=token)
+
+    @override
+    async def compare_exchange(
+        self,
+        path: PathLike,
+        *,
+        expected_token: str | None,
+        data: BytesLike,
+    ) -> VersionedBytes | None:
+        _, target = self._path_pair(path)
+        kind = self._entry_kind(target)
+        if kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {path}")
+        if kind is EntryKind.SYMLINK:
+            raise OSError(errno.ELOOP, f"Refusing to compare-exchange through symlink: {path}")
+
+        key = target.as_posix()
+        current_token = self._file_tokens.get(key) if kind is EntryKind.FILE else None
+        if expected_token is None:
+            if kind is EntryKind.FILE:
+                return None
+        elif current_token != expected_token:
+            return None
+
+        missing_parents = self._missing_parent_dirs(target)
+        for directory in missing_parents:
+            self._dirs.add(directory.as_posix())
+
+        payload = bytes(data)
+        token = self._new_file_token()
+        self._files[key] = payload
+        self._file_tokens[key] = token
+        return VersionedBytes(data=payload, token=token)
 
     @override
     async def download_stream(
@@ -399,7 +473,9 @@ class MemoryStorage(AbstractStorage):
         _, target = self._path_pair(path)
         kind = self._entry_kind(target)
         if kind is EntryKind.FILE:
-            del self._files[target.as_posix()]
+            key = target.as_posix()
+            del self._files[key]
+            self._file_tokens.pop(key, None)
             return
         if kind is EntryKind.SYMLINK:
             del self._links[target.as_posix()]
@@ -449,9 +525,12 @@ class MemoryStorage(AbstractStorage):
             return
         for directory in missing_parents:
             self._dirs.add(directory.as_posix())
-        self._remove_entry(destination, self._files, self._dirs, self._links)
+        self._remove_entry(destination, self._files, self._dirs, self._links, self._file_tokens)
         if source_kind is EntryKind.FILE:
-            self._files[destination.as_posix()] = self._files.pop(source.as_posix())
+            source_key = source.as_posix()
+            destination_key = destination.as_posix()
+            self._files[destination_key] = self._files.pop(source_key)
+            self._file_tokens[destination_key] = self._file_tokens.pop(source_key)
         else:
             self._links[destination.as_posix()] = self._links.pop(source.as_posix())
 
@@ -464,9 +543,12 @@ class MemoryStorage(AbstractStorage):
             return
         for directory in missing_parents:
             self._dirs.add(directory.as_posix())
-        self._remove_entry(destination, self._files, self._dirs, self._links)
+        self._remove_entry(destination, self._files, self._dirs, self._links, self._file_tokens)
         if source_kind is EntryKind.FILE:
-            self._files[destination.as_posix()] = self._files[source.as_posix()]
+            source_key = source.as_posix()
+            destination_key = destination.as_posix()
+            self._files[destination_key] = self._files[source_key]
+            self._file_tokens[destination_key] = self._file_tokens[source_key]
         else:
             self._links[destination.as_posix()] = self._links[source.as_posix()]
 
@@ -506,10 +588,11 @@ class MemoryStorage(AbstractStorage):
         files = self._files.copy()
         dirs = self._dirs.copy()
         links = self._links.copy()
+        file_tokens = self._file_tokens.copy()
         for entry, _ in reversed(snapshot):
-            self._remove_entry(entry, files, dirs, links)
+            self._remove_entry(entry, files, dirs, links, file_tokens)
         dirs.add(self._root.as_posix())
-        self._files, self._dirs, self._links = files, dirs, links
+        self._files, self._dirs, self._links, self._file_tokens = files, dirs, links, file_tokens
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
@@ -521,8 +604,8 @@ class MemoryStorage(AbstractStorage):
             if not overwrite:
                 raise FileExistsError(f"Destination already exists: {dst}")
             return
-        files, dirs, links = self._copytree_state(source, destination, overwrite=overwrite)
-        self._files, self._dirs, self._links = files, dirs, links
+        files, dirs, links, file_tokens = self._copytree_state(source, destination, overwrite=overwrite)
+        self._files, self._dirs, self._links, self._file_tokens = files, dirs, links, file_tokens
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
@@ -534,12 +617,12 @@ class MemoryStorage(AbstractStorage):
             if not overwrite:
                 raise FileExistsError(f"Destination already exists: {dst}")
             return
-        files, dirs, links = self._copytree_state(source, destination, overwrite=overwrite)
+        files, dirs, links, file_tokens = self._copytree_state(source, destination, overwrite=overwrite)
         source_snapshot = self._tree_entries(source)
         for entry, _ in reversed(source_snapshot):
-            self._remove_entry(entry, files, dirs, links)
+            self._remove_entry(entry, files, dirs, links, file_tokens)
         dirs.add(self._root.as_posix())
-        self._files, self._dirs, self._links = files, dirs, links
+        self._files, self._dirs, self._links, self._file_tokens = files, dirs, links, file_tokens
 
     # ------------------------------------------------------------------
     # Metadata and symlinks
@@ -625,7 +708,7 @@ class MemoryStorage(AbstractStorage):
             raise FileExistsError(f"Destination already exists: {link_path}")
         if kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Destination is a directory: {link_path}")
-        self._remove_entry(link, self._files, self._dirs, self._links)
+        self._remove_entry(link, self._files, self._dirs, self._links, self._file_tokens)
         self._links[link.as_posix()] = raw_target
 
     # ------------------------------------------------------------------

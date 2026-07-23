@@ -29,8 +29,13 @@ class SymlinkTrapStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         return "dav-symlink-trap"
+
+    @property
+    @override
+    def namespace_identity(self) -> str:
+        return "dav-symlink-trap:sha256:test"
 
     @override
     async def connect(self) -> None:

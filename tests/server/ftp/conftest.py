@@ -19,8 +19,12 @@ class ProtocolStorage(AbstractStorage):
         self.lstat_errors: dict[str, OSError] = {}
 
     @property
-    def id(self) -> str:
+    def display_id(self) -> str:
         return "ftp-protocol-test"
+
+    @property
+    def namespace_identity(self) -> str:
+        return "ftp-protocol-test:sha256:test"
 
     async def connect(self) -> None:
         pass

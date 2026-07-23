@@ -16,7 +16,7 @@ class TestResolveStorage:
         spec = {"$factory": "~memory", "root": "direct"}
         obj = resolve_storage(spec)
         assert isinstance(obj, MemoryStorage)
-        assert obj.id.endswith(":/direct")
+        assert obj.display_id.endswith(":/direct")
 
     def test_rejects_non_storage_result(self):
         spec = {"$factory": "tests.support.factory_targets:return_number"}
@@ -40,4 +40,4 @@ class TestResolveStorageFromFile:
 
         obj = resolve_storage_from_file(json_path)
         assert isinstance(obj, MemoryStorage)
-        assert obj.id.endswith(":/json-root")
+        assert obj.display_id.endswith(":/json-root")

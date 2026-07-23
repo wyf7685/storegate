@@ -17,9 +17,9 @@ from storegate.storage.abstract import (
     StorageCapabilities,
     UnsupportedOperationError,
     WalkEntry,
-    make_cache_identity,
+    make_namespace_identity,
 )
-from storegate.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
+from storegate.utils import ExceptionTranslator, coalesce_chunks
 
 from .client import AsyncDavClient, DavClientError, DavConfig, DavHttpStatusError, DavResource
 from .utils import dav_resource_to_file_info, href_to_storage_path
@@ -39,14 +39,13 @@ def _unsupported_entry(path: PathLike) -> UnsupportedOperationError:
 
 
 @translator.handles(DavHttpStatusError)
-def _(exc_group: ExceptionGroup[DavHttpStatusError], msg: str) -> OSError:
-    first = next(flatten_exception_group(exc_group))
+def _(exc: DavHttpStatusError, msg: str) -> OSError:
     return {
         404: FileNotFoundError,
         403: PermissionError,
         412: FileExistsError,  # Overwrite: F precondition failed
         423: PermissionError,  # Locked
-    }.get(first.status_code, OSError)(f"{msg}: {first}")
+    }.get(exc.status_code, OSError)(f"{msg}: {exc}")
 
 
 @final
@@ -69,15 +68,22 @@ class DavStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         parsed = urlparse(self._config.base_url)
-        return f"dav:{parsed.netloc}{self._config.root_prefix}"
+        host = parsed.hostname or ""
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        elif parsed.scheme == "http":
+            host = f"{host}:80"
+        elif parsed.scheme == "https":
+            host = f"{host}:443"
+        return f"dav:{host}{self._config.root_prefix}"
 
     @property
     @override
-    def cache_identity(self) -> str:
+    def namespace_identity(self) -> str:
         parsed = urlparse(self._config.base_url)
-        return make_cache_identity(
+        return make_namespace_identity(
             "dav",
             base_path=parsed.path,
             hostname=parsed.hostname,

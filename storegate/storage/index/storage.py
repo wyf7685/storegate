@@ -2,6 +2,7 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
+import json
 import math
 from collections.abc import AsyncGenerator, AsyncIterable, Iterable, Mapping
 from datetime import UTC, datetime
@@ -15,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from storegate.log import escape_tag
 
-from ..abstract import AbstractStorage, BytesLike, EntryKind, FileInfo, PathLike, WalkEntry, make_cache_identity
+from ..abstract import AbstractStorage, BytesLike, EntryKind, FileInfo, PathLike, WalkEntry, make_namespace_identity
 from ._guard import download_private_file, lstat_private_entry, lstat_private_entry_or_none
 from .lock import LockLease, StorageFileLocker
 from .ref import ChunkRefManager, hash_to_path
@@ -100,28 +101,24 @@ class IndexStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
-        return f"index:{self._index.id}#{self._chunks.id}"
+    def display_id(self) -> str:
+        return f"index:{self._index.display_id}#{self._chunks.display_id}"
 
     @property
     @override
-    def cache_identity(self) -> str | None:
-        index_identity = self._index.cache_identity
-        chunks_identity = self._chunks.cache_identity
-        if index_identity is None or chunks_identity is None:
-            return None
-        return make_cache_identity(
+    def namespace_identity(self) -> str:
+        return make_namespace_identity(
             "index",
             block_size=self._block_size,
-            chunks=chunks_identity,
-            index=index_identity,
+            chunks=self._chunks.namespace_identity,
+            index=self._index.namespace_identity,
         )
 
     @override
     async def connect(self) -> None:
         index = self._index
         chunks = self._chunks
-        self.log.info(f"Connecting IndexStorage (index=<c>{index.id}</c>, chunks=<c>{self._chunks.id}</c>)")
+        self.log.info(f"Connecting IndexStorage (index=<c>{index.display_id}</c>, chunks=<c>{chunks.display_id}</c>)")
         await self._retry_pending_rollback()
         index_started = False
         chunks_started = False
@@ -130,21 +127,52 @@ class IndexStorage(AbstractStorage):
             await index.connect()
             chunks_started = True
             await chunks.connect()
+            index_namespace_identity = index.namespace_identity
             try:
-                existing = (await download_private_file(chunks, CHUNKS_INDEX_FILE, label="binding file")).decode()
+                existing_raw = (await download_private_file(chunks, CHUNKS_INDEX_FILE, label="binding file")).decode()
             except FileNotFoundError:
-                existing = None
-            if existing is None:
-                await chunks.upload_bytes(index.id.encode(), CHUNKS_INDEX_FILE, overwrite=False)
-                self.log.success(f"Registered chunks storage <c>{chunks.id}</c> → index <c>{index.id}</c>")
-            elif existing != index.id:
-                self.log.error(
-                    f"Chunks storage <c>{chunks.id}</c> is already associated with "
-                    f"index <r>{escape_tag(existing)}</r>, rejecting index <c>{index.id}</c>"
+                existing_raw = None
+            if existing_raw is None:
+                payload = json.dumps(
+                    {
+                        "version": 2,
+                        "index_namespace_identity": index_namespace_identity,
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                await chunks.upload_bytes(payload, CHUNKS_INDEX_FILE, overwrite=False)
+                self.log.success(
+                    f"Registered chunks storage <c>{chunks.display_id}</c> → index <c>{index.display_id}</c>"
                 )
-                raise RuntimeError(f"Chunks storage is already associated with a different index storage: {existing}")
             else:
-                self.log.debug(f"Chunks storage <c>{chunks.id}</c> already bound to index <c>{existing}</c>")
+                try:
+                    existing = json.loads(existing_raw)
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(
+                        "Chunks storage binding uses an unsupported legacy format; "
+                        "clean cutover requires version 2 JSON with index_namespace_identity"
+                    ) from error
+                if (
+                    not isinstance(existing, dict)
+                    or existing.get("version") != 2
+                    or not isinstance(existing.get("index_namespace_identity"), str)
+                ):
+                    raise RuntimeError(
+                        "Chunks storage binding uses an unsupported legacy format; "
+                        "clean cutover requires version 2 JSON with index_namespace_identity"
+                    )
+                bound_identity = existing["index_namespace_identity"]
+                if bound_identity != index_namespace_identity:
+                    self.log.error(
+                        f"Chunks storage <c>{chunks.display_id}</c> is already associated with "
+                        f"index <r>{escape_tag(bound_identity)}</r>, rejecting index <c>{index.display_id}</c>"
+                    )
+                    raise RuntimeError(
+                        f"Chunks storage is already associated with a different index storage: {bound_identity}"
+                    )
+                self.log.debug(
+                    f"Chunks storage <c>{chunks.display_id}</c> already bound to index <c>{bound_identity}</c>"
+                )
         except BaseException as primary:
             cleanup_errors: list[BaseException] = []
             failed_cleanup: list[AbstractStorage] = []

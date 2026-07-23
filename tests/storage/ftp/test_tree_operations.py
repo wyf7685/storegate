@@ -6,6 +6,7 @@ import aioftp
 import pytest
 
 from storegate.storage.ftp import FTPStorage
+from storegate.utils import flatten_exception_group
 from tests.support.ids import uid
 
 pytestmark = pytest.mark.integration
@@ -131,6 +132,54 @@ class TestCopyAndTrees:
             assert await ftp_storage.exists(source / "b.txt")
         finally:
             monkeypatch.setattr(FTPStorage, "_copy_stream", original)
+            await ftp_storage.rmtree(base)
+
+    async def test_copytree_public_rollback_group_preserves_primary_first(
+        self,
+        ftp_storage: FTPStorage,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        base = f"/ftp-rollback-group-{uid()}"
+        source = PurePosixPath(base, "source")
+        destination = PurePosixPath(base, "destination")
+        await ftp_storage.upload_bytes(b"a", source / "a.txt")
+        await ftp_storage.upload_bytes(b"b", source / "b.txt")
+        await ftp_storage.upload_bytes(b"old-a", destination / "a.txt")
+
+        original_copy = FTPStorage._copy_stream
+
+        async def fail_second_copy(
+            self: FTPStorage,
+            source_client: aioftp.Client,
+            destination_client: aioftp.Client,
+            source_path: PurePosixPath,
+            destination_path: PurePosixPath,
+        ) -> None:
+            if source_path.name == "b.txt":
+                raise OSError("injected protocol copy failure")
+            await original_copy(self, source_client, destination_client, source_path, destination_path)
+
+        async def fail_rollback(
+            self: FTPStorage,
+            client: aioftp.Client,
+            created_files: set[PurePosixPath],
+            created_dirs: set[PurePosixPath],
+            backups: dict[PurePosixPath, PurePosixPath],
+        ) -> None:
+            _ = self, client, created_files, created_dirs, backups
+            raise OSError("injected rollback failure")
+
+        monkeypatch.setattr(FTPStorage, "_copy_stream", fail_second_copy)
+        monkeypatch.setattr(FTPStorage, "_rollback_copytree_with_fallback", fail_rollback)
+        try:
+            with pytest.raises(BaseExceptionGroup) as caught:
+                await ftp_storage.copytree(source, destination, overwrite=True)
+            flattened = list(flatten_exception_group(caught.value))
+            assert len(flattened) == 2
+            assert "injected protocol copy failure" in str(flattened[0])
+            assert "injected rollback failure" in str(flattened[1])
+        finally:
+            monkeypatch.setattr(FTPStorage, "_copy_stream", original_copy)
             await ftp_storage.rmtree(base)
 
     async def test_copytree_failure_restores_overwritten_files(

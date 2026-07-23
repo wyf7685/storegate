@@ -27,8 +27,12 @@ class ProbeStorage(AbstractStorage):
         self.rmdir_calls: list[PathLike] = []
 
     @property
-    def id(self) -> str:
+    def display_id(self) -> str:
         return "probe"
+
+    @property
+    def namespace_identity(self) -> str:
+        return "probe:sha256:test"
 
     async def connect(self) -> None:
         pass

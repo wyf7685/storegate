@@ -23,7 +23,7 @@ class TestResolveServer:
 
         assert isinstance(server, FTPServer)
         assert isinstance(server.storage, MemoryStorage)
-        assert server.storage.id.endswith(":/server-root")
+        assert server.storage.display_id.endswith(":/server-root")
         assert server.host == "127.0.0.1"
         assert server.port == 2021
 
@@ -49,6 +49,6 @@ class TestResolveServerFromFile:
 
         assert isinstance(server, FTPServer)
         assert isinstance(server.storage, MemoryStorage)
-        assert server.storage.id.endswith(":/json-server-root")
+        assert server.storage.display_id.endswith(":/json-server-root")
         assert server.host == "127.0.0.2"
         assert server.port == 2122
