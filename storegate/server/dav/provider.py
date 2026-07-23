@@ -13,9 +13,10 @@ from .utils import HiddenPathError, lstat_visible, run_async
 @final
 class StorageProvider(BaseDAVProvider):
     @override
-    def __init__(self, storage: AbstractStorage) -> None:
+    def __init__(self, storage: AbstractStorage, *, read_only: bool = False) -> None:
         super().__init__()
         self._storage = storage
+        self._read_only = read_only
 
     @override
     def get_resource_inst(self, path: str, environ: dict[str, object]) -> StorageResource | StorageCollection | None:
@@ -28,9 +29,9 @@ class StorageProvider(BaseDAVProvider):
 
         match info.kind:
             case EntryKind.FILE:
-                return StorageResource(path, environ, self._storage)
+                return StorageResource(path, environ, self._storage, read_only=self._read_only)
             case EntryKind.DIRECTORY:
-                return StorageCollection(path, environ, self._storage)
+                return StorageCollection(path, environ, self._storage, read_only=self._read_only)
             case EntryKind.SYMLINK:
                 return None
 
@@ -46,3 +47,7 @@ class StorageProvider(BaseDAVProvider):
                 return True
             case EntryKind.SYMLINK:
                 return False
+
+    @override
+    def is_readonly(self) -> bool:
+        return self._read_only

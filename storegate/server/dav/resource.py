@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 from typing import Any, Protocol, final, override
 
 import anyio
+from wsgidav import dav_error
 from wsgidav.dav_provider import DAVNonCollection
 
 from storegate.storage import AbstractStorage, FileInfo
@@ -150,11 +151,19 @@ class ResourceWriter:
 @final
 class StorageResource(DAVNonCollection):
     @override
-    def __init__(self, path: str, environ: dict[str, Any], storage: AbstractStorage) -> None:
+    def __init__(
+        self,
+        path: str,
+        environ: dict[str, Any],
+        storage: AbstractStorage,
+        *,
+        read_only: bool = False,
+    ) -> None:
         super().__init__(path, environ)
         self._storage = storage
         self._info: FileInfo | None = None
         self._writer: ResourceWriter | None = None
+        self._read_only = read_only
 
     def _get_file_info(self) -> FileInfo:
         if self._info is None:
@@ -209,6 +218,8 @@ class StorageResource(DAVNonCollection):
 
     @override
     def begin_write(self, *, content_type: object = None) -> DAVWriter:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         if self._writer is not None:
             raise RuntimeError("Write operation already in progress.")
 
@@ -220,22 +231,28 @@ class StorageResource(DAVNonCollection):
     @override
     def end_write(self, *, with_errors: bool) -> None:
         if self._writer is None:
-            raise RuntimeError("No write operation in progress.")
+            return
         if with_errors:
             self._writer.abort()
         self._writer.close()
         self._writer = None
 
     async def _delete_visible(self) -> None:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         await require_visible_file(self._storage, self.path)
         await self._storage.unlink(self.path, missing_ok=False)
 
     async def _copy_visible(self, dest_path: str) -> None:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         await require_visible_file(self._storage, self.path)
         await reject_hidden_destination(self._storage, dest_path)
         await self._storage.copy(self.path, dest_path)
 
     async def _move_visible(self, dest_path: str) -> None:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         await require_visible_file(self._storage, self.path)
         await reject_hidden_destination(self._storage, dest_path)
         await self._storage.move(self.path, dest_path)
@@ -254,6 +271,8 @@ class StorageResource(DAVNonCollection):
 
     @override
     def copy_move_single(self, dest_path: str, *, is_move: bool) -> None:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         run_async(require_visible_file, self._storage, self.path)
         run_async(reject_hidden_destination, self._storage, dest_path)
         if is_move:

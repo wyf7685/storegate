@@ -115,9 +115,8 @@ async def test_storage_resource_write_state_transitions(mocker: MockerFixture) -
     resource = StorageResource("/file.bin", {"wsgidav.provider": MagicMock()}, storage)
     writer = MagicMock(spec=ResourceWriter)
     writer_cls = mocker.patch("storegate.server.dav.resource.ResourceWriter", return_value=writer)
-
-    with pytest.raises(RuntimeError, match="No write operation"):
-        await anyio.to_thread.run_sync(lambda: resource.end_write(with_errors=False))
+    # end_write now tolerates a missing writer (returns silently).
+    await anyio.to_thread.run_sync(lambda: resource.end_write(with_errors=False))
 
     assert await anyio.to_thread.run_sync(resource.begin_write) is writer
     writer.start.assert_called_once_with()

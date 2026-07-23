@@ -215,3 +215,145 @@ async def test_wsgidav_preserves_regular_range_and_writer_behavior() -> None:
     assert metadata.status_code == 207
     assert "updated-visible" not in metadata.text
     assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_rejects_put_without_modifying_file() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    put = await anyio.to_thread.run_sync(
+        functools.partial(_request, app, "PUT", "/visible.txt", content=b"replacement")
+    )
+    assert put.status_code in (403, 405)
+    assert storage.files["/visible.txt"] == b"visible-content"
+    assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_rejects_delete_without_modifying_file() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    delete = await anyio.to_thread.run_sync(functools.partial(_request, app, "DELETE", "/visible.txt"))
+    assert delete.status_code in (403, 405)
+    assert storage.files["/visible.txt"] == b"visible-content"
+    assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_rejects_mkcol_without_creating_directory() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    mkcol = await anyio.to_thread.run_sync(functools.partial(_request, app, "MKCOL", "/newdir"))
+    assert mkcol.status_code in (403, 405)
+    assert "/newdir" not in storage.directories
+    assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_rejects_copy_without_copying_file() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    copy = await anyio.to_thread.run_sync(
+        functools.partial(
+            _request,
+            app,
+            "COPY",
+            "/visible.txt",
+            headers={"Destination": "http://testserver/copied.txt"},
+        )
+    )
+    assert copy.status_code in (403, 405)
+    assert "/copied.txt" not in storage.files
+    assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_rejects_move_without_moving_file() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    move = await anyio.to_thread.run_sync(
+        functools.partial(
+            _request,
+            app,
+            "MOVE",
+            "/visible.txt",
+            headers={"Destination": "http://testserver/moved.txt"},
+        )
+    )
+    assert move.status_code in (403, 405)
+    assert storage.files["/visible.txt"] == b"visible-content"
+    assert "/moved.txt" not in storage.files
+    assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_get_still_works() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    get = await anyio.to_thread.run_sync(functools.partial(_request, app, "GET", "/visible.txt"))
+    assert get.status_code == 200
+    assert get.content == b"visible-content"
+    assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_propfind_still_works() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    listing = await anyio.to_thread.run_sync(functools.partial(_request, app, "PROPFIND", "/", headers={"Depth": "1"}))
+    assert listing.status_code == 207
+    assert "visible.txt" in listing.text
+    assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_rejects_proppatch_without_modifying_properties() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    proppatch = await anyio.to_thread.run_sync(
+        functools.partial(
+            _request,
+            app,
+            "PROPPATCH",
+            "/visible.txt",
+            headers={"Content-Type": "application/xml"},
+            content=b"""<?xml version="1.0"?>
+<propertyupdate xmlns="DAV:"><set><prop><displayname>renamed</displayname></prop></set></propertyupdate>""",
+        )
+    )
+    assert proppatch.status_code in (403, 405)
+    assert storage.files["/visible.txt"] == b"visible-content"
+    assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_rejects_lock_without_acquiring_lock() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    lock_xml = b"""<?xml version="1.0"?>
+<lockinfo xmlns="DAV:">
+  <lockscope><exclusive/></lockscope>
+  <locktype><write/></locktype>
+  <owner><href>test</href></owner>
+</lockinfo>"""
+    lock = await anyio.to_thread.run_sync(
+        functools.partial(
+            _request,
+            app,
+            "LOCK",
+            "/visible.txt",
+            headers={"Content-Type": "application/xml"},
+            content=lock_xml,
+        )
+    )
+    assert lock.status_code in (403, 405)
+    assert storage.files["/visible.txt"] == b"visible-content"
+    assert storage.dangerous_calls == []
+
+
+async def test_readonly_dav_rejects_unlock_without_releasing_lock() -> None:
+    storage = SymlinkTrapStorage()
+    app = create_wsgi_app(storage, "127.0.0.1", 8080, read_only=True)
+    unlock = await anyio.to_thread.run_sync(
+        functools.partial(
+            _request,
+            app,
+            "UNLOCK",
+            "/visible.txt",
+            headers={"Lock-Token": "<opaquelocktoken:unused>"},
+        )
+    )
+    assert unlock.status_code in (403, 405)
+    assert storage.files["/visible.txt"] == b"visible-content"
+    assert storage.dangerous_calls == []
