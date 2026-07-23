@@ -13,6 +13,7 @@ from ..abstract import (
     FileInfo,
     PathLike,
     StorageCapabilities,
+    VersionedBytes,
     WalkEntry,
 )
 from .backend import CacheBackend
@@ -38,12 +39,13 @@ class CachedStorage(AbstractStorage):
     storage:
         The underlying storage to wrap.
     ttl:
-        TTL (seconds) for cached entries. Default 30 s.
+        TTL (seconds) for cached entries. Must be ``> 0``. Default 30 s.
     capacity:
-        Maximum number of entries per cache. Default 1000.
+        Maximum number of entries per metadata cache. Must be ``>= 4`` so the
+        download namespace can keep at least one entry. Default 1000.
     download_cache_threshold:
         Maximum file size (bytes) cached for ``download_stream``. ``None``
-        disables download caching. Default 16 KiB.
+        disables download caching; otherwise must be ``>= 0``. Default 16 KiB.
     cache:
         Cache backend, or ``"memory"`` for the built-in in-process backend.
     """
@@ -58,12 +60,21 @@ class CachedStorage(AbstractStorage):
         cache: Literal["memory"] | CacheBackend = "memory",
     ) -> None:
         super().__init__()
+        if ttl <= 0:
+            raise ValueError("ttl must be > 0")
+        if capacity < 4:
+            raise ValueError("capacity must be >= 4")
+        if download_cache_threshold is not None and download_cache_threshold < 0:
+            raise ValueError("download_cache_threshold must be None or >= 0")
+
+        download_capacity = capacity // 4
+        if download_capacity < 1:
+            raise ValueError("download namespace capacity must be >= 1")
+
         self._storage = storage
         self._ttl = ttl
         self._capacity = capacity
         self._download_cache_threshold = download_cache_threshold
-        if download_cache_threshold is not None and download_cache_threshold < 0:
-            raise ValueError("download_cache_threshold must be None or >= 0")
 
         self._cache: CacheBackend = MemoryCacheBackend(capacity=capacity) if cache == "memory" else cache
         self._cache.bind_storage(self._storage.namespace_identity)
@@ -74,7 +85,7 @@ class CachedStorage(AbstractStorage):
         self._cache.configure_namespace("stat", ttl)
         self._cache.configure_namespace("lstat", ttl)
         self._cache.configure_namespace("iterdir", ttl)
-        self._cache.configure_namespace("download", ttl * 2, capacity=capacity // 4)
+        self._cache.configure_namespace("download", ttl * 2, capacity=download_capacity)
 
     @property
     @override
@@ -89,17 +100,9 @@ class CachedStorage(AbstractStorage):
     @property
     @override
     def capabilities(self) -> StorageCapabilities:
-        # Wave 1 owns CAS proxying/invalidation. Until CachedStorage implements
-        # read_versioned/compare_exchange, never advertise wrapped CAS support.
-        caps = self._storage.capabilities
-        if not caps.compare_exchange:
-            return caps
-        return StorageCapabilities(
-            symlink_metadata=caps.symlink_metadata,
-            readlink=caps.readlink,
-            symlink_create=caps.symlink_create,
-            compare_exchange=False,
-        )
+        # Proxy CAS only when the wrapped storage implements it; otherwise keep
+        # the existing capability object so non-CAS backends stay allocation-free.
+        return self._storage.capabilities
 
     @override
     async def connect(self) -> None:
@@ -134,6 +137,41 @@ class CachedStorage(AbstractStorage):
     @override
     async def ping(self) -> bool:
         return await self._cache.ping() and await self._storage.ping()
+
+    @override
+    async def read_versioned(self, path: PathLike) -> VersionedBytes | None:
+        # Validate before any wrapped CAS I/O; keep the original path for
+        # backend semantics after normalization succeeds.
+        self._normalize(path)
+        return await self._storage.read_versioned(path)
+
+    @override
+    async def compare_exchange(
+        self,
+        path: PathLike,
+        *,
+        expected_token: str | None,
+        data: BytesLike,
+    ) -> VersionedBytes | None:
+        # Validate before any wrapped CAS I/O so invalid paths never mutate.
+        self._normalize(path)
+        result = await self._storage.compare_exchange(
+            path,
+            expected_token=expected_token,
+            data=data,
+        )
+        if result is not None:
+            await self._invalidate_path(
+                path,
+                exists=True,
+                is_file=True,
+                is_dir=False,
+                is_symlink=False,
+                download=result.data
+                if self._download_cache_threshold is not None and len(result.data) <= self._download_cache_threshold
+                else None,
+            )
+        return result
 
     @staticmethod
     def _normalize(path: PathLike) -> str:

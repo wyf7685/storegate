@@ -174,6 +174,16 @@ class RedisCacheBackend(CacheBackend):
 
     @override
     def configure_namespace(self, name: str, ttl: int, **opts: Any) -> None:
+        del opts  # Redis namespaces ignore capacity and other memory-only options.
+        if ttl <= 0:
+            raise ValueError("ttl must be > 0")
+        existing = self._ttls.get(name)
+        if existing is not None:
+            if existing == ttl:
+                return
+            raise ValueError(
+                f"namespace {name!r} already configured with ttl={existing}; cannot reconfigure with ttl={ttl}"
+            )
         self._ttls[name] = ttl
         self._serializers[name], self._deserializers[name] = _serializers_for(name)
 

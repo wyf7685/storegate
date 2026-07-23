@@ -59,7 +59,9 @@ class CacheBackend(ABC):
         (e.g. ``capacity`` for :class:`MemoryCacheBackend`) and should
         ignore unknown options.
 
-        Must be called before any data operation uses *name*.
+        Must be called before any data operation uses *name*. Repeated
+        calls with identical configuration are idempotent; conflicting
+        configuration for an existing namespace must fail explicitly.
         """
         raise NotImplementedError
 

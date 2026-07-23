@@ -12,6 +12,10 @@ class MemoryCacheBackend(CacheBackend):
     All methods are ``async`` in signature but execute synchronously
     (there is no I/O).
 
+    Namespace configuration and cache objects survive :meth:`close`. Closing
+    only clears each namespace's contents so a later reconnect reuses the same
+    configured namespaces without stale values.
+
     Parameters
     ----------
     capacity:
@@ -21,8 +25,11 @@ class MemoryCacheBackend(CacheBackend):
 
     def __init__(self, capacity: int = 1000) -> None:
         super().__init__()
+        if capacity < 1:
+            raise ValueError("capacity must be >= 1")
         self._default_capacity = capacity
         self._caches: dict[str, ExpiringDict[str, Any]] = {}
+        self._namespace_configs: dict[str, tuple[int, int]] = {}
 
     # ------------------------------------------------------------------
     # Namespace configuration
@@ -30,7 +37,25 @@ class MemoryCacheBackend(CacheBackend):
 
     @override
     def configure_namespace(self, name: str, ttl: int, **opts: Any) -> None:
+        if ttl <= 0:
+            raise ValueError("ttl must be > 0")
         capacity = opts.get("capacity", self._default_capacity)
+        if not isinstance(capacity, int) or isinstance(capacity, bool):
+            raise TypeError("capacity must be an int")
+        if capacity < 1:
+            raise ValueError("capacity must be >= 1")
+
+        config = (ttl, capacity)
+        existing = self._namespace_configs.get(name)
+        if existing is not None:
+            if existing == config:
+                return
+            raise ValueError(
+                f"namespace {name!r} already configured with ttl={existing[0]}, "
+                f"capacity={existing[1]}; cannot reconfigure with ttl={ttl}, capacity={capacity}"
+            )
+
+        self._namespace_configs[name] = config
         self._caches[name] = ExpiringDict(capacity=capacity, default_age=ttl)
 
     # ------------------------------------------------------------------
@@ -43,7 +68,9 @@ class MemoryCacheBackend(CacheBackend):
 
     @override
     async def close(self) -> None:
-        self._caches.clear()  # release memory
+        # Preserve namespace configuration and objects; drop only values.
+        for cache in self._caches.values():
+            cache.clear()
 
     @override
     async def ping(self) -> bool:
