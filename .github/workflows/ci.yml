@@ -12,6 +12,7 @@ on:
       - "uv.lock"
       - "ruff.toml"
       - "ty.toml"
+      - "README.md"
   pull_request:
     paths:
       - "storegate/**"
@@ -21,6 +22,7 @@ on:
       - "uv.lock"
       - "ruff.toml"
       - "ty.toml"
+      - "README.md"
 
 permissions:
   contents: read
@@ -82,3 +84,26 @@ jobs:
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  windows:
+    name: Windows Test & Coverage
+    runs-on: windows-latest
+    needs: lint
+    concurrency:
+      group: windows-test-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --no-dev --group test
+
+      - name: Run tests with branch coverage and skip reasons
+        run: uv run --no-sync pytest -m "not s3" --cov=storegate --cov-branch --cov-report=xml -rs
