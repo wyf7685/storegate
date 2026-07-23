@@ -7,6 +7,7 @@ import pytest
 
 from storegate.storage.factory import resolve_storage, resolve_storage_from_file
 from storegate.storage.memory import MemoryStorage
+from storegate.utils import FactoryMode
 
 
 class TestResolveStorage:
@@ -21,7 +22,7 @@ class TestResolveStorage:
     def test_rejects_non_storage_result(self):
         spec = {"$factory": "tests.support.factory_targets:return_number"}
         with pytest.raises(TypeError, match=r"Resolved object is not an AbstractStorage"):
-            resolve_storage(spec)
+            resolve_storage(spec, mode=FactoryMode.TRUSTED)
 
 
 class TestResolveStorageFromFile:
@@ -38,6 +39,6 @@ class TestResolveStorageFromFile:
         json_path = tmp_path / "spec.json"
         json_path.write_text(json.dumps(data))
 
-        obj = resolve_storage_from_file(json_path)
+        obj = resolve_storage_from_file(json_path, mode=FactoryMode.TRUSTED)
         assert isinstance(obj, MemoryStorage)
         assert obj.display_id.endswith(":/json-root")

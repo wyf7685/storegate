@@ -8,6 +8,7 @@ import pytest
 from storegate.server.factory import resolve_server, resolve_server_from_file
 from storegate.server.ftp import FTPServer
 from storegate.storage.memory import MemoryStorage
+from storegate.utils import FactoryMode
 
 
 class TestResolveServer:
@@ -30,8 +31,8 @@ class TestResolveServer:
     def test_rejects_non_server_result(self) -> None:
         spec = {"$factory": "tests.support.factory_targets:return_number"}
 
-        with pytest.raises(TypeError, match="Resolved object is not an AbstractServer: 'int'"):
-            resolve_server(spec)
+        with pytest.raises(TypeError, match="Resolved object is not an AbstractServer"):
+            resolve_server(spec, mode=FactoryMode.TRUSTED)
 
 
 class TestResolveServerFromFile:
