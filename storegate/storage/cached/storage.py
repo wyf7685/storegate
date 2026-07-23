@@ -15,6 +15,7 @@ from ..abstract import (
     StorageCapabilities,
     VersionedBytes,
     WalkEntry,
+    validate_download_offset,
 )
 from .backend import CacheBackend
 from .backend.memory import MemoryCacheBackend
@@ -327,6 +328,7 @@ class CachedStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
+        remote_path = self.normalize_path(remote_path)
         buffer = bytearray() if self._download_cache_threshold is not None else None
         threshold = self._download_cache_threshold or 0
 
@@ -356,6 +358,8 @@ class CachedStorage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
+        offset = validate_download_offset(offset)
+        remote_path = self.normalize_path(remote_path)
         np = self._normalize(remote_path)
         if await self._is_lexical_symlink(remote_path, np):
             async for chunk in self._storage.download_stream(remote_path, offset=offset):
@@ -364,6 +368,8 @@ class CachedStorage(AbstractStorage):
 
         if self._download_cache_threshold is not None and (cached := await self._cache.get("download", np)) is not None:
             self.log.trace(f"Cache hit: <le>download_stream</>(<y>{escape_tag(np)}</y>) → <g>{len(cached)} bytes</g>")
+            if offset >= len(cached):
+                return
             yield cached[offset:] if offset else cached
             return
 
@@ -387,25 +393,29 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
+        path = self.normalize_path(path)
         await self._storage.unlink(path, missing_ok=missing_ok)
         await self._invalidate_as_missing(path)
 
     @override
     async def rmdir(self, path: PathLike) -> None:
+        path = self.normalize_path(path)
         await self._storage.rmdir(path)
         await self._invalidate_as_missing(path)
 
     @override
     async def delete(self, path: PathLike) -> None:
+        path = self.normalize_path(path)
         await self._storage.delete(path)
         await self._invalidate_as_missing(path)
 
     @override
     async def delete_many(self, *paths: PathLike) -> None:
+        normalized = tuple(self.normalize_path(path) for path in paths)
         try:
-            await self._storage.delete_many(*paths)
+            await self._storage.delete_many(*normalized)
         finally:
-            for path in paths:
+            for path in normalized:
                 await self._invalidate_path(path)
 
     async def _backfill_copied_kind(self, path: PathLike, kind: EntryKind) -> None:
@@ -422,9 +432,11 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        source = await self.lstat(src)
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         src_np = self._normalize(src)
         dst_np = self._normalize(dst)
+        source = await self.lstat(src)
         try:
             await self._storage.move(src, dst, overwrite=overwrite)
         except BaseException:
@@ -441,6 +453,8 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         source = await self.lstat(src)
         try:
             await self._storage.copy(src, dst, overwrite=overwrite)
@@ -459,6 +473,7 @@ class CachedStorage(AbstractStorage):
         target_is_directory: bool = False,
         overwrite: bool = False,
     ) -> None:
+        link_path = self.normalize_path(link_path)
         try:
             await self._storage.symlink(
                 target,
@@ -473,6 +488,7 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def readlink(self, path: PathLike) -> str:
+        path = self.normalize_path(path)
         return await self._storage.readlink(path)
 
     @override
@@ -483,6 +499,7 @@ class CachedStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
+        path = self.normalize_path(path)
         await self._storage.mkdir(path, parents=parents, exist_ok=exist_ok)
         if parents:
             np = self._normalize(path)
@@ -510,6 +527,7 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def rmtree(self, path: PathLike) -> None:
+        path = self.normalize_path(path)
         try:
             await self._storage.rmtree(path)
         finally:
@@ -517,6 +535,8 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         try:
             await self._storage.copytree(src, dst, overwrite=overwrite)
         finally:
@@ -524,6 +544,8 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         try:
             await self._storage.movetree(src, dst, overwrite=overwrite)
         finally:
@@ -656,12 +678,14 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:
+        path = self.normalize_path(path)
         async for snapshot in self._storage.walk(path):
             await self._backfill_discovery(snapshot.entries)
             yield snapshot
 
     @override
     async def list_(self, path: PathLike) -> list[FileInfo]:
+        path = self.normalize_path(path)
         infos = await self._storage.list_(path)
         await self._backfill_discovery(infos)
         return infos

@@ -5,6 +5,26 @@ from pathlib import PurePosixPath
 import pytest
 
 from storegate.storage import AbstractStorage
+from tests.support.ids import uid
+
+
+async def _empty_stream():
+    if False:
+        yield b""
+
+
+async def _invoke_path_operation(storage: AbstractStorage, operation: str, path: str) -> None:
+    match operation:
+        case "upload_stream":
+            await storage.upload_stream(_empty_stream(), path)
+        case "download_stream" | "iterdir" | "walk":
+            await anext(getattr(storage, operation)(path), None)
+        case "compare_exchange":
+            await storage.compare_exchange(path, expected_token=None, data=b"data")
+        case "symlink":
+            await storage.symlink("missing/../raw-target", path)
+        case _:
+            await getattr(storage, operation)(path)
 
 
 class TestNormalizePath:
@@ -63,3 +83,66 @@ class TestNormalizePath:
     def test_collapses_repeated_slashes_and_dots(self):
         result = AbstractStorage.normalize_path("foo//./bar/./baz")
         assert result == PurePosixPath("/foo/bar/baz")
+
+
+class TestPublicPathValidation:
+    @pytest.mark.parametrize("path", ["../escape", "bad\x00path"])
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "upload_stream",
+            "download_stream",
+            "unlink",
+            "rmdir",
+            "delete",
+            "mkdir",
+            "rmtree",
+            "stat",
+            "lstat",
+            "exists",
+            "is_file",
+            "is_dir",
+            "is_symlink",
+            "readlink",
+            "iterdir",
+            "walk",
+            "list_",
+            "read_versioned",
+            "compare_exchange",
+            "symlink",
+        ],
+    )
+    async def test_single_path_entries_reject_invalid_logical_paths_before_io(
+        self,
+        storage: AbstractStorage,
+        operation: str,
+        path: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await _invoke_path_operation(storage, operation, path)
+
+    @pytest.mark.parametrize("path", ["../escape", "bad\x00path"])
+    @pytest.mark.parametrize("operation", ["copy", "move", "copytree", "movetree"])
+    async def test_pair_entries_validate_destination_before_source_io(
+        self,
+        storage: AbstractStorage,
+        operation: str,
+        path: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await getattr(storage, operation)(f"missing-source-{uid()}", path)
+
+    @pytest.mark.parametrize("path", ["../escape", "bad\x00path"])
+    async def test_delete_many_validates_all_paths_before_mutation(
+        self,
+        storage: AbstractStorage,
+        path: str,
+    ) -> None:
+        existing = f"path-delete-many-{uid()}"
+        await storage.upload_bytes(b"keep", existing)
+        try:
+            with pytest.raises(ValueError, match=r"NUL|\.\."):
+                await storage.delete_many(existing, path)
+            assert await storage.download_bytes(existing) == b"keep"
+        finally:
+            await storage.unlink(existing, missing_ok=True)

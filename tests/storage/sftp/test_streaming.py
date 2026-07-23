@@ -18,6 +18,10 @@ async def test_streaming_metadata_and_offset_download(sftp_server: SFTPServerInf
         assert await storage.download_bytes("/folder/file.bin") == b"abcdefgh"
         chunks = [chunk async for chunk in storage.download_stream("/folder/file.bin", offset=3)]
         assert b"".join(chunks) == b"defgh"
+        for offset in (8, 9):
+            assert [chunk async for chunk in storage.download_stream("/folder/file.bin", offset=offset)] == []
+        with pytest.raises(ValueError, match="non-negative"):
+            await anext(storage.download_stream("/folder/file.bin", offset=-1))
         assert [entry.name async for entry in storage.iterdir("/folder")] == ["file.bin"]
 
 

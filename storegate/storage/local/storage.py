@@ -27,6 +27,9 @@ from storegate.storage.abstract import (
     UnsupportedOperationError,
     WalkEntry,
     make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
 )
 
 _LOCAL_CAPABILITIES = StorageCapabilities(symlink_metadata=True, readlink=True, symlink_create=True)
@@ -146,14 +149,9 @@ class LocalStorage(AbstractStorage):
 
     def _logical_path(self, path: PathLike) -> PurePosixPath:
         raw = os.fspath(path)
-        if "\0" in raw:
-            raise ValueError("Path contains a NUL byte")
-        supplied = PurePosixPath(raw)
-        if ".." in supplied.parts:
-            raise ValueError(f"Path traversal detected: {path!r}")
         if os.name == "nt" and "\\" in raw:
             raise ValueError(f"Local paths must use POSIX separators: {path!r}")
-        return self.normalize_path(supplied)
+        return self.normalize_path(raw)
 
     def _lexical_path(self, path: PathLike) -> tuple[PurePosixPath, Path]:
         logical = self._logical_path(path)
@@ -361,8 +359,7 @@ class LocalStorage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
-        if offset < 0:
-            raise ValueError("offset must be non-negative")
+        offset = validate_download_offset(offset)
         _logical, target, _result, kind = await anyio.to_thread.run_sync(self._follow, remote_path)
         if kind is not EntryKind.FILE:
             raise FileNotFoundError(f"File not found: {remote_path}")
@@ -423,11 +420,22 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(self._lexical_lstat, src)
+        src_logical = self._logical_path(src)
+        dst_logical = self._logical_path(dst)
+        _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(
+            self._lexical_lstat, src_logical
+        )
+        if validate_same_path_file_operation(
+            src_logical,
+            dst_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
         if source_kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {src}")
 
-        dst_logical, destination = self._lexical_path(dst)
+        _dst_logical, destination = self._lexical_path(dst_logical)
         await anyio.to_thread.run_sync(
             functools.partial(self._ensure_parent_directory, dst_logical, destination, create=True)
         )
@@ -440,13 +448,8 @@ class LocalStorage(AbstractStorage):
             if destination_kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Destination is a directory: {dst}")
 
-        if source == destination:
-            if not overwrite:
-                raise FileExistsError(f"Destination already exists: {dst}")
-            return
         if destination_kind is not None and not overwrite:
             raise FileExistsError(f"Destination already exists: {dst}")
-
         rename = os.replace if overwrite else os.rename
         try:
             await anyio.to_thread.run_sync(rename, source, destination)
@@ -466,11 +469,22 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(self._lexical_lstat, src)
+        src_logical = self._logical_path(src)
+        dst_logical = self._logical_path(dst)
+        _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(
+            self._lexical_lstat, src_logical
+        )
+        if validate_same_path_file_operation(
+            src_logical,
+            dst_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
         if source_kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {src}")
 
-        dst_logical, destination = self._lexical_path(dst)
+        _dst_logical, destination = self._lexical_path(dst_logical)
         await anyio.to_thread.run_sync(
             functools.partial(self._ensure_parent_directory, dst_logical, destination, create=True)
         )
@@ -483,10 +497,6 @@ class LocalStorage(AbstractStorage):
             if destination_kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Destination is a directory: {dst}")
 
-        if source == destination:
-            if not overwrite:
-                raise FileExistsError(f"Destination already exists: {dst}")
-            return
         if destination_kind is not None and not overwrite:
             raise FileExistsError(f"Destination already exists: {dst}")
         await anyio.to_thread.run_sync(
@@ -619,7 +629,7 @@ class LocalStorage(AbstractStorage):
 
     @staticmethod
     def _paths_overlap(source: Path, destination: Path) -> bool:
-        return source == destination or source.is_relative_to(destination) or destination.is_relative_to(source)
+        return source != destination and (source.is_relative_to(destination) or destination.is_relative_to(source))
 
     @override
     async def rmtree(self, path: PathLike) -> None:
@@ -751,10 +761,27 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _src_logical, source, _source_result, _source_kind = await anyio.to_thread.run_sync(
-            self._lexical_directory, src
-        )
-        dst_logical, destination = self._lexical_path(dst)
+        src_logical = self._logical_path(src)
+        dst_logical = self._logical_path(dst)
+        _src_logical, source = self._lexical_path(src_logical)
+        try:
+            _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(
+                self._lexical_lstat, src_logical
+            )
+        except FileNotFoundError:
+            source_kind = None
+        if validate_same_path_tree_operation(
+            src_logical,
+            dst_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src_logical}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {src_logical}")
+        _dst_logical, destination = self._lexical_path(dst_logical)
         await anyio.to_thread.run_sync(self._validate_intermediate_components, dst_logical)
         if self._paths_overlap(source, destination):
             raise ValueError("Source and destination trees must not overlap")
@@ -771,15 +798,28 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _src_logical, source, _source_result, _source_kind = await anyio.to_thread.run_sync(
-            self._lexical_directory, src
-        )
-        dst_logical, destination = self._lexical_path(dst)
-        await anyio.to_thread.run_sync(self._validate_intermediate_components, dst_logical)
-        if source == destination:
-            if not overwrite:
-                raise FileExistsError(f"Destination already exists: {dst}")
+        src_logical = self._logical_path(src)
+        dst_logical = self._logical_path(dst)
+        _src_logical, source = self._lexical_path(src_logical)
+        try:
+            _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(
+                self._lexical_lstat, src_logical
+            )
+        except FileNotFoundError:
+            source_kind = None
+        if validate_same_path_tree_operation(
+            src_logical,
+            dst_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src_logical}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {src_logical}")
+        _dst_logical, destination = self._lexical_path(dst_logical)
+        await anyio.to_thread.run_sync(self._validate_intermediate_components, dst_logical)
         if self._paths_overlap(source, destination):
             raise ValueError("Source and destination trees must not overlap")
 

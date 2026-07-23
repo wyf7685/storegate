@@ -54,8 +54,13 @@ async def test_copytree_conflict_and_descendant_rejection(sftp_server: SFTPServe
     source = f"/tree-{uid()}"
     async with SFTPStorage(make_config(sftp_server)) as storage:
         await storage.upload_bytes(b"data", f"{source}/file.bin")
+        # overwrite=True same-tree is a preserving no-op
+        await storage.copytree(source, source)
+        assert await storage.is_dir(source)
+        assert await storage.exists(f"{source}/file.bin")
+        # overwrite=False same-tree raises FileExistsError
         with pytest.raises(FileExistsError):
-            await storage.copytree(source, source)
+            await storage.copytree(source, source, overwrite=False)
         with pytest.raises(ValueError, match="Destination must not be inside"):
             await storage.copytree(source, f"{source}/child")
         await storage.rmtree(source)

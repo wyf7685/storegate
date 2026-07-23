@@ -3,6 +3,8 @@
 import hashlib
 import os
 
+import pytest
+
 from storegate.storage.index import IndexStorage
 from tests.storage.index.helpers import BLOCK_SIZE
 from tests.support.ids import uid
@@ -55,6 +57,23 @@ class TestDownloadStreamOffset:
             await index_storage.upload_bytes(data, path)
             chunks = [chunk async for chunk in index_storage.download_stream(path, offset=100)]
             assert b"".join(chunks) == b""
+        finally:
+            await index_storage.delete(path)
+
+    async def test_negative_offset_rejected(self, index_storage: IndexStorage):
+        path = f"test-dl-negative-{uid()}"
+        try:
+            await index_storage.upload_bytes(b"short", path)
+            with pytest.raises(ValueError, match="non-negative"):
+                await anext(index_storage.download_stream(path, offset=-1))
+        finally:
+            await index_storage.delete(path)
+
+    async def test_offset_at_file_size_is_empty(self, index_storage: IndexStorage):
+        path = f"test-dl-exact-{uid()}"
+        try:
+            await index_storage.upload_bytes(b"short", path)
+            assert [chunk async for chunk in index_storage.download_stream(path, offset=5)] == []
         finally:
             await index_storage.delete(path)
 

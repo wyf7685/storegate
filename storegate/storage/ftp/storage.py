@@ -21,6 +21,9 @@ from storegate.storage.abstract import (
     UnsupportedOperationError,
     WalkEntry,
     make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
 )
 from storegate.utils import ExceptionTranslator, coalesce_chunks
 
@@ -105,12 +108,7 @@ class FTPStorage(AbstractStorage):
         )
 
     def _logical_path(self, path: PathLike) -> PurePosixPath:
-        raw = PurePosixPath(path)
-        if "\x00" in raw.as_posix():
-            raise ValueError("FTP path must not contain NUL")
-        if ".." in raw.parts:
-            raise ValueError("FTP path must not contain '..' segments")
-        return self.normalize_path(raw)
+        return self.normalize_path(path)
 
     def _remote_path(self, path: PathLike) -> str:
         logical = self._logical_path(path)
@@ -293,21 +291,24 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to stat {path}")
     async def stat(self, path: PathLike) -> FileInfo:
+        logical = self._logical_path(path)
         async with self._client_lease() as lease:
-            return await self._stat(lease.client, path)
+            return await self._stat(lease.client, logical)
 
     @override
     @translator.wrap("Failed to check existence of {path}")
     async def exists(self, path: PathLike) -> bool:
+        logical = self._logical_path(path)
         async with self._client_lease() as lease:
-            return await self._exists(lease.client, path)
+            return await self._exists(lease.client, logical)
 
     @override
     @translator.wrap("Failed to check whether {path} is a file")
     async def is_file(self, path: PathLike) -> bool:
+        logical = self._logical_path(path)
         async with self._client_lease() as lease:
             try:
-                info = await self._stat(lease.client, path)
+                info = await self._stat(lease.client, logical)
             except FileNotFoundError:
                 return False
             return info.kind is EntryKind.FILE
@@ -315,9 +316,10 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to check whether {path} is a directory")
     async def is_dir(self, path: PathLike) -> bool:
+        logical = self._logical_path(path)
         async with self._client_lease() as lease:
             try:
-                info = await self._stat(lease.client, path)
+                info = await self._stat(lease.client, logical)
             except FileNotFoundError:
                 return False
             return info.kind is EntryKind.DIRECTORY
@@ -366,8 +368,9 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap_agen("Failed to iterate directory {path}")
     async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
+        logical = self._logical_path(path)
         async with self._client_lease() as lease:
-            entries = await self._list(lease.client, path)
+            entries = await self._list(lease.client, logical)
         for entry in entries:
             yield entry
 
@@ -396,8 +399,9 @@ class FTPStorage(AbstractStorage):
     @override
     @translator.wrap_agen("Failed to walk directory {path}")
     async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:
+        logical = self._logical_path(path)
         async with self._client_lease() as lease:
-            snapshot = await self._walk_snapshot(lease.client, path, strict=False)
+            snapshot = await self._walk_snapshot(lease.client, logical, strict=False)
         for entry in snapshot:
             yield entry
 
@@ -509,9 +513,7 @@ class FTPStorage(AbstractStorage):
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
         try:
-            if offset < 0:
-                raise ValueError("offset must be non-negative")
-
+            offset = validate_download_offset(offset)
             logical = self._logical_path(remote_path)
             async with self._pool.acquire() as lease:
                 try:
@@ -730,24 +732,25 @@ class FTPStorage(AbstractStorage):
         source = self._logical_path(src)
         destination = self._logical_path(dst)
         self.log.info(f"Move: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
-        if source == PurePosixPath("/"):
-            raise OSError("Cannot move root directory")
 
         failure: BaseException | None = None
         temporary: PurePosixPath | None = None
         destination_existed = False
         async with self._client_lease() as lease:
             source_info = await self._stat(lease.client, source)
+            if validate_same_path_file_operation(
+                source,
+                destination,
+                source_kind=source_info.kind,
+                overwrite=overwrite,
+            ):
+                return
             if source_info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Is a directory: {source.as_posix()}")
             if source_info.kind is not EntryKind.FILE:
                 raise UnsupportedOperationError(
                     _UNSUPPORTED_ERRNO, f"Unsupported FTP move source kind: {source.as_posix()}"
                 )
-            if source == destination:
-                if not overwrite:
-                    raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
-                return
             try:
                 destination_info = await self._stat(lease.client, destination)
             except FileNotFoundError:
@@ -799,20 +802,21 @@ class FTPStorage(AbstractStorage):
         source = self._logical_path(src)
         destination = self._logical_path(dst)
         self.log.info(f"Copy: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
-        if source == PurePosixPath("/"):
-            raise IsADirectoryError("Cannot copy root directory as a file")
         async with self._client_lease() as lease:
             source_info = await self._stat(lease.client, source)
+            if validate_same_path_file_operation(
+                source,
+                destination,
+                source_kind=source_info.kind,
+                overwrite=overwrite,
+            ):
+                return
             if source_info.kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Is a directory: {source.as_posix()}")
             if source_info.kind is not EntryKind.FILE:
                 raise UnsupportedOperationError(
                     _UNSUPPORTED_ERRNO, f"Unsupported FTP copy source kind: {source.as_posix()}"
                 )
-            if source == destination:
-                if overwrite:
-                    return
-                raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
             try:
                 destination_info = await self._stat(lease.client, destination)
             except FileNotFoundError:
@@ -945,11 +949,20 @@ class FTPStorage(AbstractStorage):
         try:
             source_info = await self._stat(source_client, source)
         except FileNotFoundError:
-            raise NotADirectoryError(f"Not a directory: {source.as_posix()}") from None
-        if source_info.kind is not EntryKind.DIRECTORY:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_tree_operation(
+            source,
+            destination,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {source.as_posix()}")
+        if source_kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {source.as_posix()}")
-        if source == destination:
-            raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
         if self._is_descendant(destination, source):
             raise ValueError("Destination must not be inside the source tree")
 
@@ -1039,20 +1052,28 @@ class FTPStorage(AbstractStorage):
         source = self._logical_path(src)
         destination = self._logical_path(dst)
         self.log.info(f"MoveTree: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
-        if source == PurePosixPath("/"):
-            raise OSError("Cannot move root directory")
-        if source == destination:
-            return
-        if self._is_descendant(destination, source):
-            raise ValueError("Destination must not be inside the source tree")
-
         async with self._client_lease() as lease:
             try:
                 source_info = await self._stat(lease.client, source)
             except FileNotFoundError:
-                raise NotADirectoryError(f"Not a directory: {source.as_posix()}") from None
-            if source_info.kind is not EntryKind.DIRECTORY:
+                source_kind = None
+            else:
+                source_kind = source_info.kind
+            if validate_same_path_tree_operation(
+                source,
+                destination,
+                source_kind=source_kind,
+                overwrite=overwrite,
+            ):
+                return
+            if source_kind is None:
+                raise FileNotFoundError(f"Source not found: {source.as_posix()}")
+            if source_kind is not EntryKind.DIRECTORY:
                 raise NotADirectoryError(f"Not a directory: {source.as_posix()}")
+            if source == PurePosixPath("/"):
+                raise OSError("Cannot move root directory")
+            if self._is_descendant(destination, source):
+                raise ValueError("Destination must not be inside the source tree")
 
             try:
                 destination_info = await self._stat(lease.client, destination)

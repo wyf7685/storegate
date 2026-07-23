@@ -18,6 +18,9 @@ from storegate.storage.abstract import (
     UnsupportedOperationError,
     WalkEntry,
     make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
 )
 from storegate.utils import ExceptionTranslator, coalesce_chunks
 
@@ -379,12 +382,13 @@ class DavStorage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
+        offset = validate_download_offset(offset)
         info = await self.stat(remote_path)
         if info.kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {remote_path}")
         if info.kind is not EntryKind.FILE:
             raise _unsupported_entry(remote_path)
-        if info.size > 0 and offset >= info.size:
+        if offset >= info.size:
             return
 
         client = self._ensure_client()
@@ -536,24 +540,31 @@ class DavStorage(AbstractStorage):
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        # Validate both caller paths before any network I/O (including source PROPFIND).
-        src_rel = self._remote_path(src)
-        dst_rel = self._remote_path(dst)
-        if src_rel == "":
+        src_np = self.normalize_path(src)
+        dst_np = self.normalize_path(dst)
+        src_rel = self._remote_path(src_np)
+        dst_rel = self._remote_path(dst_np)
+        if src_rel == "" and src_np != dst_np:
             raise OSError(f"Cannot move root: {src}")
         try:
             source_info = await self.stat(src)
         except FileNotFoundError:
-            raise FileNotFoundError(f"Source not found: {src}") from None
-        if source_info.kind is EntryKind.DIRECTORY:
-            raise IsADirectoryError(f"Is a directory: {src}")
-        if source_info.kind is not EntryKind.FILE:
-            raise _unsupported_entry(src)
-
-        if self.normalize_path(src) == self.normalize_path(dst):
-            if not overwrite:
-                raise FileExistsError(f"Source and destination are the same: {src}")
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src_np,
+            dst_np,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
+        if source_kind is not EntryKind.FILE:
+            raise _unsupported_entry(src)
 
         client = self._ensure_client()
         if await self.is_dir(dst):
@@ -603,23 +614,31 @@ class DavStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to copy {src} → {dst}")
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        # Validate both caller paths before any network I/O (including source PROPFIND).
-        src_rel = self._remote_path(src)
-        dst_rel = self._remote_path(dst)
+        src_np = self.normalize_path(src)
+        dst_np = self.normalize_path(dst)
+        src_rel = self._remote_path(src_np)
+        dst_rel = self._remote_path(dst_np)
         if src_rel == "":
             raise IsADirectoryError(f"Cannot copy root: {src}")
         try:
-            info = await self.stat(src)
+            source_info = await self.stat(src)
         except FileNotFoundError:
-            raise FileNotFoundError(f"Source not found: {src}") from None
-        if info.kind is EntryKind.DIRECTORY:
-            raise IsADirectoryError(f"Is a directory: {src}")
-        if info.kind is not EntryKind.FILE:
-            raise _unsupported_entry(src)
-        if self.normalize_path(src) == self.normalize_path(dst):
-            if not overwrite:
-                raise FileExistsError(f"Source and destination are the same: {src}")
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src_np,
+            dst_np,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
+        if source_kind is not EntryKind.FILE:
+            raise _unsupported_entry(src)
         if await self.is_dir(dst):
             raise IsADirectoryError(f"Destination is a directory: {dst}")
         await self.mkdir(self.normalize_path(dst).parent.as_posix(), parents=True, exist_ok=True)
@@ -641,8 +660,19 @@ class DavStorage(AbstractStorage):
         try:
             info = await self.stat(src)
         except FileNotFoundError:
-            raise NotADirectoryError(f"Not a directory: {src}") from None
-        if info.kind is not EntryKind.DIRECTORY:
+            source_kind = None
+        else:
+            source_kind = info.kind
+        if validate_same_path_tree_operation(
+            src_np,
+            dst_np,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
         if not overwrite and await self.exists(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
@@ -678,8 +708,19 @@ class DavStorage(AbstractStorage):
         try:
             info = await self.stat(src)
         except FileNotFoundError:
-            raise NotADirectoryError(f"Not a directory: {src}") from None
-        if info.kind is not EntryKind.DIRECTORY:
+            source_kind = None
+        else:
+            source_kind = info.kind
+        if validate_same_path_tree_operation(
+            src_np,
+            dst_np,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
         if not overwrite and await self.exists(dst):
             raise FileExistsError(f"Destination already exists: {dst}")

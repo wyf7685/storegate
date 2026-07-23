@@ -267,6 +267,30 @@ async def test_storage_download_uses_single_get_for_full_and_offset() -> None:
     assert responses[1].closed is True
 
 
+async def test_storage_download_rejects_negative_offset_before_io() -> None:
+    storage = S3Storage(_config())
+    client = MagicMock(spec=AsyncS3Client)
+    storage._client = cast("AsyncS3Client", client)
+    client.head_object = AsyncMock()
+
+    with pytest.raises(ValueError, match="non-negative"):
+        await anext(storage.download_stream("big.bin", offset=-1))
+
+    client.head_object.assert_not_awaited()
+
+
+@pytest.mark.parametrize("offset", [8, 9])
+async def test_storage_download_offset_at_or_beyond_size_skips_get(offset: int) -> None:
+    storage = S3Storage(_config())
+    client = MagicMock(spec=AsyncS3Client)
+    storage._client = cast("AsyncS3Client", client)
+    client.head_object = AsyncMock(return_value=HeadObjectOutput(content_length=8, etag='"e"', last_modified=_NOW))
+    client.stream_get = MagicMock()
+
+    assert [chunk async for chunk in storage.download_stream("big.bin", offset=offset)] == []
+    client.stream_get.assert_not_called()
+
+
 async def test_storage_download_aclose_closes_response() -> None:
     storage = S3Storage(_config())
     client = MagicMock(spec=AsyncS3Client)

@@ -16,7 +16,18 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from storegate.log import escape_tag
 
-from ..abstract import AbstractStorage, BytesLike, EntryKind, FileInfo, PathLike, WalkEntry, make_namespace_identity
+from ..abstract import (
+    AbstractStorage,
+    BytesLike,
+    EntryKind,
+    FileInfo,
+    PathLike,
+    WalkEntry,
+    make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
+)
 from ._guard import download_private_file, lstat_private_entry, lstat_private_entry_or_none
 from .lock import LockLease, StorageFileLocker
 from .ref import ChunkRefManager, hash_to_path
@@ -625,6 +636,7 @@ class IndexStorage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
+        offset = validate_download_offset(offset)
         remote_path = self.normalize_path(remote_path)
         _colored_path = f"<y>{escape_tag(remote_path)}</y>"
         self.log.debug(f"Download starting: {_colored_path}{f" (offset=<g>{offset}</g>)" if offset else ""}")
@@ -774,12 +786,23 @@ class IndexStorage(AbstractStorage):
     ) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
-        if src == dst:
-            if await self._get_file_meta(src) is None:
-                raise FileNotFoundError(f"Source file not found: {src}")
-            if not overwrite:
-                raise FileExistsError(f"Destination file already exists: {dst}")
+        try:
+            source_info = await lstat_private_entry(self._index, src, label="source entry")
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source file not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
 
         _colored_src = f"<y>{escape_tag(src)}</y>"
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
@@ -857,12 +880,23 @@ class IndexStorage(AbstractStorage):
     ) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
-        if src == dst:
-            if await self._get_file_meta(src) is None:
-                raise FileNotFoundError(f"Source file not found: {src}")
-            if not overwrite:
-                raise FileExistsError(f"Destination file already exists: {dst}")
+        try:
+            source_info = await lstat_private_entry(self._index, src, label="source entry")
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source file not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
 
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
         async with self._lock_indexes(src, dst):
@@ -1104,14 +1138,25 @@ class IndexStorage(AbstractStorage):
         dst = self.normalize_path(dst)
         try:
             src_info = await lstat_private_entry(self._index, src, label="tree root")
-        except FileNotFoundError as error:
-            raise NotADirectoryError(f"Not a directory: {src}") from error
-        if src_info.kind is not EntryKind.DIRECTORY:
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = src_info.kind
+        if validate_same_path_tree_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
         dst_info = await lstat_private_entry_or_none(self._index, dst, label="tree destination")
         if not overwrite and dst_info is not None:
             raise FileExistsError(f"Destination already exists: {dst}")
-        if dst == src or dst.is_relative_to(src):
+        if dst.is_relative_to(src):
             raise ValueError("Destination must not be inside the source tree")
         async with self._lock_indexes(f"{src}.tree", f"{dst}.tree"):
             files, directories = await self._apply_tree_transaction(src, dst, move=False)
@@ -1126,14 +1171,25 @@ class IndexStorage(AbstractStorage):
         dst = self.normalize_path(dst)
         try:
             src_info = await lstat_private_entry(self._index, src, label="tree root")
-        except FileNotFoundError as error:
-            raise NotADirectoryError(f"Not a directory: {src}") from error
-        if src_info.kind is not EntryKind.DIRECTORY:
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = src_info.kind
+        if validate_same_path_tree_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
         dst_info = await lstat_private_entry_or_none(self._index, dst, label="tree destination")
         if not overwrite and dst_info is not None:
             raise FileExistsError(f"Destination already exists: {dst}")
-        if dst == src or dst.is_relative_to(src):
+        if dst.is_relative_to(src):
             raise ValueError("Destination must not be inside the source tree")
         async with self._lock_indexes(f"{src}.tree", f"{dst}.tree"):
             files, directories = await self._apply_tree_transaction(src, dst, move=True)

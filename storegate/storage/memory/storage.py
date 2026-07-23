@@ -16,6 +16,9 @@ from storegate.storage.abstract import (
     VersionedBytes,
     WalkEntry,
     make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
 )
 
 _sid = itertools.count()
@@ -450,8 +453,7 @@ class MemoryStorage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
-        if offset < 0:
-            raise ValueError("offset must be non-negative")
+        offset = validate_download_offset(offset)
         _, lexical = self._path_pair(remote_path)
         target = self._follow(lexical)
         kind = self._entry_kind(target)
@@ -499,30 +501,37 @@ class MemoryStorage(AbstractStorage):
 
     def _prepare_entry_destination(
         self,
-        source: PurePosixPath,
         destination: PurePosixPath,
         *,
         overwrite: bool,
-    ) -> tuple[EntryKind, tuple[PurePosixPath, ...]]:
-        source_kind = self._entry_kind(source)
-        if source_kind is None:
-            raise FileNotFoundError(f"Source not found: {self._logical_from_backend(source)}")
-        if source_kind is EntryKind.DIRECTORY:
-            raise IsADirectoryError(f"Is a directory: {self._logical_from_backend(source)}")
+    ) -> tuple[PurePosixPath, ...]:
         destination_kind = self._entry_kind(destination)
         if destination_kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Destination is a directory: {self._logical_from_backend(destination)}")
         if destination_kind is not None and not overwrite:
             raise FileExistsError(f"Destination already exists: {self._logical_from_backend(destination)}")
-        return source_kind, self._missing_parent_dirs(destination)
+        return self._missing_parent_dirs(destination)
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _, source = self._path_pair(src)
-        _, destination = self._path_pair(dst)
-        source_kind, missing_parents = self._prepare_entry_destination(source, destination, overwrite=overwrite)
-        if source == destination:
+        source_logical, source = self._path_pair(src)
+        destination_logical, destination = self._path_pair(dst)
+        source_kind = self._entry_kind(source)
+        if validate_same_path_file_operation(
+            source_logical,
+            destination_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {source_logical}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {source_logical}")
+        missing_parents = self._prepare_entry_destination(
+            destination,
+            overwrite=overwrite,
+        )
         for directory in missing_parents:
             self._dirs.add(directory.as_posix())
         self._remove_entry(destination, self._files, self._dirs, self._links, self._file_tokens)
@@ -536,11 +545,24 @@ class MemoryStorage(AbstractStorage):
 
     @override
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _, source = self._path_pair(src)
-        _, destination = self._path_pair(dst)
-        source_kind, missing_parents = self._prepare_entry_destination(source, destination, overwrite=overwrite)
-        if source == destination:
+        source_logical, source = self._path_pair(src)
+        destination_logical, destination = self._path_pair(dst)
+        source_kind = self._entry_kind(source)
+        if validate_same_path_file_operation(
+            source_logical,
+            destination_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {source_logical}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {source_logical}")
+        missing_parents = self._prepare_entry_destination(
+            destination,
+            overwrite=overwrite,
+        )
         for directory in missing_parents:
             self._dirs.add(directory.as_posix())
         self._remove_entry(destination, self._files, self._dirs, self._links, self._file_tokens)
@@ -596,27 +618,39 @@ class MemoryStorage(AbstractStorage):
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _, source = self._path_pair(src)
-        _, destination = self._path_pair(dst)
-        if source == destination:
-            if self._entry_kind(source) is not EntryKind.DIRECTORY:
-                raise NotADirectoryError(f"Not a directory: {src}")
-            if not overwrite:
-                raise FileExistsError(f"Destination already exists: {dst}")
+        source_logical, source = self._path_pair(src)
+        destination_logical, destination = self._path_pair(dst)
+        source_kind = self._entry_kind(source)
+        if validate_same_path_tree_operation(
+            source_logical,
+            destination_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {source_logical}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {source_logical}")
         files, dirs, links, file_tokens = self._copytree_state(source, destination, overwrite=overwrite)
         self._files, self._dirs, self._links, self._file_tokens = files, dirs, links, file_tokens
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _, source = self._path_pair(src)
-        _, destination = self._path_pair(dst)
-        if source == destination:
-            if self._entry_kind(source) is not EntryKind.DIRECTORY:
-                raise NotADirectoryError(f"Not a directory: {src}")
-            if not overwrite:
-                raise FileExistsError(f"Destination already exists: {dst}")
+        source_logical, source = self._path_pair(src)
+        destination_logical, destination = self._path_pair(dst)
+        source_kind = self._entry_kind(source)
+        if validate_same_path_tree_operation(
+            source_logical,
+            destination_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {source_logical}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {source_logical}")
         files, dirs, links, file_tokens = self._copytree_state(source, destination, overwrite=overwrite)
         source_snapshot = self._tree_entries(source)
         for entry, _ in reversed(source_snapshot):

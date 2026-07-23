@@ -35,7 +35,7 @@ async def test_paths_metadata_listing_and_walk(sftp_server: SFTPServerInfo) -> N
 @pytest.mark.parametrize("path", ["/a/../b", "bad\x00path"])
 async def test_rejects_unsafe_paths(sftp_server: SFTPServerInfo, path: str) -> None:
     async with SFTPStorage(make_config(sftp_server)) as storage:
-        with pytest.raises(ValueError, match="SFTP path must not contain"):
+        with pytest.raises(ValueError, match="path must not contain"):
             await storage.exists(path)
 
 

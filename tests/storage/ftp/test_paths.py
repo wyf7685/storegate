@@ -66,7 +66,7 @@ class TestIdentityAndPaths:
             await ftp_storage.rmdir("/")
         with pytest.raises(OSError, match="Cannot remove root"):
             await ftp_storage.rmtree("/")
-        with pytest.raises(OSError, match="Cannot move root"):
+        with pytest.raises(IsADirectoryError):
             await ftp_storage.move("/", "/elsewhere")
         with pytest.raises(OSError, match="Cannot move root"):
             await ftp_storage.movetree("/", "/elsewhere")

@@ -43,6 +43,8 @@ class TestMetadataAndStreaming:
             assert await ftp_storage.download_bytes(f"{base}/data.bin") == b"0123456789"
             chunks = [chunk async for chunk in ftp_storage.download_stream(f"{base}/data.bin", offset=4)]
             assert b"".join(chunks) == b"456789"
+            exact = [chunk async for chunk in ftp_storage.download_stream(f"{base}/data.bin", offset=10)]
+            assert exact == []
             beyond = [chunk async for chunk in ftp_storage.download_stream(f"{base}/data.bin", offset=99)]
             assert beyond == []
             with pytest.raises(ValueError, match="non-negative"):

@@ -20,6 +20,9 @@ from storegate.storage.abstract import (
     VersionedBytes,
     WalkEntry,
     make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
 )
 from storegate.utils import ExceptionTranslator, coalesce_chunks
 
@@ -91,8 +94,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to read versioned object {path}")
     async def read_versioned(self, path: PathLike) -> VersionedBytes | None:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         # Read data and ETag from one GET so the token identifies the returned bytes.
         try:
             async with client.stream_get(key) as response:
@@ -265,8 +268,9 @@ class S3Storage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
-        client = self._ensure_client()
+        offset = validate_download_offset(offset)
         key = self._remote_path_to_key(remote_path)
+        client = self._ensure_client()
         head = await client.head_object(key=key)
         if head is None:
             # Preserve directory/404 contract: directory markers are not downloadable files.
@@ -290,8 +294,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to unlink {path} (missing_ok={missing_ok})")
     async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
 
         # 1. 文件：直接删除
         if await client.head_object(key=key) is not None:
@@ -310,8 +314,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to remove directory {path}")
     async def rmdir(self, path: PathLike) -> None:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         if await client.head_object(key=key) is not None:
             raise NotADirectoryError(f"Not a directory: {path}")
         if await self.is_dir(path):
@@ -326,8 +330,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to delete {path}")
     async def delete(self, path: PathLike) -> None:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         if await client.head_object(key=key) is not None:
             await client.delete_object(key=key)
             return
@@ -343,7 +347,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to delete objects: {paths}")
     async def delete_many(self, *paths: PathLike) -> None:
-        for path in paths:
+        normalized = tuple(self.normalize_path(path) for path in paths)
+        for path in normalized:
             try:
                 await self.delete(path)
             except FileNotFoundError:
@@ -393,23 +398,31 @@ class S3Storage(AbstractStorage):
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        if self._remote_path_to_key(src) == self._remote_path_to_key(dst):
-            if not overwrite:
-                raise FileExistsError(f"Source and destination are the same: {src}")
-            if await self.is_dir(src):
-                raise IsADirectoryError(f"Is a directory: {src}")
-            if await self._ensure_client().head_object(key=self._remote_path_to_key(src)) is None:
-                raise FileNotFoundError(f"Source not found: {src}")
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
+        try:
+            source_info = await self.stat(src)
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
 
-        client = self._ensure_client()
         src_key = self._remote_path_to_key(src)
         dst_key = self._remote_path_to_key(dst)
-        try:
-            if await self.is_dir(dst):
-                raise IsADirectoryError(f"Destination is a directory: {dst}")
-        except TypeError:
-            pass
+        client = self._ensure_client()
+        if await self.is_dir(dst):
+            raise IsADirectoryError(f"Destination is a directory: {dst}")
         if not overwrite and await self.exists(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
 
@@ -451,20 +464,30 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to copy {src} → {dst}")
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
+        try:
+            source_info = await self.stat(src)
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
+
         src_key = self._remote_path_to_key(src)
         dst_key = self._remote_path_to_key(dst)
         client = self._ensure_client()
-        if src_key == dst_key:
-            if not overwrite:
-                raise FileExistsError(f"Source and destination are the same: {src}")
-            if await self.is_dir(src):
-                raise IsADirectoryError(f"Is a directory: {src}")
-            if await client.head_object(key=src_key) is None:
-                raise FileNotFoundError(f"Source not found: {src}")
-            return
         head = await client.head_object(key=src_key)
-        if await self.is_dir(src):
-            raise IsADirectoryError(f"Is a directory: {src}")
         if head is None:
             raise FileNotFoundError(f"Source not found: {src}")
         if await self.is_dir(dst):
@@ -533,8 +556,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to remove directory tree {path}")
     async def rmtree(self, path: PathLike) -> None:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         self.log.info(f"RmTree: <y>{escape_tag(key)}</y>")
 
         if not await self.is_dir(path):
@@ -665,17 +688,29 @@ class S3Storage(AbstractStorage):
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        client = self._ensure_client()
-
-        # 类型和策略校验
-        if not await self.is_dir(src):
-            raise NotADirectoryError(f"Not a directory: {src}")
-        if not overwrite and await self.is_dir(dst):
-            raise FileExistsError(f"Destination already exists: {dst}")
-
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
+        try:
+            source_info = await self.stat(src)
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_tree_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {src}")
+        if not overwrite and await self.exists(dst):
+            raise FileExistsError(f"Destination already exists: {dst}")
 
+        client = self._ensure_client()
         # walk 收集源树所有文件和目录
         file_paths: list[PurePosixPath] = []
         dir_paths: list[PurePosixPath] = []
@@ -746,6 +781,31 @@ class S3Storage(AbstractStorage):
         await self._cleanup_copytree_backups(client, backups.values())
 
     @override
+    @translator.wrap("Failed to move tree {src} → {dst} (overwrite={overwrite})")
+    async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
+        try:
+            source_info = await self.stat(src)
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_tree_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {src}")
+        await self.copytree(src, dst, overwrite=overwrite)
+        await self.rmtree(src)
+
+    @override
     @translator.wrap("Failed to check existence of {path}")
     async def exists(self, path: PathLike) -> bool:
         try:
@@ -757,8 +817,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to check if path is a file: {path}")
     async def is_file(self, path: PathLike) -> bool:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         return await client.head_object(key=key) is not None
 
     @override
@@ -773,9 +833,9 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to stat {path}")
     async def stat(self, path: PathLike) -> FileInfo:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
         np = self.normalize_path(path)
+        client = self._ensure_client()
 
         # 根目录：不需要 S3 请求
         if key == "":
@@ -864,8 +924,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to list directory {path}")
     async def list_(self, path: PathLike) -> list[FileInfo]:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         prefix = (key + "/") if key else None
         infos: list[FileInfo] = []
 

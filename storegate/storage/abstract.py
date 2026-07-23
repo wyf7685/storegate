@@ -100,6 +100,44 @@ def validate_download_offset(offset: int) -> int:
     return offset
 
 
+def validate_same_path_file_operation(
+    src: PurePosixPath,
+    dst: PurePosixPath,
+    *,
+    source_kind: EntryKind | None,
+    overwrite: bool,
+) -> bool:
+    """Validate a same-path file copy or move and report a completed no-op."""
+    if src != dst:
+        return False
+    if source_kind is None:
+        raise FileNotFoundError(f"Source not found: {src}")
+    if source_kind is EntryKind.DIRECTORY:
+        raise IsADirectoryError(f"Is a directory: {src}")
+    if not overwrite:
+        raise FileExistsError(f"Destination already exists: {dst}")
+    return True
+
+
+def validate_same_path_tree_operation(
+    src: PurePosixPath,
+    dst: PurePosixPath,
+    *,
+    source_kind: EntryKind | None,
+    overwrite: bool,
+) -> bool:
+    """Validate a same-path tree copy or move and report a completed no-op."""
+    if src != dst:
+        return False
+    if source_kind is None:
+        raise FileNotFoundError(f"Source not found: {src}")
+    if source_kind is not EntryKind.DIRECTORY:
+        raise NotADirectoryError(f"Not a directory: {src}")
+    if not overwrite:
+        raise FileExistsError(f"Destination already exists: {dst}")
+    return True
+
+
 _LIFECYCLE_WRAPPED_ATTRIBUTE = "__storegate_lifecycle_wrapped__"
 
 
@@ -385,7 +423,7 @@ class AbstractStorage(ABC):
         *,
         overwrite: bool = True,
     ) -> None:
-        """Upload bytes."""
+        remote_path = self.normalize_path(remote_path)
         buf = memoryview(data).toreadonly()
 
         async def aiterable() -> AsyncIterable[memoryview[int]]:
@@ -404,8 +442,7 @@ class AbstractStorage(ABC):
         *,
         overwrite: bool = True,
     ) -> None:
-        """Upload a local file."""
-
+        remote_path = self.normalize_path(remote_path)
         async with contextlib.aclosing(open_file_rb(Path(local_path))) as stream:
             await self.upload_stream(stream, remote_path, overwrite=overwrite)
 
@@ -442,6 +479,7 @@ class AbstractStorage(ABC):
         remote_path: PathLike,
     ) -> bytes:
         """Download as bytes."""
+        remote_path = self.normalize_path(remote_path)
         buffer = bytearray()
         async for chunk in self.download_stream(remote_path):
             buffer.extend(chunk)
@@ -453,6 +491,7 @@ class AbstractStorage(ABC):
         local_path: PathLike,
     ) -> None:
         """Download to a local file."""
+        remote_path = self.normalize_path(remote_path)
         async with open_file_wb(Path(local_path)) as write:
             async for chunk in self.download_stream(remote_path):
                 await write(chunk)
@@ -467,7 +506,7 @@ class AbstractStorage(ABC):
         Backends without compare-exchange support raise
         :class:`UnsupportedOperationError`.
         """
-        del path
+        self.normalize_path(path)
         raise UnsupportedOperationError(
             _UNSUPPORTED_ERRNO,
             f"compare-exchange is not supported by {type(self).__name__}",
@@ -489,7 +528,8 @@ class AbstractStorage(ABC):
         Backends without compare-exchange support raise
         :class:`UnsupportedOperationError`.
         """
-        del path, expected_token, data
+        self.normalize_path(path)
+        del expected_token, data
         raise UnsupportedOperationError(
             _UNSUPPORTED_ERRNO,
             f"compare-exchange is not supported by {type(self).__name__}",
@@ -532,6 +572,7 @@ class AbstractStorage(ABC):
         :class:`FileNotFoundError`; non-empty directories raise :class:`OSError`
         without removing the directory.
         """
+        path = self.normalize_path(path)
         info = await self.lstat(path)
         if info.is_dir:
             await self.rmdir(path)
@@ -544,7 +585,8 @@ class AbstractStorage(ABC):
         The operation is fail-fast for every error other than
         :class:`FileNotFoundError`; paths before the failing path stay deleted.
         """
-        for path in paths:
+        normalized = tuple(self.normalize_path(path) for path in paths)
+        for path in normalized:
             try:
                 await self.delete(path)
             except FileNotFoundError:
@@ -723,7 +765,7 @@ class AbstractStorage(ABC):
         :class:`UnsupportedOperationError` with the platform unsupported errno
         when the backend lacks this primitive.
         """
-        del path
+        self.normalize_path(path)
         raise UnsupportedOperationError(_UNSUPPORTED_ERRNO, "readlink is not supported")
 
     async def symlink(
@@ -748,7 +790,8 @@ class AbstractStorage(ABC):
         platform unsupported errno. A failed non-idempotent create request must
         not be replayed after a connection failure.
         """
-        del target, link_path, target_is_directory, overwrite
+        self.normalize_path(link_path)
+        del target, target_is_directory, overwrite
         raise UnsupportedOperationError(_UNSUPPORTED_ERRNO, "symlink is not supported")
 
     # ------------------------------------------------------------------
@@ -757,6 +800,7 @@ class AbstractStorage(ABC):
 
     async def list_(self, path: PathLike) -> list[FileInfo]:
         """List directory."""
+        path = self.normalize_path(path)
         return [item async for item in self.iterdir(path)]
 
     @abstractmethod

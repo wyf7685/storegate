@@ -1,5 +1,7 @@
 """CachedStorage behavior tests."""
 
+import pytest
+
 from storegate.storage.cached import CachedStorage
 from tests.support.ids import uid
 
@@ -47,5 +49,35 @@ class TestDownloadCache:
             # Cache persists
             snap = cached.dump_cache()
             assert path in snap.get("download", {})
+        finally:
+            await cached.delete(path)
+
+
+class TestDownloadOffsetParity:
+    async def test_negative_offset_rejected_on_hit_and_miss(self, cached: CachedStorage) -> None:
+        path = f"test-dlcache-negative-{uid()}"
+        data = b"cached-content"
+        try:
+            await cached.upload_bytes(data, path)
+            with pytest.raises(ValueError, match="non-negative"):
+                await anext(cached.download_stream(path, offset=-1))
+
+            await cached._cache.delete("download", path)
+            with pytest.raises(ValueError, match="non-negative"):
+                await anext(cached.download_stream(path, offset=-1))
+        finally:
+            await cached.delete(path)
+
+    async def test_at_or_beyond_size_is_empty_on_hit_and_miss(self, cached: CachedStorage) -> None:
+        path = f"test-dlcache-empty-{uid()}"
+        data = b"cached-content"
+        try:
+            await cached.upload_bytes(data, path)
+            for offset in (len(data), len(data) + 1):
+                assert [chunk async for chunk in cached.download_stream(path, offset=offset)] == []
+
+            await cached._cache.delete("download", path)
+            for offset in (len(data), len(data) + 1):
+                assert [chunk async for chunk in cached.download_stream(path, offset=offset)] == []
         finally:
             await cached.delete(path)
