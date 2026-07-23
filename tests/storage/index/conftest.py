@@ -13,6 +13,6 @@ async def index_storage() -> AsyncIterator[IndexStorage]:
     async with (
         MemoryStorage("/") as idx,
         MemoryStorage("/") as chunks,
-        IndexStorage(idx, chunks, block_size=BLOCK_SIZE) as s,
+        IndexStorage(idx, chunks, block_size=BLOCK_SIZE, lock_mode="best_effort") as s,
     ):
         yield s

@@ -181,7 +181,7 @@ async def test_ftp_chunks_pool_is_recreated_after_index_binding_rollback(monkeyp
     )
     monkeypatch.setattr(ftp, "download_bytes", AsyncMock(side_effect=RuntimeError("binding read failed")))
     monkeypatch.setattr(ftp, "upload_bytes", AsyncMock())
-    storage = IndexStorage(MemoryStorage("/"), ftp)
+    storage = IndexStorage(MemoryStorage("/"), ftp, lock_mode="best_effort")
 
     with pytest.raises(RuntimeError, match="binding read failed"):
         await storage.connect()

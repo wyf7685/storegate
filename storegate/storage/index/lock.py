@@ -1,11 +1,10 @@
-import asyncio
 import contextlib
 import dataclasses
 import json
 import uuid
 from collections.abc import AsyncGenerator, Iterable
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import anyio
 import anyio.lowlevel
@@ -31,12 +30,22 @@ class LocalLockGuard:
     references: int = 0
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(slots=True)
 class LockLease:
     owner: str
     expires: datetime
     storage: AbstractStorage
     path: PathLike
+    token: str | None = None
+
+
+_LOCK_TOMBSTONE = b'{"released":true,"expires":"2000-01-01T00:00:00+00:00"}'
+
+_LockMode = Literal["strong", "best_effort", "disabled"]
+
+
+def _is_tombstone(payload: bytes) -> bool:
+    return payload == _LOCK_TOMBSTONE
 
 
 class StorageFileLocker:
@@ -47,14 +56,22 @@ class StorageFileLocker:
         storage: IndexStorage,
         lock_lease: float,
         lock_timeout: float,
-        skip_locking: bool,
+        lock_mode: _LockMode = "strong",
     ):
         self.log = logger_wrapper(
             f"{storage.__class__.__name__}.{self.__class__.__name__} <c><i>{escape_tag(storage.display_id)}</></>"
         )
         self.lock_lease = lock_lease
         self.lock_timeout = lock_timeout
-        self.skip_locking = skip_locking
+        self.lock_mode = lock_mode
+        if self.lock_mode == "best_effort":
+            self.log.warning(
+                "Lock mode 'best_effort' does not guarantee cross-process mutual exclusion. "
+                "Use only when external serialisation is already in place."
+            )
+
+    def _reg_key(self, storage: AbstractStorage, lock_path: PathLike) -> str:
+        return f"{storage.namespace_identity}:{storage.normalize_path(lock_path)}"
 
     @contextlib.asynccontextmanager
     async def local_lock_guard(self, key: str) -> AsyncGenerator[None]:
@@ -72,16 +89,19 @@ class StorageFileLocker:
             if entry.references == 0 and registry.get(key) is entry:
                 del registry[key]
 
-    async def _release_lock_locked(self, storage: AbstractStorage, lock_path: PathLike, lease: LockLease) -> None:
+    # ------------------------------------------------------------------
+    # Best-effort (legacy) lock operations
+    # ------------------------------------------------------------------
+
+    async def _best_effort_release_lock_locked(
+        self, storage: AbstractStorage, lock_path: PathLike, lease: LockLease
+    ) -> None:
         try:
             current = await download_private_file(storage, lock_path, label="lock file")
             data = json.loads(current.decode())
             if data.get("owner") != lease.owner:
                 self.log.warning(f"Lock <y>{escape_tag(lock_path)}</y> owner changed; leaving it intact")
                 return
-            # The storage contract has no conditional delete. Re-reading immediately before
-            # unlink minimizes the takeover race, but another process can still replace the
-            # lock after this check and before unlink.
             if await download_private_file(storage, lock_path, label="lock file") != current:
                 self.log.warning(f"Lock <y>{escape_tag(lock_path)}</y> changed; leaving it intact")
                 return
@@ -90,17 +110,12 @@ class StorageFileLocker:
         except FileNotFoundError, KeyError, TypeError, ValueError, UnicodeDecodeError:
             return
 
-    def _renewal_validity(self) -> float:
-        """Leave a scheduler-safe validity window for one bounded renewal probe."""
-        return max(self.lock_lease + (2 * self.lock_timeout), 0.5)
-
-    async def renew_lock(self, lease: LockLease) -> None:
+    async def _best_effort_renew(self, lease: LockLease) -> None:
         interval = self.lock_lease / 3
-        key = f"{lease.storage.namespace_identity}:{lease.storage.normalize_path(lease.path)}"
         while True:
             try:
                 with anyio.fail_after(self.lock_timeout):
-                    async with self.local_lock_guard(key):
+                    async with self.local_lock_guard(self._reg_key(lease.storage, lease.path)):
                         current = await download_private_file(lease.storage, lease.path, label="lock file")
                         data = json.loads(current.decode())
                         if data.get("owner") != lease.owner:
@@ -111,11 +126,9 @@ class StorageFileLocker:
                         expires = now + timedelta(seconds=self._renewal_validity())
                         data["expires"] = expires.isoformat()
                         payload = json.dumps(data, separators=(",", ":")).encode()
-                        # A second read is the best ownership proof available without CAS.
                         if await download_private_file(lease.storage, lease.path, label="lock file") != current:
                             raise LockLeaseLostError(f"Storage lock ownership changed during renewal: {lease.path}")
                         await lease.storage.upload_bytes(payload, lease.path, overwrite=True)
-                        lease = dataclasses.replace(lease, expires=expires)
             except TimeoutError:
                 if datetime.now(UTC) >= lease.expires:
                     raise LockLeaseLostError(f"Storage lock renewal probe timed out: {lease.path}") from None
@@ -125,36 +138,9 @@ class StorageFileLocker:
                 raise LockLeaseLostError(f"Storage lock ownership lost during renewal: {lease.path}") from error
             await anyio.sleep(interval)
 
-    @contextlib.asynccontextmanager
-    async def renewing_locks(self, leases: Iterable[LockLease | None]) -> AsyncGenerator[None]:
-        try:
-            tasks: set[asyncio.Task] = set()
-            for lease in leases:
-                if lease is not None:
-                    tasks.add(asyncio.create_task(self.renew_lock(lease)))
-            try:
-                yield
-            finally:
-                for task in tasks:
-                    if task.done():
-                        task.result()  # Propagate any exception raised during renewal
-                    else:
-                        task.cancel()
-        except BaseExceptionGroup as group:
-            error: BaseException = group
-            while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
-                error = error.exceptions[0]
-            if error is group:
-                raise
-            raise error from group
-
-    async def acquire_lock(self, storage: AbstractStorage, lock_path: PathLike) -> LockLease | None:
+    async def _best_effort_acquire(self, storage: AbstractStorage, lock_path: PathLike) -> LockLease | None:
         _colored_path = f"<y>{escape_tag(lock_path)}</y>"
-        if self.skip_locking:
-            self.log.trace(f"Lock {_colored_path} disabled, skipping ...")
-            return None
-
-        key = f"{storage.namespace_identity}:{storage.normalize_path(lock_path)}"
+        key = self._reg_key(storage, lock_path)
         deadline = anyio.current_time() + self.lock_timeout
         while True:
             remaining = deadline - anyio.current_time()
@@ -171,8 +157,6 @@ class StorageFileLocker:
                             if handoff_timeout <= 0:
                                 raise TimeoutError
                             now = datetime.now(UTC)
-                            # A backend may commit before its upload call returns. Cover its
-                            # bounded handoff plus one lease and renewal probe budget.
                             expires = now + timedelta(seconds=handoff_timeout + self._renewal_validity())
                             lease = LockLease(owner, expires, storage, lock_path)
                             payload = json.dumps(
@@ -180,8 +164,6 @@ class StorageFileLocker:
                                 separators=(",", ":"),
                             ).encode()
                             try:
-                                # This shield protects the post-commit handoff from external
-                                # cancellation without extending the acquisition deadline.
                                 with anyio.fail_after(handoff_timeout, shield=True):
                                     await storage.upload_bytes(payload, lock_path, overwrite=False)
                             except FileExistsError:
@@ -209,8 +191,6 @@ class StorageFileLocker:
                                     except FileNotFoundError:
                                         stale = False
                                 if stale:
-                                    # The equality check narrows, but cannot eliminate, the
-                                    # final cross-process replace-before-unlink race without CAS.
                                     try:
                                         if (
                                             await download_private_file(storage, lock_path, label="lock file")
@@ -237,16 +217,242 @@ class StorageFileLocker:
                 raise TimeoutError(f"Timed out waiting for storage lock: {lock_path}")
             await anyio.sleep(min(0.1, remaining))
 
-    async def release_lock(self, storage: AbstractStorage, lock_path: PathLike, lease: LockLease | None) -> None:
-        if self.skip_locking or lease is None:
-            return
-        key = f"{storage.namespace_identity}:{storage.normalize_path(lock_path)}"
+    async def _best_effort_release(self, storage: AbstractStorage, lock_path: PathLike, lease: LockLease) -> None:
+        key = self._reg_key(storage, lock_path)
         try:
             with anyio.fail_after(self.lock_timeout, shield=True):
                 async with self.local_lock_guard(key):
-                    await self._release_lock_locked(storage, lock_path, lease)
+                    await self._best_effort_release_lock_locked(storage, lock_path, lease)
         except TimeoutError as error:
             raise TimeoutError(f"Timed out releasing storage lock: {lock_path}") from error
+
+    # ------------------------------------------------------------------
+    # Strong (CAS-based) lock operations
+    # ------------------------------------------------------------------
+    # All strong operations use the local lock guard to serialize renewal
+    # and release within the same process, preventing token-advance races.
+    # ------------------------------------------------------------------
+
+    async def _strong_renew(self, lease: LockLease) -> None:
+        interval = self.lock_lease / 3
+        lock_path = lease.path
+        while True:
+            try:
+                with anyio.fail_after(self.lock_timeout):
+                    async with self.local_lock_guard(self._reg_key(lease.storage, lock_path)):
+                        now = datetime.now(UTC)
+                        if now >= lease.expires:
+                            raise LockLeaseLostError(f"Storage lock lease expired before renewal: {lock_path}")
+                        expires = now + timedelta(seconds=self._renewal_validity())
+                        payload = json.dumps(
+                            {"owner": lease.owner, "created": now.isoformat(), "expires": expires.isoformat()},
+                            separators=(",", ":"),
+                        ).encode()
+                        # Shield the CAS commit through the local token handoff so a
+                        # cancelled renewer cannot leave a live successor token stranded.
+                        with anyio.CancelScope(shield=True):
+                            result = await lease.storage.compare_exchange(
+                                lock_path,
+                                expected_token=lease.token,
+                                data=payload,
+                            )
+                            if result is None:
+                                raise LockLeaseLostError(f"Storage lock token lost during renewal: {lock_path}")
+                            lease.token = result.token
+                            lease.expires = expires
+            except TimeoutError:
+                if datetime.now(UTC) >= lease.expires:
+                    raise LockLeaseLostError(f"Storage lock renewal probe timed out: {lock_path}") from None
+                await anyio.lowlevel.checkpoint()
+                continue
+            except LockLeaseLostError:
+                raise
+            except (FileNotFoundError, KeyError, TypeError, ValueError, UnicodeDecodeError) as error:
+                raise LockLeaseLostError(f"Storage lock state invalid during renewal: {lock_path}") from error
+            await anyio.sleep(interval)
+
+    async def _strong_acquire(self, storage: AbstractStorage, lock_path: PathLike) -> LockLease | None:
+        _colored_path = f"<y>{escape_tag(lock_path)}</y>"
+        deadline = anyio.current_time() + self.lock_timeout
+        while True:
+            remaining = deadline - anyio.current_time()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for storage lock: {lock_path}")
+            committed_token: str | None = None
+            committed_owner: str | None = None
+            committed_expires: datetime | None = None
+            try:
+                with anyio.fail_after(remaining):
+                    now = datetime.now(UTC)
+                    owner = uuid.uuid4().hex
+                    handoff_timeout = deadline - anyio.current_time()
+                    if handoff_timeout <= 0:
+                        raise TimeoutError
+                    expires = now + timedelta(seconds=handoff_timeout + self._renewal_validity())
+                    payload = json.dumps(
+                        {"owner": owner, "created": now.isoformat(), "expires": expires.isoformat()},
+                        separators=(",", ":"),
+                    ).encode()
+                    # Atomic create-if-absent. Capture committed_token inside the
+                    # shield so cancel cannot land between backend commit and local handoff.
+                    with anyio.fail_after(handoff_timeout, shield=True):
+                        result = await storage.compare_exchange(
+                            lock_path,
+                            expected_token=None,
+                            data=payload,
+                        )
+                        if result is not None:
+                            committed_token = result.token
+                            committed_owner = owner
+                            committed_expires = expires
+                    if committed_token is None:
+                        # Lock exists - read the whole versioned record atomically.
+                        current_vb = await storage.read_versioned(lock_path)
+                        if current_vb is None:
+                            continue
+                        # Parse stale/released state from the same VersionedBytes
+                        # whose token we CAS against.
+                        try:
+                            lock_data = json.loads(current_vb.data.decode())
+                            stale = datetime.fromisoformat(lock_data["expires"]) <= datetime.now(UTC)
+                            stale = stale or lock_data.get("released", False)
+                        except KeyError, TypeError, ValueError, UnicodeDecodeError:
+                            stale = False
+                        if stale:
+                            expires = now + timedelta(seconds=handoff_timeout + self._renewal_validity())
+                            payload = json.dumps(
+                                {"owner": owner, "created": now.isoformat(), "expires": expires.isoformat()},
+                                separators=(",", ":"),
+                            ).encode()
+                            # Shield takeover commit-to-token handoff the same way as
+                            # create-if-absent so cancel after a successful CAS still
+                            # has committed_token for tombstone cleanup.
+                            with anyio.fail_after(handoff_timeout, shield=True):
+                                result = await storage.compare_exchange(
+                                    lock_path,
+                                    expected_token=current_vb.token,
+                                    data=payload,
+                                )
+                                if result is not None:
+                                    committed_token = result.token
+                                    committed_owner = owner
+                                    committed_expires = expires
+
+                    if committed_token is not None:
+                        assert committed_owner is not None
+                        assert committed_expires is not None
+                        await anyio.lowlevel.checkpoint()
+                        lease = LockLease(
+                            committed_owner,
+                            committed_expires,
+                            storage,
+                            lock_path,
+                            token=committed_token,
+                        )
+                        self.log.trace(f"Lock {_colored_path} acquired")
+                        return lease
+            except BaseException as error:
+                if committed_token is not None:
+                    self.log.warning(
+                        f"Lock <y>{escape_tag(lock_path)}</y> acquisition cancelled after committed CAS; cleaning up"
+                    )
+                    try:
+                        with anyio.fail_after(self.lock_timeout, shield=True):
+                            await storage.compare_exchange(
+                                lock_path,
+                                expected_token=committed_token,
+                                data=_LOCK_TOMBSTONE,
+                            )
+                    except BaseException as cleanup_error:
+                        self.log.warning(
+                            f"Failed to clean up uncertain lock <y>{escape_tag(lock_path)}</y>: {cleanup_error!r}"
+                        )
+                if isinstance(error, TimeoutError):
+                    raise TimeoutError(f"Timed out waiting for storage lock: {lock_path}") from error
+                raise
+            remaining = deadline - anyio.current_time()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for storage lock: {lock_path}")
+            await anyio.sleep(min(0.1, remaining))
+
+    async def _strong_release(self, storage: AbstractStorage, lock_path: PathLike, lease: LockLease) -> None:
+        if lease.token is None:
+            raise LockLeaseLostError(f"Storage lock has no tracked token during release: {lock_path}")
+        key = self._reg_key(storage, lock_path)
+        try:
+            with anyio.fail_after(self.lock_timeout, shield=True):
+                async with self.local_lock_guard(key):
+                    result = await storage.compare_exchange(
+                        lock_path,
+                        expected_token=lease.token,
+                        data=_LOCK_TOMBSTONE,
+                    )
+                    if result is None:
+                        raise LockLeaseLostError(f"Storage lock token lost during release: {lock_path}")
+                    self.log.trace(f"Lock <y>{escape_tag(lock_path)}</y> released (tombstone)")
+        except LockLeaseLostError:
+            raise
+        except TimeoutError as error:
+            raise TimeoutError(f"Timed out releasing storage lock: {lock_path}") from error
+
+    # ------------------------------------------------------------------
+    # Public API - dispatches based on lock_mode
+    # ------------------------------------------------------------------
+
+    def _renewal_validity(self) -> float:
+        return max(self.lock_lease + (2 * self.lock_timeout), 0.5)
+
+    async def renew_lock(self, lease: LockLease) -> None:
+        if self.lock_mode == "strong":
+            await self._strong_renew(lease)
+        elif self.lock_mode == "best_effort":
+            await self._best_effort_renew(lease)
+
+    @contextlib.asynccontextmanager
+    async def renewing_locks(self, leases: Iterable[LockLease | None]) -> AsyncGenerator[None]:
+        active = [lease for lease in leases if lease is not None]
+        if not active:
+            yield
+            return
+        try:
+            async with anyio.create_task_group() as tg:
+                for lease in active:
+                    tg.start_soon(self.renew_lock, lease)
+                try:
+                    yield
+                finally:
+                    # Cancel renewers and wait for termination so release observes
+                    # the final committed token from any shielded CAS handoff.
+                    tg.cancel_scope.cancel()
+        except BaseExceptionGroup as group:
+            lease_losses = [exc for exc in group.exceptions if isinstance(exc, LockLeaseLostError)]
+            if len(lease_losses) == 1 and len(group.exceptions) == 1:
+                raise lease_losses[0] from group
+            if lease_losses:
+                raise lease_losses[0] from group
+            error: BaseException = group
+            while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
+                error = error.exceptions[0]
+            if error is group:
+                raise
+            raise error from group
+
+    async def acquire_lock(self, storage: AbstractStorage, lock_path: PathLike) -> LockLease | None:
+        _colored_path = f"<y>{escape_tag(lock_path)}</y>"
+        if self.lock_mode == "disabled":
+            self.log.trace(f"Lock {_colored_path} disabled, skipping ...")
+            return None
+        if self.lock_mode == "strong":
+            return await self._strong_acquire(storage, lock_path)
+        return await self._best_effort_acquire(storage, lock_path)
+
+    async def release_lock(self, storage: AbstractStorage, lock_path: PathLike, lease: LockLease | None) -> None:
+        if self.lock_mode == "disabled" or lease is None:
+            return
+        if self.lock_mode == "strong":
+            await self._strong_release(storage, lock_path, lease)
+        else:
+            await self._best_effort_release(storage, lock_path, lease)
 
     async def release_locks(
         self,

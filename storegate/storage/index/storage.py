@@ -7,7 +7,7 @@ import math
 from collections.abc import AsyncGenerator, AsyncIterable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import NoReturn, Self, final, override
+from typing import Literal, NoReturn, Self, final, override
 
 import anyio
 import anyio.lowlevel
@@ -29,7 +29,7 @@ from ..abstract import (
     validate_same_path_tree_operation,
 )
 from ._guard import download_private_file, lstat_private_entry, lstat_private_entry_or_none
-from .lock import LockLease, StorageFileLocker
+from .lock import LockLease, StorageFileLocker, _is_tombstone
 from .ref import ChunkRefManager, hash_to_path
 
 BLOCK_SIZE = 64 * 1024 * 1024  # 64 MB
@@ -73,7 +73,7 @@ class IndexStorage(AbstractStorage):
         chunks: AbstractStorage,
         block_size: int = BLOCK_SIZE,
         max_concurrent_uploads: int = MAX_CONCURRENT_UPLOADS,
-        skip_locking: bool = False,
+        lock_mode: Literal["strong", "best_effort", "disabled"] = "strong",
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
         lock_lease: float = DEFAULT_LOCK_LEASE,
     ):
@@ -87,6 +87,8 @@ class IndexStorage(AbstractStorage):
             or max_concurrent_uploads <= 0
         ):
             raise ValueError("max_concurrent_uploads must be a positive integer")
+        if lock_mode not in ("strong", "best_effort", "disabled"):
+            raise ValueError("lock_mode must be 'strong', 'best_effort', or 'disabled'")
         if not isinstance(lock_timeout, (int, float)) or not math.isfinite(lock_timeout) or lock_timeout <= 0:
             raise ValueError("lock_timeout must be finite and greater than zero")
         if not isinstance(lock_lease, (int, float)) or not math.isfinite(lock_lease) or lock_lease < MIN_LOCK_LEASE:
@@ -97,11 +99,12 @@ class IndexStorage(AbstractStorage):
         self._chunks = chunks
         self._block_size = block_size
         self._max_concurrent_uploads = max_concurrent_uploads
+        self._lock_mode = lock_mode
         self._locker = StorageFileLocker(
             self,
             lock_timeout=lock_timeout,
             lock_lease=lock_lease,
-            skip_locking=skip_locking,
+            lock_mode=lock_mode,
         )
         self._refs = ChunkRefManager(
             storage=self,
@@ -130,6 +133,9 @@ class IndexStorage(AbstractStorage):
         index = self._index
         chunks = self._chunks
         self.log.info(f"Connecting IndexStorage (index=<c>{index.display_id}</c>, chunks=<c>{chunks.display_id}</c>)")
+        if self._lock_mode == "strong":
+            self._require_compare_exchange(index, "index")
+            self._require_compare_exchange(chunks, "chunks")
         await self._retry_pending_rollback()
         index_started = False
         chunks_started = False
@@ -206,6 +212,15 @@ class IndexStorage(AbstractStorage):
                     "Index storage connection rollback failed", [primary, *cleanup_errors]
                 ) from None
             raise
+
+    @staticmethod
+    def _require_compare_exchange(storage: AbstractStorage, label: str) -> None:
+        if not storage.capabilities.compare_exchange:
+            raise RuntimeError(
+                f"IndexStorage lock_mode='strong' requires compare_exchange capability "
+                f"on the {label} storage ({storage.display_id}), "
+                f"which does not support it. Use lock_mode='best_effort' or 'disabled' instead."
+            )
 
     async def _retry_pending_rollback(self) -> None:
         if not self._pending_rollback:
@@ -299,6 +314,9 @@ class IndexStorage(AbstractStorage):
             return None
         if not meta_bytes:
             return None
+        # Internal lock tombstones are not user file metadata.
+        if _is_tombstone(meta_bytes):
+            return None
         try:
             return FileMeta.model_validate_json(meta_bytes.decode())
         except (UnicodeDecodeError, ValidationError) as error:
@@ -310,7 +328,7 @@ class IndexStorage(AbstractStorage):
         newly_added_refs: set[str],
         staged_bins: set[str],
     ) -> None:
-        """Worker：从 channel 拉取 block，保存或复用已有分块。"""
+        """Worker: pull blocks from channel, save or reuse existing chunks."""
         async for chunk_hash, data, remote_path in recv:
             bin_path = hash_to_path(chunk_hash, "bin")
 
@@ -974,10 +992,12 @@ class IndexStorage(AbstractStorage):
         _colored_path = f"<y>{escape_tag(path)}</y>"
         self.log.info(f"RmTree: {_colored_path}")
 
-        metas, relative_directories = await self._collect_tree(path)
+        metas, relative_directories, tombstone_locks = await self._collect_tree(path)
         async with anyio.create_task_group() as tg:
             for file_path in metas:
                 tg.start_soon(self.unlink, file_path)
+            for lock_path in tombstone_locks:
+                tg.start_soon(self._index.unlink, lock_path)
         for relative in sorted(relative_directories, key=lambda item: len(item.parts), reverse=True):
             await self._index.rmdir(path / relative)
         await self._index.rmdir(path)
@@ -985,9 +1005,20 @@ class IndexStorage(AbstractStorage):
             f"RmTree complete: {_colored_path} (<g>{len(metas) + len(relative_directories)}</g> entries removed)"
         )
 
-    async def _collect_tree(self, root: PurePosixPath) -> tuple[dict[PurePosixPath, FileMeta], list[PurePosixPath]]:
+    async def _read_is_tombstone(self, entry_path: PurePosixPath) -> bool:
+        """Return True when *entry_path* is a recognised clean-release tombstone."""
+        try:
+            data = await download_private_file(self._index, entry_path, label="tree entry")
+            return _is_tombstone(data)
+        except FileNotFoundError, OSError:
+            return False
+
+    async def _collect_tree(
+        self, root: PurePosixPath
+    ) -> tuple[dict[PurePosixPath, FileMeta], list[PurePosixPath], list[PurePosixPath]]:
         metas: dict[PurePosixPath, FileMeta] = {}
         relatives: list[PurePosixPath] = []
+        tombstone_locks: list[PurePosixPath] = []
         async for walk_entry in self._index.walk(root):
             for entry in walk_entry.entries:
                 entry_path = self.normalize_path(entry.path)
@@ -995,13 +1026,19 @@ class IndexStorage(AbstractStorage):
                     case EntryKind.DIRECTORY:
                         relatives.append(entry_path.relative_to(root))
                     case EntryKind.FILE:
-                        meta = await self._get_file_meta(entry_path)
-                        if meta is None:
-                            raise FileNotFoundError(f"File not found: {entry_path}")
-                        metas[entry_path] = meta
+                        try:
+                            meta = await self._get_file_meta(entry_path)
+                        except OSError:
+                            meta = None
+                        if meta is not None:
+                            metas[entry_path] = meta
+                        elif await self._read_is_tombstone(entry_path):
+                            tombstone_locks.append(entry_path)
+                        # Non-metadata, non-tombstone files (e.g. active lock files)
+                        # are silently skipped.
                     case EntryKind.SYMLINK:
                         await lstat_private_entry(self._index, entry_path, label="tree entry")
-        return metas, relatives
+        return metas, relatives, tombstone_locks
 
     @staticmethod
     def _raise_tree_failure(primary: BaseException, rollback_error: BaseException | None) -> NoReturn:
@@ -1079,7 +1116,7 @@ class IndexStorage(AbstractStorage):
         *,
         move: bool,
     ) -> tuple[int, int]:
-        source_metas, source_dirs = await self._collect_tree(src)
+        source_metas, source_dirs, _tombstone_locks = await self._collect_tree(src)
         destination_paths = {dst.joinpath(path.relative_to(src)) for path in source_metas}
         destination_metas: dict[PurePosixPath, FileMeta] = {}
         for path in destination_paths:
@@ -1104,6 +1141,19 @@ class IndexStorage(AbstractStorage):
                 else:
                     await self.copy(source_path, destination_path, overwrite=True)
             if move:
+                # Clean up lock tombstones before rmdir; validate payload, not suffix.
+                tombstone_orphans: list[PurePosixPath] = []
+                for relative in sorted(
+                    [src] + [src / relative for relative in source_dirs],
+                    key=lambda path: len(path.parts),
+                    reverse=True,
+                ):
+                    async for entry in self._index.iterdir(relative):
+                        entry_path = relative / entry.name
+                        if await self._read_is_tombstone(entry_path):
+                            tombstone_orphans.append(entry_path)
+                for path in tombstone_orphans:
+                    await self._index.unlink(path)
                 for relative in sorted(source_dirs, key=lambda path: len(path.parts), reverse=True):
                     await self._index.rmdir(src / relative)
                 await self._index.rmdir(src)
