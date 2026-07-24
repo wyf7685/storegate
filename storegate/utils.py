@@ -20,9 +20,10 @@ from typing import TYPE_CHECKING, Any, Concatenate, Literal, TypedDict, Unpack, 
 
 from pydantic import TypeAdapter
 
-from storegate.const import DEFAULT_CHUNK_SIZE
-
 from .log import logger
+
+DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
+
 
 if TYPE_CHECKING:
     import httpx as httpx
