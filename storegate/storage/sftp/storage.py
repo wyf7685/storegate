@@ -427,6 +427,13 @@ class SFTPStorage(AbstractStorage):
         target = await self._io(client.readlink(remote.as_posix()))
         if not isinstance(target, str) or "\x00" in target:
             raise OSError(errno.EINVAL, f"SFTP server returned an invalid symlink target for {remote.as_posix()}")
+        # Windows OpenSSH / asyncssh fixtures may return native separators or
+        # drive-letter forms. Preserve relative POSIX identity for relative
+        # targets and normalize absolute ones to POSIX separators.
+        if "\\" in target:
+            target = target.replace("\\", "/")
+        if target.startswith(("//?/", "//./")):
+            target = target[4:]
         return target
 
     def _link_target_path(self, link_remote: PurePosixPath, raw_target: str) -> PurePosixPath:

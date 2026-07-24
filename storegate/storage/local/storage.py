@@ -244,6 +244,17 @@ class LocalStorage(AbstractStorage):
                 raw_target = raw_target[4:]
         return Path(raw_target)
 
+    @staticmethod
+    def _normalize_readlink_target(raw_target: str) -> str:
+        """Return a stable OS-native symlink target without extended-path noise."""
+        if os.name != "nt":
+            return raw_target
+        if raw_target.startswith("\\\\?\\UNC\\"):
+            return f"\\\\{raw_target[8:]}"
+        if raw_target.startswith("\\\\?\\"):
+            return raw_target[4:]
+        return raw_target
+
     def _follow(self, path: PathLike) -> tuple[PurePosixPath, Path, os.stat_result, EntryKind]:
         logical, candidate = self._lexical_path(path)
         self._validate_intermediate_components(logical)
@@ -282,12 +293,28 @@ class LocalStorage(AbstractStorage):
             return logical, current, final_result, self._public_kind(current, final_result)
 
     @staticmethod
-    def _file_info(logical: PurePosixPath, result: os.stat_result, kind: EntryKind) -> FileInfo:
+    def _file_info(
+        logical: PurePosixPath,
+        result: os.stat_result,
+        kind: EntryKind,
+        local: Path | None = None,
+    ) -> FileInfo:
+        if kind is EntryKind.DIRECTORY:
+            size = 0
+        elif kind is EntryKind.SYMLINK and os.name == "nt" and result.st_size == 0 and local is not None:
+            # Windows often reports st_size=0 for reparse points; surface the raw
+            # target length so symlink metadata remains useful for callers.
+            try:
+                size = len(LocalStorage._normalize_readlink_target(os.readlink(local)))  # noqa: PTH115
+            except OSError:
+                size = 0
+        else:
+            size = result.st_size
         return FileInfo(
             path=logical.as_posix(),
             name=logical.name,
             kind=kind,
-            size=0 if kind is EntryKind.DIRECTORY else result.st_size,
+            size=size,
             modified=datetime.fromtimestamp(result.st_mtime).astimezone(),
             created=datetime.fromtimestamp(result.st_ctime).astimezone(),
         )
@@ -514,7 +541,11 @@ class LocalStorage(AbstractStorage):
         _logical, target, _result, kind = await anyio.to_thread.run_sync(self._lexical_lstat, path)
         if kind is not EntryKind.SYMLINK:
             raise OSError(errno.EINVAL, f"Not a symlink: {path}")
-        return await anyio.to_thread.run_sync(os.readlink, target)
+
+        def _read() -> str:
+            return LocalStorage._normalize_readlink_target(os.readlink(target))  # noqa: PTH115
+
+        return await anyio.to_thread.run_sync(_read)
 
     @staticmethod
     def _validate_symlink_target(target: PathLike) -> str:
@@ -864,13 +895,13 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def stat(self, path: PathLike) -> FileInfo:
-        logical, _target, result, kind = await anyio.to_thread.run_sync(self._follow, path)
-        return self._file_info(logical, result, kind)
+        logical, target, result, kind = await anyio.to_thread.run_sync(self._follow, path)
+        return self._file_info(logical, result, kind, target)
 
     @override
     async def lstat(self, path: PathLike) -> FileInfo:
-        logical, _target, result, kind = await anyio.to_thread.run_sync(self._lexical_lstat, path)
-        return self._file_info(logical, result, kind)
+        logical, target, result, kind = await anyio.to_thread.run_sync(self._lexical_lstat, path)
+        return self._file_info(logical, result, kind, target)
 
     def _discovery_snapshot(self, logical: PurePosixPath, target: Path) -> tuple[FileInfo, ...]:
         result = os.lstat(target)
@@ -887,7 +918,7 @@ class LocalStorage(AbstractStorage):
                 self.log.debug(f"Skipping unsupported local entry <y>{child}</>")
                 continue
             kind = EntryKind(raw_kind.value)
-            infos.append(self._file_info(logical / entry.name, child_result, kind))
+            infos.append(self._file_info(logical / entry.name, child_result, kind, child))
         return tuple(sorted(infos, key=lambda info: info.path))
 
     @override

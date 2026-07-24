@@ -145,10 +145,12 @@ async def test_active_lease_is_renewed() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.05, lock_lease=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=0.15, lock_lease=0.06, lock_mode="best_effort") as storage,
         storage._lock_index("/renew"),
     ):
-        await anyio.sleep(0.08)
+        # Hold past several renewal intervals so contenders still time out only if
+        # the active holder successfully extends its lease under load.
+        await anyio.sleep(0.25)
         with pytest.raises(TimeoutError):
             await storage._locker.acquire_lock(index, "/renew.lock")
 
@@ -157,11 +159,11 @@ async def test_delayed_renewal_keeps_active_holder_exclusive() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.08, lock_lease=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=0.2, lock_lease=0.06, lock_mode="best_effort") as storage,
         storage._lock_index("/delayed-renew"),
     ):
-        await anyio.sleep(0.11)
-        contender = IndexStorage(index, chunks, lock_timeout=0.03, lock_lease=0.03, lock_mode="best_effort")
+        await anyio.sleep(0.3)
+        contender = IndexStorage(index, chunks, lock_timeout=0.08, lock_lease=0.06, lock_mode="best_effort")
         with pytest.raises(TimeoutError):
             await contender._locker.acquire_lock(index, "/delayed-renew.lock")
 

@@ -129,6 +129,7 @@ class StorageFileLocker:
                         if await download_private_file(lease.storage, lease.path, label="lock file") != current:
                             raise LockLeaseLostError(f"Storage lock ownership changed during renewal: {lease.path}")
                         await lease.storage.upload_bytes(payload, lease.path, overwrite=True)
+                        lease.expires = expires
             except TimeoutError:
                 if datetime.now(UTC) >= lease.expires:
                     raise LockLeaseLostError(f"Storage lock renewal probe timed out: {lease.path}") from None
