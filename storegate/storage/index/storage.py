@@ -791,8 +791,22 @@ class IndexStorage(AbstractStorage):
             raise NotADirectoryError(f"Not a directory: {path}")
         if not await self._is_dir_empty(path):
             raise OSError(f"Directory not empty: {path}")
-
+        # Strong-mode release leaves tombstones at ``{child}.lock``. They are
+        # invisible to public iterdir, but still occupy the index directory.
+        await self._purge_private_directory_residue(path)
         await self._index.rmdir(path)
+
+    async def _purge_private_directory_residue(self, path: PurePosixPath) -> None:
+        """Remove internal lock tombstones so empty public dirs can rmdir."""
+        async for entry in self._index.iterdir(path):
+            entry_path = self.normalize_path(entry.path)
+            if entry.kind is not EntryKind.FILE:
+                raise OSError(f"Directory not empty: {path}")
+            if await self._read_is_tombstone(entry_path):
+                await self._index.unlink(entry_path, missing_ok=True)
+                continue
+            # Active lock files or other private residue still block removal.
+            raise OSError(f"Directory not empty: {path}")
 
     @override
     async def move(
@@ -993,11 +1007,22 @@ class IndexStorage(AbstractStorage):
         self.log.info(f"RmTree: {_colored_path}")
 
         metas, relative_directories, tombstone_locks = await self._collect_tree(path)
+        # Unlink user files first. Strong release writes a tombstone at ``{path}.lock``,
+        # which is the same object rmtree would otherwise delete for residual cleanup.
+        # Concurrent tombstone deletion races active holders (renewal/release CAS) and
+        # surfaces as LockLeaseLostError under ordinary contract cleanup.
         async with anyio.create_task_group() as tg:
             for file_path in metas:
                 tg.start_soon(self.unlink, file_path)
-            for lock_path in tombstone_locks:
-                tg.start_soon(self._index.unlink, lock_path)
+        residual_locks = {self.normalize_path(lock_path) for lock_path in tombstone_locks}
+        residual_locks.update(self.normalize_path(f"{file_path}.lock") for file_path in metas)
+        async with anyio.create_task_group() as tg:
+            for lock_path in residual_locks:
+
+                async def _unlink_lock(target: PurePosixPath = lock_path) -> None:
+                    await self._index.unlink(target, missing_ok=True)
+
+                tg.start_soon(_unlink_lock)
         for relative in sorted(relative_directories, key=lambda item: len(item.parts), reverse=True):
             await self._index.rmdir(path / relative)
         await self._index.rmdir(path)
