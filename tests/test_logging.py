@@ -14,16 +14,17 @@ def test_import_does_not_add_sinks() -> None:
     ``logger.add()``, or ``logger.configure()``."""
     import importlib
 
+    # Snapshot current handlers before reloading so parallel suites that leave
+    # temporary sinks behind cannot make an absolute count assertion flaky.
+    before = set(loguru.logger._core.handlers)  # ty: ignore[unresolved-attribute]
+
     import storegate.log as m
 
     importlib.reload(m)
 
-    # The Loguru root logger starts with at least the default stderr sink
-    # (id 0).  If no sinks were added, the only sinks are pre-existing.
-    sink_ids = loguru.logger._core.handlers  # ty: ignore[unresolved-attribute]
-    # The default stderr handler has id 0; our module should not have
-    # added any others at import time.
-    assert len(sink_ids) <= 1, f"Import added unexpected sinks: {list(sink_ids)}"
+    after = set(loguru.logger._core.handlers)  # ty: ignore[unresolved-attribute]
+    added = after - before
+    assert not added, f"Import added unexpected sinks: {sorted(added)}"
 
 
 def test_configure_logging_adds_and_removes_sinks() -> None:

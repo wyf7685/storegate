@@ -2,6 +2,7 @@ import errno
 import inspect
 from collections.abc import AsyncGenerator, AsyncIterable, Callable
 from dataclasses import FrozenInstanceError
+from pathlib import PurePosixPath
 from typing import cast, get_type_hints
 
 import pytest
@@ -214,6 +215,6 @@ async def test_delete_dispatches_from_lstat_and_unlinks_symlink() -> None:
 
     await storage.delete("/link")
 
-    assert storage.stat_calls == ["/link"]
-    assert storage.unlink_calls == [("/link", False)]
+    assert storage.stat_calls == [PurePosixPath("/link")]
+    assert storage.unlink_calls == [(PurePosixPath("/link"), False)]
     assert storage.rmdir_calls == []
