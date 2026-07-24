@@ -109,7 +109,7 @@ class LoguruOpts(TypedDict, total=False):
 
 class LoggerWrapper:
     def __init__(self, logger_name: str) -> None:
-        self.logger = logger.patch(lambda r: r.update(name="app"))
+        self.logger = logger.patch(lambda r: r.update(name="storegate"))
         self.logger_name = logger_name
 
     def log(
@@ -119,6 +119,7 @@ class LoggerWrapper:
         **opts: Unpack[LoguruOpts],
     ) -> None:
         opts["colors"] = True
+        opts["depth"] = opts.get("depth", 0) + 1
         self.logger.opt(**opts).log(level, f"<m>{self.logger_name}</m> | {message}")
 
     __call__ = log
@@ -140,6 +141,7 @@ class LoggerWrapper:
                 raise AttributeError(f"Invalid log level: {item}")
 
             def method(message: str, **opts: Unpack[LoguruOpts]) -> None:
+                opts["depth"] = opts.get("depth", 0) + 1
                 self.log(level, message, **opts)
 
             setattr(self, item, method)
@@ -147,6 +149,7 @@ class LoggerWrapper:
 
     def exception(self, message: str, **opts: Unpack[LoguruOpts]) -> None:
         opts["exception"] = True
+        opts["depth"] = opts.get("depth", 0) + 1
         self.log("ERROR", message, **opts)
 
 

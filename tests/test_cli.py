@@ -31,6 +31,18 @@ from storegate.server.ftp import FTPServer
 from storegate.storage.memory import MemoryStorage
 
 
+@pytest.fixture(autouse=True)
+def _restore_logging_after_cli_entry() -> Any:
+    """CLI main() owns process logging and calls logger.remove(); restore suite sinks."""
+    yield
+    import loguru
+
+    from storegate.log import configure_logging
+
+    loguru.logger.remove()
+    configure_logging(console=True, diagnose=False, enqueue=False, stdlib_bridge=False)
+
+
 def _ftp_config(
     *,
     host: str = "127.0.0.1",
@@ -323,6 +335,45 @@ def test_log_options_passed_to_configure(tmp_path: Path, monkeypatch: pytest.Mon
 
 # ---------------------------------------------------------------------------
 # Package / wheel smoke
+
+
+def test_cli_main_clears_default_sink_before_configure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI process entry drops Loguru's default/prior sinks, then configures once.
+
+    Library ``configure_logging()`` alone must not wipe host sinks; only the CLI
+    process boundary may call ``logger.remove()`` so default stderr formatting
+    does not dual-emit with storegate's sinks.
+    """
+    import storegate.log as log_mod
+
+    remove_calls: list[tuple[Any, ...]] = []
+    configure_calls: list[dict[str, Any]] = []
+    original_remove = log_mod.logger.remove
+
+    def tracking_remove(*args: Any, **kwargs: Any) -> None:
+        remove_calls.append(args)
+        original_remove(*args, **kwargs)
+
+    def fake_configure(**kwargs: Any) -> MagicMock:
+        configure_calls.append(kwargs)
+        # Keep suite sinks stable: do not add real sinks under the monkeypatch.
+        return MagicMock()
+
+    class FakeServer:
+        def __init__(self) -> None:
+            self.storage = MemoryStorage()
+
+    monkeypatch.setattr(log_mod.logger, "remove", tracking_remove)
+    monkeypatch.setattr("storegate.cli.configure_logging", fake_configure)
+    monkeypatch.setattr("storegate.cli.resolve_server", lambda *_a, **_k: FakeServer())
+
+    cfg = _write_config(tmp_path / "cli-log.json", {"$factory": "x"})
+    code = main(["check", str(cfg)])
+    assert code == EXIT_OK
+    assert remove_calls == [()], "CLI must call logger.remove() with no args before configure"
+    assert len(configure_calls) == 1
+
+
 # ---------------------------------------------------------------------------
 
 

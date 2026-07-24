@@ -44,6 +44,33 @@ def test_configure_logging_adds_and_removes_sinks() -> None:
     assert after_remove == existing, f"Expected sink count to return to {existing}, got {after_remove}"
 
 
+def test_configure_logging_preserves_host_sinks() -> None:
+    """Library configure must not wipe host Loguru sinks (§4.11).
+
+    CLI is the process owner that may call ``logger.remove()`` first;
+    library ``configure_logging()`` only adds and tracks its own sinks.
+    """
+    import storegate.log as m
+
+    host_messages: list[str] = []
+    host_id = loguru.logger.add(host_messages.append, format="{message}", enqueue=False)
+    try:
+        existing = set(loguru.logger._core.handlers)  # ty: ignore[unresolved-attribute]
+        assert host_id in existing
+
+        handle = m.configure_logging(console=True, file_path=None, enqueue=False, stdlib_bridge=False)
+        after_add = set(loguru.logger._core.handlers)  # ty: ignore[unresolved-attribute]
+        assert host_id in after_add
+        assert existing < after_add
+
+        handle.remove()
+        after_remove = set(loguru.logger._core.handlers)  # ty: ignore[unresolved-attribute]
+        assert after_remove == existing
+        assert host_id in after_remove
+    finally:
+        loguru.logger.remove(host_id)
+
+
 def test_configure_logging_diagnose_defaults_to_false() -> None:
     """The default ``diagnose`` must be ``False`` — verifying the call
     succeeds and the handle cleans up correctly."""

@@ -192,6 +192,10 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_CONFIG if code == 2 else code
         return EXIT_CONFIG
 
+    # Process entry owns logging: drop Loguru's default stderr sink (and any
+    # prior sinks) before installing storegate's format. Library callers of
+    # configure_logging() must not wipe host sinks — only CLI does this.
+    logger.remove()
     configure_logging(level=args.log_level, file_path=args.log_file)
 
     try:
