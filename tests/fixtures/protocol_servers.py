@@ -204,10 +204,29 @@ def _sftp_server(tmp_path_factory: pytest.TempPathFactory) -> Generator[SFTPServ
 
     class TestSFTPServer(asyncssh.SFTPServer):
         def readlink(self, path: bytes) -> bytes:
-            target = Path(os.fsdecode(self.map_path(path))).readlink()
-            if target.is_absolute():
-                return self.reverse_map_path(os.fsencode(target.as_posix()))
-            return os.fsencode(target.as_posix())
+            """Return raw symlink targets without Windows path-form breakage.
+
+            asyncssh's default readlink realpaths every target under chroot, which
+            destroys relative link identity. It also relies on map_path bytes that
+            look like ``/C:/...``; decoding those with ``Path`` on Windows yields
+            invalid native paths ("filename ... syntax is incorrect"). Convert via
+            ``_to_local_path`` and preserve relative targets as POSIX text.
+            """
+            local_path = asyncssh.sftp._to_local_path(self.map_path(path))
+            raw = os.readlink(local_path)  # noqa: PTH115
+            if isinstance(raw, bytes):
+                raw = os.fsdecode(raw)
+            if os.name == "nt" and raw.startswith("\\\\?\\"):
+                raw = raw[4:]
+            # Relative targets: keep as stored (POSIX separators preferred).
+            # os.path.isabs is intentional: Path.is_absolute treats some UNC forms differently.
+            if not os.path.isabs(raw) and not raw.startswith("\\\\"):  # noqa: PTH117
+                return os.fsencode(raw.replace("\\", "/"))
+            # Absolute targets: reverse-map into the chroot view when possible.
+            try:
+                return self.reverse_map_path(asyncssh.sftp._from_local_path(raw))
+            except asyncssh.SFTPNoSuchFile:
+                return asyncssh.sftp._from_local_path(raw)
 
     async def _runner() -> None:
         acceptor = await asyncssh.create_server(

@@ -13,7 +13,9 @@ from ..abstract import (
     FileInfo,
     PathLike,
     StorageCapabilities,
+    VersionedBytes,
     WalkEntry,
+    validate_download_offset,
 )
 from .backend import CacheBackend
 from .backend.memory import MemoryCacheBackend
@@ -38,12 +40,13 @@ class CachedStorage(AbstractStorage):
     storage:
         The underlying storage to wrap.
     ttl:
-        TTL (seconds) for cached entries. Default 30 s.
+        TTL (seconds) for cached entries. Must be ``> 0``. Default 30 s.
     capacity:
-        Maximum number of entries per cache. Default 1000.
+        Maximum number of entries per metadata cache. Must be ``>= 4`` so the
+        download namespace can keep at least one entry. Default 1000.
     download_cache_threshold:
         Maximum file size (bytes) cached for ``download_stream``. ``None``
-        disables download caching. Default 16 KiB.
+        disables download caching; otherwise must be ``>= 0``. Default 16 KiB.
     cache:
         Cache backend, or ``"memory"`` for the built-in in-process backend.
     """
@@ -58,15 +61,24 @@ class CachedStorage(AbstractStorage):
         cache: Literal["memory"] | CacheBackend = "memory",
     ) -> None:
         super().__init__()
+        if ttl <= 0:
+            raise ValueError("ttl must be > 0")
+        if capacity < 4:
+            raise ValueError("capacity must be >= 4")
+        if download_cache_threshold is not None and download_cache_threshold < 0:
+            raise ValueError("download_cache_threshold must be None or >= 0")
+
+        download_capacity = capacity // 4
+        if download_capacity < 1:
+            raise ValueError("download namespace capacity must be >= 1")
+
         self._storage = storage
         self._ttl = ttl
         self._capacity = capacity
         self._download_cache_threshold = download_cache_threshold
-        if download_cache_threshold is not None and download_cache_threshold < 0:
-            raise ValueError("download_cache_threshold must be None or >= 0")
 
         self._cache: CacheBackend = MemoryCacheBackend(capacity=capacity) if cache == "memory" else cache
-        self._cache.bind_storage(self._storage.cache_identity)
+        self._cache.bind_storage(self._storage.namespace_identity)
         self._cache.configure_namespace("exists", ttl)
         self._cache.configure_namespace("is_file", ttl)
         self._cache.configure_namespace("is_dir", ttl)
@@ -74,21 +86,23 @@ class CachedStorage(AbstractStorage):
         self._cache.configure_namespace("stat", ttl)
         self._cache.configure_namespace("lstat", ttl)
         self._cache.configure_namespace("iterdir", ttl)
-        self._cache.configure_namespace("download", ttl * 2, capacity=capacity // 4)
+        self._cache.configure_namespace("download", ttl * 2, capacity=download_capacity)
 
     @property
     @override
-    def id(self) -> str:
-        return self._storage.id
+    def display_id(self) -> str:
+        return self._storage.display_id
 
     @property
     @override
-    def cache_identity(self) -> str | None:
-        return self._storage.cache_identity
+    def namespace_identity(self) -> str:
+        return self._storage.namespace_identity
 
     @property
     @override
     def capabilities(self) -> StorageCapabilities:
+        # Proxy CAS only when the wrapped storage implements it; otherwise keep
+        # the existing capability object so non-CAS backends stay allocation-free.
         return self._storage.capabilities
 
     @override
@@ -125,12 +139,47 @@ class CachedStorage(AbstractStorage):
     async def ping(self) -> bool:
         return await self._cache.ping() and await self._storage.ping()
 
+    @override
+    async def read_versioned(self, path: PathLike) -> VersionedBytes | None:
+        # Validate before any wrapped CAS I/O; keep the original path for
+        # backend semantics after normalization succeeds.
+        self._normalize(path)
+        return await self._storage.read_versioned(path)
+
+    @override
+    async def compare_exchange(
+        self,
+        path: PathLike,
+        *,
+        expected_token: str | None,
+        data: BytesLike,
+    ) -> VersionedBytes | None:
+        # Validate before any wrapped CAS I/O so invalid paths never mutate.
+        self._normalize(path)
+        result = await self._storage.compare_exchange(
+            path,
+            expected_token=expected_token,
+            data=data,
+        )
+        if result is not None:
+            await self._invalidate_path(
+                path,
+                exists=True,
+                is_file=True,
+                is_dir=False,
+                is_symlink=False,
+                download=result.data
+                if self._download_cache_threshold is not None and len(result.data) <= self._download_cache_threshold
+                else None,
+            )
+        return result
+
     @staticmethod
     def _normalize(path: PathLike) -> str:
-        p = PurePosixPath(path)
-        if p.is_absolute():
-            p = p.relative_to("/")
-        result = str(p)
+        # Validate caller-supplied logical paths before any cache key derivation.
+        absolute = AbstractStorage.normalize_path(path)
+        relative = absolute.relative_to("/")
+        result = relative.as_posix()
         return "" if result == "." else result
 
     @staticmethod
@@ -279,6 +328,7 @@ class CachedStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
+        remote_path = self.normalize_path(remote_path)
         buffer = bytearray() if self._download_cache_threshold is not None else None
         threshold = self._download_cache_threshold or 0
 
@@ -308,6 +358,8 @@ class CachedStorage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
+        offset = validate_download_offset(offset)
+        remote_path = self.normalize_path(remote_path)
         np = self._normalize(remote_path)
         if await self._is_lexical_symlink(remote_path, np):
             async for chunk in self._storage.download_stream(remote_path, offset=offset):
@@ -316,6 +368,8 @@ class CachedStorage(AbstractStorage):
 
         if self._download_cache_threshold is not None and (cached := await self._cache.get("download", np)) is not None:
             self.log.trace(f"Cache hit: <le>download_stream</>(<y>{escape_tag(np)}</y>) → <g>{len(cached)} bytes</g>")
+            if offset >= len(cached):
+                return
             yield cached[offset:] if offset else cached
             return
 
@@ -339,25 +393,29 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
+        path = self.normalize_path(path)
         await self._storage.unlink(path, missing_ok=missing_ok)
         await self._invalidate_as_missing(path)
 
     @override
     async def rmdir(self, path: PathLike) -> None:
+        path = self.normalize_path(path)
         await self._storage.rmdir(path)
         await self._invalidate_as_missing(path)
 
     @override
     async def delete(self, path: PathLike) -> None:
+        path = self.normalize_path(path)
         await self._storage.delete(path)
         await self._invalidate_as_missing(path)
 
     @override
     async def delete_many(self, *paths: PathLike) -> None:
+        normalized = tuple(self.normalize_path(path) for path in paths)
         try:
-            await self._storage.delete_many(*paths)
+            await self._storage.delete_many(*normalized)
         finally:
-            for path in paths:
+            for path in normalized:
                 await self._invalidate_path(path)
 
     async def _backfill_copied_kind(self, path: PathLike, kind: EntryKind) -> None:
@@ -374,9 +432,11 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        source = await self.lstat(src)
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         src_np = self._normalize(src)
         dst_np = self._normalize(dst)
+        source = await self.lstat(src)
         try:
             await self._storage.move(src, dst, overwrite=overwrite)
         except BaseException:
@@ -393,6 +453,8 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         source = await self.lstat(src)
         try:
             await self._storage.copy(src, dst, overwrite=overwrite)
@@ -411,6 +473,7 @@ class CachedStorage(AbstractStorage):
         target_is_directory: bool = False,
         overwrite: bool = False,
     ) -> None:
+        link_path = self.normalize_path(link_path)
         try:
             await self._storage.symlink(
                 target,
@@ -425,6 +488,7 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def readlink(self, path: PathLike) -> str:
+        path = self.normalize_path(path)
         return await self._storage.readlink(path)
 
     @override
@@ -435,6 +499,7 @@ class CachedStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
+        path = self.normalize_path(path)
         await self._storage.mkdir(path, parents=parents, exist_ok=exist_ok)
         if parents:
             np = self._normalize(path)
@@ -462,6 +527,7 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def rmtree(self, path: PathLike) -> None:
+        path = self.normalize_path(path)
         try:
             await self._storage.rmtree(path)
         finally:
@@ -469,6 +535,8 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         try:
             await self._storage.copytree(src, dst, overwrite=overwrite)
         finally:
@@ -476,6 +544,8 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
         try:
             await self._storage.movetree(src, dst, overwrite=overwrite)
         finally:
@@ -608,12 +678,14 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:
+        path = self.normalize_path(path)
         async for snapshot in self._storage.walk(path):
             await self._backfill_discovery(snapshot.entries)
             yield snapshot
 
     @override
     async def list_(self, path: PathLike) -> list[FileInfo]:
+        path = self.normalize_path(path)
         infos = await self._storage.list_(path)
         await self._backfill_discovery(infos)
         return infos

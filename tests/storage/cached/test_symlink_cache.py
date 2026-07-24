@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator
+from pathlib import PurePosixPath
 from typing import cast
 from unittest.mock import AsyncMock
 
@@ -92,9 +93,9 @@ async def test_walk_delegates_and_preserves_snapshot_identity_and_order(monkeypa
             FileInfo(path="/root/a-file", name="a-file", kind=EntryKind.FILE, size=1),
         ),
     )
-    calls: list[str] = []
+    calls: list[object] = []
 
-    async def walk(path: str) -> AsyncGenerator[WalkEntry]:
+    async def walk(path: object) -> AsyncGenerator[WalkEntry]:
         calls.append(path)
         yield snapshot
 
@@ -102,7 +103,8 @@ async def test_walk_delegates_and_preserves_snapshot_identity_and_order(monkeypa
 
     results = [entry async for entry in cached.walk("root")]
 
-    assert calls == ["root"]
+    # CachedStorage normalizes caller paths before delegating (public path contract).
+    assert calls == [PurePosixPath("/root")]
     assert results == [snapshot]
     assert results[0] is snapshot
     assert results[0].entries is snapshot.entries

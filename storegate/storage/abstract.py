@@ -1,6 +1,7 @@
 import contextlib
 import errno
 import functools
+import hashlib
 import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
@@ -56,6 +57,13 @@ class StorageCapabilities:
     symlink_metadata: bool = False
     readlink: bool = False
     symlink_create: bool = False
+    compare_exchange: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class VersionedBytes:
+    data: bytes
+    token: str
 
 
 _UNSUPPORTED_ERRNO = getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)
@@ -74,13 +82,60 @@ type PathLike = str | PurePath
 type LifecycleImplementation = Callable[["AbstractStorage"], Awaitable[None]]
 
 
-def make_cache_identity(kind: str, **fields: object) -> str:
-    """Build a canonical, non-secret identity for a persistent cache scope.
+def make_namespace_identity(kind: str, **fields: object) -> str:
+    """Build a secret-free, stable namespace identity.
 
     Callers must whitelist only fields that identify the underlying data
-    location.  Credentials and runtime-only settings must not be included.
+    location. Credentials and runtime-only settings must not be included.
     """
-    return json.dumps({"kind": kind, **fields}, separators=(",", ":"), sort_keys=True)
+    payload = json.dumps({"kind": kind, **fields}, separators=(",", ":"), sort_keys=True)
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    return f"{kind}:sha256:{digest}"
+
+
+def validate_download_offset(offset: int) -> int:
+    """Reject negative download offsets while accepting zero and positive values."""
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    return offset
+
+
+def validate_same_path_file_operation(
+    src: PurePosixPath,
+    dst: PurePosixPath,
+    *,
+    source_kind: EntryKind | None,
+    overwrite: bool,
+) -> bool:
+    """Validate a same-path file copy or move and report a completed no-op."""
+    if src != dst:
+        return False
+    if source_kind is None:
+        raise FileNotFoundError(f"Source not found: {src}")
+    if source_kind is EntryKind.DIRECTORY:
+        raise IsADirectoryError(f"Is a directory: {src}")
+    if not overwrite:
+        raise FileExistsError(f"Destination already exists: {dst}")
+    return True
+
+
+def validate_same_path_tree_operation(
+    src: PurePosixPath,
+    dst: PurePosixPath,
+    *,
+    source_kind: EntryKind | None,
+    overwrite: bool,
+) -> bool:
+    """Validate a same-path tree copy or move and report a completed no-op."""
+    if src != dst:
+        return False
+    if source_kind is None:
+        raise FileNotFoundError(f"Source not found: {src}")
+    if source_kind is not EntryKind.DIRECTORY:
+        raise NotADirectoryError(f"Not a directory: {src}")
+    if not overwrite:
+        raise FileExistsError(f"Destination already exists: {dst}")
+    return True
 
 
 _LIFECYCLE_WRAPPED_ATTRIBUTE = "__storegate_lifecycle_wrapped__"
@@ -136,16 +191,19 @@ class AbstractStorage(ABC):
 
     @functools.cached_property
     def log(self) -> LoggerWrapper:
-        return logger_wrapper(f"{self.__class__.__name__} <c><i>{escape_tag(self.id)}</></>")
+        return logger_wrapper(f"{self.__class__.__name__} <c><i>{escape_tag(self.display_id)}</></>")
 
     @property
     @abstractmethod
-    def id(self) -> str:
+    def display_id(self) -> str:
+        """Human-readable, secret-free identity for logs and error messages."""
         raise NotImplementedError
 
     @property
-    def cache_identity(self) -> str | None:
-        return None
+    @abstractmethod
+    def namespace_identity(self) -> str:
+        """Stable secret-free identity for persistent namespaces and locks."""
+        raise NotImplementedError
 
     @property
     def capabilities(self) -> StorageCapabilities:
@@ -158,7 +216,19 @@ class AbstractStorage(ABC):
 
     @staticmethod
     def normalize_path(path: PathLike) -> PurePosixPath:
-        return "/" / PurePosixPath(path)
+        """Normalize a caller-supplied logical path to an absolute POSIX path.
+
+        Rejects NUL bytes and independent ``..`` segments before constructing
+        the absolute path. ``.`` and repeated ``/`` are normalized; ordinary
+        dots in filenames such as ``a..b`` or ``.hidden`` are preserved.
+        """
+        raw = PurePosixPath(path)
+        raw_text = raw.as_posix()
+        if "\x00" in raw_text:
+            raise ValueError("path must not contain NUL")
+        if ".." in raw.parts:
+            raise ValueError("path must not contain '..' segments")
+        return "/" / raw
 
     @abstractmethod
     async def connect(self) -> None:
@@ -353,7 +423,7 @@ class AbstractStorage(ABC):
         *,
         overwrite: bool = True,
     ) -> None:
-        """Upload bytes."""
+        remote_path = self.normalize_path(remote_path)
         buf = memoryview(data).toreadonly()
 
         async def aiterable() -> AsyncIterable[memoryview[int]]:
@@ -372,8 +442,7 @@ class AbstractStorage(ABC):
         *,
         overwrite: bool = True,
     ) -> None:
-        """Upload a local file."""
-
+        remote_path = self.normalize_path(remote_path)
         async with contextlib.aclosing(open_file_rb(Path(local_path))) as stream:
             await self.upload_stream(stream, remote_path, overwrite=overwrite)
 
@@ -410,6 +479,7 @@ class AbstractStorage(ABC):
         remote_path: PathLike,
     ) -> bytes:
         """Download as bytes."""
+        remote_path = self.normalize_path(remote_path)
         buffer = bytearray()
         async for chunk in self.download_stream(remote_path):
             buffer.extend(chunk)
@@ -421,9 +491,49 @@ class AbstractStorage(ABC):
         local_path: PathLike,
     ) -> None:
         """Download to a local file."""
+        remote_path = self.normalize_path(remote_path)
         async with open_file_wb(Path(local_path)) as write:
             async for chunk in self.download_stream(remote_path):
                 await write(chunk)
+
+    # ------------------------------------------------------------------
+    # Versioned compare-exchange
+    # ------------------------------------------------------------------
+
+    async def read_versioned(self, path: PathLike) -> VersionedBytes | None:
+        """Read file bytes with an opaque version token.
+
+        Backends without compare-exchange support raise
+        :class:`UnsupportedOperationError`.
+        """
+        self.normalize_path(path)
+        raise UnsupportedOperationError(
+            _UNSUPPORTED_ERRNO,
+            f"compare-exchange is not supported by {type(self).__name__}",
+        )
+
+    async def compare_exchange(
+        self,
+        path: PathLike,
+        *,
+        expected_token: str | None,
+        data: BytesLike,
+    ) -> VersionedBytes | None:
+        """Atomically create or replace *path* when *expected_token* matches.
+
+        ``expected_token=None`` means create-if-absent. A non-``None`` token
+        replaces only when the current version matches exactly. Success returns
+        the new value and token; conflict or absence returns ``None``.
+
+        Backends without compare-exchange support raise
+        :class:`UnsupportedOperationError`.
+        """
+        self.normalize_path(path)
+        del expected_token, data
+        raise UnsupportedOperationError(
+            _UNSUPPORTED_ERRNO,
+            f"compare-exchange is not supported by {type(self).__name__}",
+        )
 
     # ------------------------------------------------------------------
     # File operations
@@ -462,6 +572,7 @@ class AbstractStorage(ABC):
         :class:`FileNotFoundError`; non-empty directories raise :class:`OSError`
         without removing the directory.
         """
+        path = self.normalize_path(path)
         info = await self.lstat(path)
         if info.is_dir:
             await self.rmdir(path)
@@ -474,7 +585,8 @@ class AbstractStorage(ABC):
         The operation is fail-fast for every error other than
         :class:`FileNotFoundError`; paths before the failing path stay deleted.
         """
-        for path in paths:
+        normalized = tuple(self.normalize_path(path) for path in paths)
+        for path in normalized:
             try:
                 await self.delete(path)
             except FileNotFoundError:
@@ -653,7 +765,7 @@ class AbstractStorage(ABC):
         :class:`UnsupportedOperationError` with the platform unsupported errno
         when the backend lacks this primitive.
         """
-        del path
+        self.normalize_path(path)
         raise UnsupportedOperationError(_UNSUPPORTED_ERRNO, "readlink is not supported")
 
     async def symlink(
@@ -678,7 +790,8 @@ class AbstractStorage(ABC):
         platform unsupported errno. A failed non-idempotent create request must
         not be replayed after a connection failure.
         """
-        del target, link_path, target_is_directory, overwrite
+        self.normalize_path(link_path)
+        del target, target_is_directory, overwrite
         raise UnsupportedOperationError(_UNSUPPORTED_ERRNO, "symlink is not supported")
 
     # ------------------------------------------------------------------
@@ -687,6 +800,7 @@ class AbstractStorage(ABC):
 
     async def list_(self, path: PathLike) -> list[FileInfo]:
         """List directory."""
+        path = self.normalize_path(path)
         return [item async for item in self.iterdir(path)]
 
     @abstractmethod

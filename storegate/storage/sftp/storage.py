@@ -24,7 +24,10 @@ from storegate.storage.abstract import (
     StorageCapabilities,
     UnsupportedOperationError,
     WalkEntry,
-    make_cache_identity,
+    make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
 )
 from storegate.utils import coalesce_chunks
 
@@ -120,15 +123,15 @@ class SFTPStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         config = self._config
         return f"sftp:{config.username}@{config.host}:{config.port}{config.root_prefix}"
 
     @property
     @override
-    def cache_identity(self) -> str:
+    def namespace_identity(self) -> str:
         config = self._config
-        return make_cache_identity(
+        return make_namespace_identity(
             "sftp",
             host=config.host,
             port=config.port,
@@ -142,12 +145,7 @@ class SFTPStorage(AbstractStorage):
         return _CAPABILITIES
 
     def _logical_path(self, path: PathLike) -> PurePosixPath:
-        raw = PurePosixPath(path)
-        if "\x00" in raw.as_posix():
-            raise ValueError("SFTP path must not contain NUL")
-        if ".." in raw.parts:
-            raise ValueError("SFTP path must not contain '..' segments")
-        return self.normalize_path(raw)
+        return self.normalize_path(path)
 
     def _remote_path(self, path: PathLike) -> str:
         logical = self._logical_path(path)
@@ -429,6 +427,13 @@ class SFTPStorage(AbstractStorage):
         target = await self._io(client.readlink(remote.as_posix()))
         if not isinstance(target, str) or "\x00" in target:
             raise OSError(errno.EINVAL, f"SFTP server returned an invalid symlink target for {remote.as_posix()}")
+        # Windows OpenSSH / asyncssh fixtures may return native separators or
+        # drive-letter forms. Preserve relative POSIX identity for relative
+        # targets and normalize absolute ones to POSIX separators.
+        if "\\" in target:
+            target = target.replace("\\", "/")
+        if target.startswith(("//?/", "//./")):
+            target = target[4:]
         return target
 
     def _link_target_path(self, link_remote: PurePosixPath, raw_target: str) -> PurePosixPath:
@@ -502,29 +507,34 @@ class SFTPStorage(AbstractStorage):
 
     @override
     async def lstat(self, path: PathLike) -> FileInfo:
+        logical = self._logical_path(path)
         async with self._client_lease(f"Failed to lstat {path}") as lease:
-            return await self._lstat_info(lease.client, path)
+            return await self._lstat_info(lease.client, logical)
 
     @override
     async def stat(self, path: PathLike) -> FileInfo:
+        logical = self._logical_path(path)
         async with self._client_lease(f"Failed to stat {path}") as lease:
-            return await self._stat_info(lease.client, path)
+            return await self._stat_info(lease.client, logical)
 
     @override
     async def exists(self, path: PathLike) -> bool:
+        logical = self._logical_path(path)
         async with self._client_lease(f"Failed to check existence of {path}") as lease:
-            return await self._stat_or_none(lease.client, self._logical_path(path)) is not None
+            return await self._stat_or_none(lease.client, logical) is not None
 
     @override
     async def is_file(self, path: PathLike) -> bool:
+        logical = self._logical_path(path)
         async with self._client_lease(f"Failed to check whether {path} is a file") as lease:
-            info = await self._stat_or_none(lease.client, self._logical_path(path))
+            info = await self._stat_or_none(lease.client, logical)
             return info is not None and info.is_file
 
     @override
     async def is_dir(self, path: PathLike) -> bool:
+        logical = self._logical_path(path)
         async with self._client_lease(f"Failed to check whether {path} is a directory") as lease:
-            info = await self._stat_or_none(lease.client, self._logical_path(path))
+            info = await self._stat_or_none(lease.client, logical)
             return info is not None and info.is_dir
 
     @override
@@ -680,8 +690,9 @@ class SFTPStorage(AbstractStorage):
 
     @override
     async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:
+        logical = self._logical_path(path)
         async with self._client_lease(f"Failed to walk directory {path}") as lease:
-            snapshot = await self._walk_snapshot(lease.client, path)
+            snapshot = await self._walk_snapshot(lease.client, logical)
         for entry in snapshot:
             yield entry
 
@@ -840,8 +851,7 @@ class SFTPStorage(AbstractStorage):
 
     @override
     async def download_stream(self, remote_path: PathLike, *, offset: int = 0) -> AsyncGenerator[bytes]:
-        if offset < 0:
-            raise ValueError("offset must not be negative")
+        offset = validate_download_offset(offset)
         logical = self._logical_path(remote_path)
         async with self._client_lease(f"Failed to download {remote_path}") as lease:
             client = lease.client
@@ -992,19 +1002,20 @@ class SFTPStorage(AbstractStorage):
         source = self._logical_path(src)
         destination = self._logical_path(dst)
         self.log.info(f"Copy: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
-        if source == _ROOT:
-            raise IsADirectoryError("Cannot copy root directory as a file")
         async with self._client_lease(f"Failed to copy {src} to {dst}") as lease:
             client = lease.client
             source_info = await self._lstat_or_none(client, source)
             if source_info is None:
                 raise FileNotFoundError(f"Source does not exist: {source.as_posix()}")
+            if validate_same_path_file_operation(
+                source,
+                destination,
+                source_kind=source_info.kind,
+                overwrite=overwrite,
+            ):
+                return
             if source_info.is_dir:
                 raise IsADirectoryError(f"Source is a directory: {source.as_posix()}")
-            if source == destination:
-                if overwrite:
-                    return
-                raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
             destination_info = await self._lstat_or_none(client, destination)
             if destination_info is not None:
                 if destination_info.is_dir:
@@ -1030,19 +1041,20 @@ class SFTPStorage(AbstractStorage):
         source = self._logical_path(src)
         destination = self._logical_path(dst)
         self.log.info(f"Move: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
-        if source == _ROOT:
-            raise IsADirectoryError("Cannot move root directory as a file")
         async with self._client_lease(f"Failed to move {src} to {dst}") as lease:
             client = lease.client
             source_info = await self._lstat_or_none(client, source)
             if source_info is None:
                 raise FileNotFoundError(f"Source does not exist: {source.as_posix()}")
+            if validate_same_path_file_operation(
+                source,
+                destination,
+                source_kind=source_info.kind,
+                overwrite=overwrite,
+            ):
+                return
             if source_info.is_dir:
                 raise IsADirectoryError(f"Source is a directory: {source.as_posix()}")
-            if source == destination:
-                if overwrite:
-                    return
-                raise FileExistsError(f"Destination already exists: {destination.as_posix()}")
             destination_info = await self._lstat_or_none(client, destination)
             if destination_info is not None:
                 if destination_info.is_dir:
@@ -1168,10 +1180,18 @@ class SFTPStorage(AbstractStorage):
         defer_cleanup: bool = False,
     ) -> _TreeJournal:
         source_info = await self._lstat_or_none(client, source)
-        if source_info is None or not source_info.is_dir:
+        source_kind = source_info.kind if source_info is not None else None
+        if validate_same_path_tree_operation(
+            source,
+            destination,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return _TreeJournal()
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {source.as_posix()}")
+        if source_kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {source.as_posix()}")
-        if source == destination:
-            raise FileExistsError(f"Source and destination are the same: {source.as_posix()}")
         if self._is_descendant(destination, source):
             raise ValueError("Destination must not be inside the source tree")
         snapshot = await self._strict_snapshot(client, source)
@@ -1247,17 +1267,25 @@ class SFTPStorage(AbstractStorage):
         source = self._logical_path(src)
         destination = self._logical_path(dst)
         self.log.info(f"MoveTree: <y>{escape_tag(source.as_posix())}</y> → <y>{escape_tag(destination.as_posix())}</y>")
-        if source == _ROOT:
-            raise OSError("Cannot move root directory")
-        if source == destination:
-            return
-        if self._is_descendant(destination, source):
-            raise ValueError("Destination must not be inside the source tree")
         async with self._client_lease(f"Failed to move tree {src} to {dst}") as lease:
             client = lease.client
             source_info = await self._lstat_or_none(client, source)
-            if source_info is None or not source_info.is_dir:
+            source_kind = source_info.kind if source_info is not None else None
+            if validate_same_path_tree_operation(
+                source,
+                destination,
+                source_kind=source_kind,
+                overwrite=overwrite,
+            ):
+                return
+            if source_kind is None:
+                raise FileNotFoundError(f"Source not found: {source.as_posix()}")
+            if source_kind is not EntryKind.DIRECTORY:
                 raise NotADirectoryError(f"Not a directory: {source.as_posix()}")
+            if source == _ROOT:
+                raise OSError("Cannot move root directory")
+            if self._is_descendant(destination, source):
+                raise ValueError("Destination must not be inside the source tree")
             await self._strict_snapshot(client, source)
             destination_info = await self._lstat_or_none(client, destination)
             if destination_info is None:

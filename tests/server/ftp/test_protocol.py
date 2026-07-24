@@ -8,6 +8,7 @@ import pytest
 from storegate.server.ftp.handle import ReadHandle, WriteHandle
 from storegate.server.ftp.pathio import _file_info_to_stat
 from storegate.storage import AbstractStorage, EntryKind, FileInfo
+from tests.server.ftp.conftest import ProtocolStorage
 
 pytestmark = pytest.mark.integration
 
@@ -296,3 +297,71 @@ async def test_handles_recheck_symlink_kind_before_backend_stream_access(
     write_handle = WriteHandle(storage, PurePosixPath("/file-link"))
     with pytest.raises(FileNotFoundError, match="File unavailable"):
         await write_handle.close()
+
+
+async def test_readonly_stor_rejected_without_modifying_file(
+    ftp_readonly_server: tuple[str, int, ProtocolStorage],
+) -> None:
+    host, port, storage = ftp_readonly_server
+    async with aioftp.Client.context(host, port) as client:
+        code, _ = await client.command("STOR /unwanted.txt", expected_codes="550")
+        assert str(code) == "550"
+        assert "/unwanted.txt" not in storage.files
+
+
+async def test_readonly_dele_rejected_without_modifying_file(
+    ftp_readonly_server: tuple[str, int, ProtocolStorage],
+) -> None:
+    host, port, storage = ftp_readonly_server
+    async with aioftp.Client.context(host, port) as client:
+        code, _ = await client.command("DELE /readonly-test.txt", expected_codes="550")
+        assert str(code) == "550"
+        assert storage.files["/readonly-test.txt"] == b"readonly content"
+
+
+async def test_readonly_mkd_rejected_without_creating_directory(
+    ftp_readonly_server: tuple[str, int, ProtocolStorage],
+) -> None:
+    host, port, storage = ftp_readonly_server
+    async with aioftp.Client.context(host, port) as client:
+        code, _ = await client.command("MKD /newdir", expected_codes="550")
+        assert str(code) == "550"
+        assert "/newdir" not in storage.directories
+
+
+async def test_readonly_rmd_rejected_without_deleting_directory(
+    ftp_readonly_server: tuple[str, int, ProtocolStorage],
+) -> None:
+    host, port, storage = ftp_readonly_server
+    async with aioftp.Client.context(host, port) as client:
+        code, _ = await client.command("RMD /target-dir", expected_codes="550")
+        assert str(code) == "550"
+        assert "/target-dir" in storage.directories
+        assert "/target-dir/sentinel.txt" in storage.files
+
+
+async def test_readonly_rnfr_rejected_without_allowing_rename(
+    ftp_readonly_server: tuple[str, int, ProtocolStorage],
+) -> None:
+    host, port, _storage = ftp_readonly_server
+    async with aioftp.Client.context(host, port) as client:
+        code, _ = await client.command("RNFR /readonly-test.txt", expected_codes="550")
+        assert str(code) == "550"
+
+
+async def test_readonly_rename_is_blocked_at_rnfr(
+    ftp_readonly_server: tuple[str, int, ProtocolStorage],
+) -> None:
+    host, port, storage = ftp_readonly_server
+    async with aioftp.Client.context(host, port) as client:
+        code, _ = await client.command("RNFR /readonly-test.txt", expected_codes="550")
+        assert str(code) == "550"
+        assert storage.files["/readonly-test.txt"] == b"readonly content"
+        assert "/renamed.txt" not in storage.files
+
+
+async def test_readonly_retr_still_works(ftp_readonly_server: tuple[str, int, ProtocolStorage]) -> None:
+    host, port, _storage = ftp_readonly_server
+    async with aioftp.Client.context(host, port) as client:
+        content = await _download(client, "/readonly-test.txt")
+        assert content == b"readonly content"

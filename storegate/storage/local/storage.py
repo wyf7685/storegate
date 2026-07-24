@@ -26,7 +26,10 @@ from storegate.storage.abstract import (
     StorageCapabilities,
     UnsupportedOperationError,
     WalkEntry,
-    make_cache_identity,
+    make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
 )
 
 _LOCAL_CAPABILITIES = StorageCapabilities(symlink_metadata=True, readlink=True, symlink_create=True)
@@ -115,13 +118,13 @@ class LocalStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         return f"local:{self._root.as_posix()}"
 
     @property
     @override
-    def cache_identity(self) -> str:
-        return make_cache_identity("local", root=self._root.as_posix())
+    def namespace_identity(self) -> str:
+        return make_namespace_identity("local", root=self._root.as_posix())
 
     @property
     @override
@@ -146,14 +149,9 @@ class LocalStorage(AbstractStorage):
 
     def _logical_path(self, path: PathLike) -> PurePosixPath:
         raw = os.fspath(path)
-        if "\0" in raw:
-            raise ValueError("Path contains a NUL byte")
-        supplied = PurePosixPath(raw)
-        if ".." in supplied.parts:
-            raise ValueError(f"Path traversal detected: {path!r}")
         if os.name == "nt" and "\\" in raw:
             raise ValueError(f"Local paths must use POSIX separators: {path!r}")
-        return self.normalize_path(supplied)
+        return self.normalize_path(raw)
 
     def _lexical_path(self, path: PathLike) -> tuple[PurePosixPath, Path]:
         logical = self._logical_path(path)
@@ -246,6 +244,17 @@ class LocalStorage(AbstractStorage):
                 raw_target = raw_target[4:]
         return Path(raw_target)
 
+    @staticmethod
+    def _normalize_readlink_target(raw_target: str) -> str:
+        """Return a stable OS-native symlink target without extended-path noise."""
+        if os.name != "nt":
+            return raw_target
+        if raw_target.startswith("\\\\?\\UNC\\"):
+            return f"\\\\{raw_target[8:]}"
+        if raw_target.startswith("\\\\?\\"):
+            return raw_target[4:]
+        return raw_target
+
     def _follow(self, path: PathLike) -> tuple[PurePosixPath, Path, os.stat_result, EntryKind]:
         logical, candidate = self._lexical_path(path)
         self._validate_intermediate_components(logical)
@@ -284,12 +293,28 @@ class LocalStorage(AbstractStorage):
             return logical, current, final_result, self._public_kind(current, final_result)
 
     @staticmethod
-    def _file_info(logical: PurePosixPath, result: os.stat_result, kind: EntryKind) -> FileInfo:
+    def _file_info(
+        logical: PurePosixPath,
+        result: os.stat_result,
+        kind: EntryKind,
+        local: Path | None = None,
+    ) -> FileInfo:
+        if kind is EntryKind.DIRECTORY:
+            size = 0
+        elif kind is EntryKind.SYMLINK and os.name == "nt" and result.st_size == 0 and local is not None:
+            # Windows often reports st_size=0 for reparse points; surface the raw
+            # target length so symlink metadata remains useful for callers.
+            try:
+                size = len(LocalStorage._normalize_readlink_target(os.readlink(local)))  # noqa: PTH115
+            except OSError:
+                size = 0
+        else:
+            size = result.st_size
         return FileInfo(
             path=logical.as_posix(),
             name=logical.name,
             kind=kind,
-            size=0 if kind is EntryKind.DIRECTORY else result.st_size,
+            size=size,
             modified=datetime.fromtimestamp(result.st_mtime).astimezone(),
             created=datetime.fromtimestamp(result.st_ctime).astimezone(),
         )
@@ -361,8 +386,7 @@ class LocalStorage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
-        if offset < 0:
-            raise ValueError("offset must be non-negative")
+        offset = validate_download_offset(offset)
         _logical, target, _result, kind = await anyio.to_thread.run_sync(self._follow, remote_path)
         if kind is not EntryKind.FILE:
             raise FileNotFoundError(f"File not found: {remote_path}")
@@ -423,11 +447,22 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(self._lexical_lstat, src)
+        src_logical = self._logical_path(src)
+        dst_logical = self._logical_path(dst)
+        _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(
+            self._lexical_lstat, src_logical
+        )
+        if validate_same_path_file_operation(
+            src_logical,
+            dst_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
         if source_kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {src}")
 
-        dst_logical, destination = self._lexical_path(dst)
+        _dst_logical, destination = self._lexical_path(dst_logical)
         await anyio.to_thread.run_sync(
             functools.partial(self._ensure_parent_directory, dst_logical, destination, create=True)
         )
@@ -440,13 +475,8 @@ class LocalStorage(AbstractStorage):
             if destination_kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Destination is a directory: {dst}")
 
-        if source == destination:
-            if not overwrite:
-                raise FileExistsError(f"Destination already exists: {dst}")
-            return
         if destination_kind is not None and not overwrite:
             raise FileExistsError(f"Destination already exists: {dst}")
-
         rename = os.replace if overwrite else os.rename
         try:
             await anyio.to_thread.run_sync(rename, source, destination)
@@ -466,11 +496,22 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(self._lexical_lstat, src)
+        src_logical = self._logical_path(src)
+        dst_logical = self._logical_path(dst)
+        _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(
+            self._lexical_lstat, src_logical
+        )
+        if validate_same_path_file_operation(
+            src_logical,
+            dst_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
         if source_kind is EntryKind.DIRECTORY:
             raise IsADirectoryError(f"Is a directory: {src}")
 
-        dst_logical, destination = self._lexical_path(dst)
+        _dst_logical, destination = self._lexical_path(dst_logical)
         await anyio.to_thread.run_sync(
             functools.partial(self._ensure_parent_directory, dst_logical, destination, create=True)
         )
@@ -483,10 +524,6 @@ class LocalStorage(AbstractStorage):
             if destination_kind is EntryKind.DIRECTORY:
                 raise IsADirectoryError(f"Destination is a directory: {dst}")
 
-        if source == destination:
-            if not overwrite:
-                raise FileExistsError(f"Destination already exists: {dst}")
-            return
         if destination_kind is not None and not overwrite:
             raise FileExistsError(f"Destination already exists: {dst}")
         await anyio.to_thread.run_sync(
@@ -504,7 +541,11 @@ class LocalStorage(AbstractStorage):
         _logical, target, _result, kind = await anyio.to_thread.run_sync(self._lexical_lstat, path)
         if kind is not EntryKind.SYMLINK:
             raise OSError(errno.EINVAL, f"Not a symlink: {path}")
-        return await anyio.to_thread.run_sync(os.readlink, target)
+
+        def _read() -> str:
+            return LocalStorage._normalize_readlink_target(os.readlink(target))  # noqa: PTH115
+
+        return await anyio.to_thread.run_sync(_read)
 
     @staticmethod
     def _validate_symlink_target(target: PathLike) -> str:
@@ -619,7 +660,7 @@ class LocalStorage(AbstractStorage):
 
     @staticmethod
     def _paths_overlap(source: Path, destination: Path) -> bool:
-        return source == destination or source.is_relative_to(destination) or destination.is_relative_to(source)
+        return source != destination and (source.is_relative_to(destination) or destination.is_relative_to(source))
 
     @override
     async def rmtree(self, path: PathLike) -> None:
@@ -751,10 +792,27 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _src_logical, source, _source_result, _source_kind = await anyio.to_thread.run_sync(
-            self._lexical_directory, src
-        )
-        dst_logical, destination = self._lexical_path(dst)
+        src_logical = self._logical_path(src)
+        dst_logical = self._logical_path(dst)
+        _src_logical, source = self._lexical_path(src_logical)
+        try:
+            _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(
+                self._lexical_lstat, src_logical
+            )
+        except FileNotFoundError:
+            source_kind = None
+        if validate_same_path_tree_operation(
+            src_logical,
+            dst_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src_logical}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {src_logical}")
+        _dst_logical, destination = self._lexical_path(dst_logical)
         await anyio.to_thread.run_sync(self._validate_intermediate_components, dst_logical)
         if self._paths_overlap(source, destination):
             raise ValueError("Source and destination trees must not overlap")
@@ -771,15 +829,28 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        _src_logical, source, _source_result, _source_kind = await anyio.to_thread.run_sync(
-            self._lexical_directory, src
-        )
-        dst_logical, destination = self._lexical_path(dst)
-        await anyio.to_thread.run_sync(self._validate_intermediate_components, dst_logical)
-        if source == destination:
-            if not overwrite:
-                raise FileExistsError(f"Destination already exists: {dst}")
+        src_logical = self._logical_path(src)
+        dst_logical = self._logical_path(dst)
+        _src_logical, source = self._lexical_path(src_logical)
+        try:
+            _src_logical, source, _source_result, source_kind = await anyio.to_thread.run_sync(
+                self._lexical_lstat, src_logical
+            )
+        except FileNotFoundError:
+            source_kind = None
+        if validate_same_path_tree_operation(
+            src_logical,
+            dst_logical,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src_logical}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {src_logical}")
+        _dst_logical, destination = self._lexical_path(dst_logical)
+        await anyio.to_thread.run_sync(self._validate_intermediate_components, dst_logical)
         if self._paths_overlap(source, destination):
             raise ValueError("Source and destination trees must not overlap")
 
@@ -824,13 +895,13 @@ class LocalStorage(AbstractStorage):
 
     @override
     async def stat(self, path: PathLike) -> FileInfo:
-        logical, _target, result, kind = await anyio.to_thread.run_sync(self._follow, path)
-        return self._file_info(logical, result, kind)
+        logical, target, result, kind = await anyio.to_thread.run_sync(self._follow, path)
+        return self._file_info(logical, result, kind, target)
 
     @override
     async def lstat(self, path: PathLike) -> FileInfo:
-        logical, _target, result, kind = await anyio.to_thread.run_sync(self._lexical_lstat, path)
-        return self._file_info(logical, result, kind)
+        logical, target, result, kind = await anyio.to_thread.run_sync(self._lexical_lstat, path)
+        return self._file_info(logical, result, kind, target)
 
     def _discovery_snapshot(self, logical: PurePosixPath, target: Path) -> tuple[FileInfo, ...]:
         result = os.lstat(target)
@@ -847,7 +918,7 @@ class LocalStorage(AbstractStorage):
                 self.log.debug(f"Skipping unsupported local entry <y>{child}</>")
                 continue
             kind = EntryKind(raw_kind.value)
-            infos.append(self._file_info(logical / entry.name, child_result, kind))
+            infos.append(self._file_info(logical / entry.name, child_result, kind, child))
         return tuple(sorted(infos, key=lambda info: info.path))
 
     @override

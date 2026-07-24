@@ -13,9 +13,11 @@
 
 </div>
 
-Storegate 是一个异步、多后端文件存储服务。项目以 `AbstractStorage` 作为统一接口，可直接操作内存、本地文件系统、S3、WebDAV、FTP 和 SFTP，也可以叠加缓存与分块索引层；同一套存储实现还能通过 WebDAV 或 FTP 协议对外提供服务。
+Storegate 是一个异步、多后端文件存储与协议网关。项目以 `AbstractStorage` 作为统一接口，可直接操作内存、本地文件系统、S3、WebDAV、FTP 和 SFTP，也可以叠加缓存与分块索引层；同一套存储实现还能通过 WebDAV 或 FTP 协议对外提供服务。
 
-> 当前版本：`0.1.0`。项目仍处于开发阶段，接口与配置格式可能调整。
+> 当前版本：`0.1.0`。项目仍处于开发阶段，**公共库接口与配置格式均不承诺稳定**，可能在不提前通知的情况下调整。请勿将本版本当作 Production/Stable API。
+
+License: [Apache-2.0](LICENSE). Copyright 2026 wyf7685.
 
 ## 主要能力
 
@@ -25,7 +27,8 @@ Storegate 是一个异步、多后端文件存储服务。项目以 `AbstractSto
   - `CachedStorage`：缓存元数据、目录列表和小文件下载，支持内存与 Redis 缓存。
   - `IndexStorage`：将大文件切分为内容寻址分块，支持 SHA-256 去重和引用计数。
 - 双协议服务端：将任意 `AbstractStorage` 暴露为 WebDAV 或 FTP 服务。
-- JSON 对象工厂：通过嵌套配置组合存储和服务，无需在代码中手动组装对象图。
+- JSON 对象工厂：通过嵌套配置组合存储和服务；默认 SAFE 模式仅允许官方 registry。
+- 正式 CLI：`storegate serve` / `storegate check`（也支持 `python -m storegate`）。
 - 异步 I/O：基于 AnyIO、HTTPX（可选 [httpx2](https://github.com/pydantic/httpx2)）、aioftp、AsyncSSH、Uvicorn 和 WsgiDAV。
 
 ## 架构概览
@@ -108,7 +111,61 @@ pip install "storegate[full]"         # standard + ayafileio + httpx2 + uvloop/w
 
 HTTP 代码统一通过 `from storegate.utils import httpx` 导入。CI 对 `pytest -m httpx` 子集分别在默认 `httpx` 与 `uv sync --extra httpx2` 环境下验证两条路径。
 
-## 快速开始
+## 运维入口：CLI（推荐）
+
+正式运维入口是 console script 与模块入口：
+
+```bash
+storegate serve <config.json>
+storegate check <config.json>
+python -m storegate serve <config.json>
+python -m storegate check <config.json>
+```
+
+公共选项：
+
+| 选项 | 说明 |
+| --- | --- |
+| `--trusted-factory` | 切换到 TRUSTED factory（允许非官方模块路径）。默认 SAFE。 |
+| `--log-level LEVEL` | 日志级别，默认 `INFO`。 |
+| `--log-file PATH` | 可选文件 sink；**默认不写日志文件**。 |
+
+`serve` 根据 JSON 配置启动协议服务，并遵守服务端的 loopback / `allow_insecure_public` 约束。`check` 以 factory 解析 server 配置、连接 `server.storage`、调用 `ping()`，无论成功失败都会关闭 storage，**不启动长期监听**。
+
+### 退出码
+
+| 码 | 含义 |
+| --- | --- |
+| `0` | 成功 / 服务干净停止 |
+| `1` | 未预期运行时失败 |
+| `2` | CLI、JSON、Pydantic 或 SAFE factory 配置错误 |
+| `3` | 缺少 optional extra |
+| `4` | connect / ping 健康检查失败 |
+| `130` | CLI 边界的 KeyboardInterrupt / cancellation |
+
+### 最小可运行示例
+
+将 Memory 存储通过 WebDAV 暴露在 loopback：
+
+```json
+{
+  "$factory": "@dav",
+  "storage": {
+    "$factory": "~memory"
+  },
+  "host": "127.0.0.1",
+  "port": 8080
+}
+```
+
+```bash
+storegate check server.json
+storegate serve server.json
+```
+
+需要 FTP 服务时将 `$factory` 改为 `@ftp`（默认端口 `2121`）。非 loopback 绑定见下文安全说明。
+
+## 快速开始（库 API）
 
 ### 直接使用存储接口
 
@@ -143,7 +200,7 @@ storage = LocalStorage("./runtime/files")
 
 所有后端都支持异步上下文管理器。网络后端应在 `async with` 中使用，以确保连接被正确建立和关闭。
 
-### 启动 WebDAV 服务
+### 启动 WebDAV / FTP 服务（代码）
 
 ```python
 import anyio
@@ -164,10 +221,6 @@ async def main() -> None:
 anyio.run(main)
 ```
 
-启动后可使用支持 WebDAV 的文件管理器或客户端访问 `http://127.0.0.1:8080/`。
-
-### 启动 FTP 服务
-
 ```python
 import anyio
 
@@ -187,7 +240,7 @@ async def main() -> None:
 anyio.run(main)
 ```
 
-当前 FTP 服务端支持匿名访问，默认开发端口为 `2121`。
+运维场景优先使用 CLI；上述代码路径适合嵌入式集成。
 
 ## JSON 配置与对象工厂
 
@@ -198,6 +251,15 @@ Storegate 使用 `$factory` 描述要创建的对象：
 - `@name`：解析为 `storegate.server.name.Server`
 - `@name:ClassName`：解析为指定服务类
 - 包含 `$factory` 的嵌套对象会被递归创建
+
+### Factory 信任模式
+
+| 模式 | 行为 |
+| --- | --- |
+| **SAFE**（默认） | 仅允许官方 registry 中的 exact factory（含官方 storage / server / cache backend）；`~`/`@` alias 解析后仍必须命中 registry；拒绝任意未注册 `module:factory`；嵌套 `$factory` 最大深度 **16**（超出在 import/construct 前失败）。 |
+| **TRUSTED** | 允许非官方模块路径；必须通过 CLI `--trusted-factory` 或 API `mode=FactoryMode.TRUSTED` 显式开启。 |
+
+`resolve_storage()`、`resolve_storage_from_file()`、`resolve_server()`、`resolve_server_from_file()` 默认均为 SAFE。错误消息可以包含 factory 字符串，不会输出完整 spec 或凭据。
 
 例如，将本地存储包装为缓存存储，再通过 WebDAV 暴露：
 
@@ -218,14 +280,14 @@ Storegate 使用 `$factory` 描述要创建的对象：
 }
 ```
 
-加载配置：
+库 API 加载配置：
 
 ```python
 import anyio
 
 from storegate.server import resolve_server_from_file
 
-server = resolve_server_from_file("server.json")
+server = resolve_server_from_file("server.json")  # SAFE by default
 anyio.run(server.serve)
 ```
 
@@ -305,7 +367,7 @@ storage = S3Storage("s3.json")
 
 SFTP 默认执行 SSH host key 校验。测试或受控环境中只有显式设置 `disable_host_key_check=true` 才会关闭校验；生产配置应使用系统或指定的 `known_hosts` 文件。首版支持密码和显式私钥认证，不使用远程 shell、SCP、SSH agent、ProxyJump 或符号链接。
 
-### 分块索引存储
+### 分块索引存储与 `lock_mode`
 
 `IndexStorage` 需要两个不同的存储实例：`index` 保存文件元数据，`chunks` 保存去重后的内容分块。
 
@@ -321,11 +383,54 @@ SFTP 默认执行 SSH host key 校验。测试或受控环境中只有显式设�
     "root": "./runtime/chunks"
   },
   "block_size": 67108864,
-  "max_concurrent_uploads": 2
+  "max_concurrent_uploads": 2,
+  "lock_mode": "best_effort"
 }
 ```
 
-不要让 `index` 与 `chunks` 指向同一个存储实例。`skip_locking` 会关闭并发写保护，只应在能够确认不存在并发写入时使用。
+不要让 `index` 与 `chunks` 指向同一个存储实例。
+
+并发写保护由 **`lock_mode`** 控制（已移除旧的 `skip_locking`）：
+
+| 模式 | 含义 |
+| --- | --- |
+| `strong`（默认） | 基于真实 compare-exchange。**index 与 chunks 两端都必须声明 CAS 能力**；否则在 connect 阶段 fail-fast。Memory 与（带条件 PUT 的）S3 可走 strong；Local/DAV/FTP/SFTP 等若无证明的原子 CAS，不得使用 strong。 |
+| `best_effort` | 显式使用存储文件租约思路；**不保证跨进程互斥**，仅在外部已串行化或单进程场景使用。 |
+| `disabled` | 完全关闭 Index 锁；仅当外部已保证串行时使用。 |
+
+## 协议服务端安全边界
+
+FTP 与 WebDAV 服务端共享下列边界（构造期强制）：
+
+| 设置 | 默认 | 说明 |
+| --- | --- | --- |
+| `host` | `127.0.0.1` | loopback（`127.0.0.0/8`、`::1`、`localhost`）可直接启动 |
+| `allow_insecure_public` | `False` | 非 loopback 绑定匿名服务时必须显式 `True`，否则构造抛 `ValueError` |
+| `read_only` | `False` | `True` 时在协议层拒绝写路径，**在触碰 storage 变更前**失败 |
+
+协议默认行为：
+
+- **FTP**：普通（未加密）FTP；匿名访问。
+- **WebDAV**：匿名访问（无内建用户数据库）。
+
+`allow_insecure_public=True` 只表示部署者理解匿名/明文风险，**不等价于认证或 TLS**。Storegate **不**实现完整用户库、路径级 ACL 或代理身份信任。
+
+**反向代理 TLS / 认证在 Storegate 认证模型之外。** 若在公网暴露，应在前置反向代理或网络层终止 TLS 并实施认证与访问控制；Storegate 本身不消费代理身份头，也不将代理层认证映射为协议内用户。
+
+`read_only=True` 时：
+
+- FTP：拒绝 STOR、APPE、DELE、MKD、RMD、RNFR/RNTO 等修改命令；RETR/LIST/STAT 仍可用。
+- WebDAV：拒绝 PUT、DELETE、MKCOL、COPY、MOVE、PROPPATCH、LOCK/UNLOCK 等写路径；GET/HEAD/PROPFIND 仍可用。
+
+## 日志
+
+导入 `storegate` 或 `storegate.log`：
+
+- **不会** `logger.remove()` / `logger.add()` / `logger.configure()` / `dictConfig()`；
+- **不会**创建 `logs/` 目录或默认文件 sink；
+- **不会** 接管宿主进程已有的 Loguru / stdlib sinks。
+
+需要日志时请显式调用 `configure_logging(...)`，或使用 CLI 的 `--log-level` / `--log-file`。文件 sink 的 `diagnose` 默认为 `False`。直接构造 `FTPServer` / `DAVServer` 也不会自动接管全局日志。
 
 ## 公共存储接口
 
@@ -337,8 +442,9 @@ SFTP 默认执行 SSH host key 校验。测试或受控环境中只有显式设�
 - 文件操作：`copy()`、`move()`（均支持 `overwrite=True|False`）、`unlink()`、`delete()`、`delete_many()`
 - 目录操作：`mkdir()`、`rmdir()`、`rmtree()`、`copytree()`、`movetree()`
 - 查询与遍历：`exists()`、`is_file()`、`is_dir()`、`stat()`、`iterdir()`、`list_()`、`walk()`
+- 身份：`display_id`（可读、用于日志）、`namespace_identity`（完整无密钥命名空间身份，用于 binding / 缓存 / 锁 registry）
 
-路径会被统一规范化为 POSIX 风格的绝对逻辑路径。`unlink()` 对不存在文件严格抛出
+路径会被统一规范化为 POSIX 风格的绝对逻辑路径；独立 `..` segment 与 NUL 会被拒绝。`unlink()` 对不存在文件严格抛出
 `FileNotFoundError`（除非 `missing_ok=True`）；`rmdir()` 对不存在路径、文件和非空目录分别抛出
 `FileNotFoundError`、`NotADirectoryError` 和 `OSError`。`delete()` 对不存在路径抛出
 `FileNotFoundError`；`delete_many()` 按输入顺序 fail-fast，但跳过不存在路径。
@@ -363,6 +469,9 @@ uv run pytest -m integration
 # 仅运行 MemoryStorage 公共契约
 uv run pytest tests/contract/storage -k memory
 
+# 查看当前收集到的用例（不要依赖文档中的硬编码数量）
+uv run pytest --collect-only
+
 # Lint、格式化与类型检查
 uv run ruff check --fix
 uv run ruff format
@@ -372,12 +481,16 @@ uv run ty check
 uv run prek install
 ```
 
-测试以 `tests/contract/storage/` 中的公共契约为核心，同一组行为会针对多个后端参数化执行。DAV、FTP 与 SFTP 集成测试会在本地启动临时协议服务；外部 S3 测试需要单独提供凭据。
+测试以 `tests/contract/storage/` 中的公共契约为核心，同一组行为会针对多个后端参数化执行。DAV、FTP 与 SFTP 集成测试会在本地启动临时协议服务；外部 S3 测试需要单独提供凭据。收集数量会随用例增减变化，请用 `pytest --collect-only` 查看当前树，而不是依赖 README 中的固定数字。
 
 ## 目录结构
 
 ```text
 storegate/
+├── __main__.py           # python -m storegate
+├── cli.py                # storegate serve / check
+├── factory.py            # 高层 factory 导出
+├── py.typed              # PEP 561 标记
 ├── storage/
 │   ├── abstract.py       # AbstractStorage 与 FileInfo
 │   ├── factory.py        # 存储配置解析
@@ -392,7 +505,7 @@ storegate/
 ├── server/
 │   ├── dav/              # WebDAV 服务端
 │   └── ftp/              # FTP 服务端
-├── log.py                # Loguru 日志配置
+├── log.py                # 显式 Loguru 配置（import 无副作用）
 └── utils.py              # 对象工厂、异常翻译等通用工具
 
 tests/
@@ -404,10 +517,14 @@ tests/
 ```
 
 ## 安全说明与当前限制
+
 - S3、WebDAV、FTP 和 SFTP 通过适配层将服务端状态翻译为统一异常；服务端仍可能拒绝不支持的原子操作，此时保留为 `OSError`，不会改变 `overwrite` 或删除契约。
-- 当前 WebDAV 服务端允许匿名访问，FTP 服务端同样使用匿名用户；请仅绑定到可信网络或在前置代理/网络层增加认证与访问控制。
-- FTP 后端目前不支持加密传输；跨不可信网络应优先使用 WebDAV over HTTPS 或在受保护网络中部署。
+- FTP / WebDAV 服务端默认为 **loopback + 匿名**；非 loopback 必须 `allow_insecure_public=True`。只读模式见上文。
+- Storegate **没有**内建认证/TLS 终止；反向代理上的 TLS 与认证属于部署边界，不在 Storegate 认证模型内。
+- FTP 后端与服务端目前不支持加密传输；跨不可信网络应优先使用 WebDAV over HTTPS（前置代理）或在受保护网络中部署。
 - 配置文件可能包含 S3、WebDAV、FTP、SFTP 或 Redis 凭据。不要提交真实密钥；项目已忽略根目录下的 `data/`。
+- SAFE factory 默认拒绝任意模块路径；仅在完全信任配置来源时使用 `--trusted-factory` / `FactoryMode.TRUSTED`。
 - S3、WebDAV、FTP 和 SFTP 的复制、覆盖及目录删除语义可能受远端服务实现影响。接入新的服务端时应先运行对应契约和集成测试。
 - SFTP 的 `root_prefix` 和客户端 symlink 检查不是恶意远端或并发攻击者下的完整沙箱；租户隔离应由服务端 chroot/jail 保证。覆盖式 `movetree` 在 source tombstone 删除开始后无法提供文件系统事务级原子性。
-- `IndexStorage` 的索引与分块存储存在绑定关系；迁移或清理任一侧前应先确认引用数据的一致性。
+- `IndexStorage` 的索引与分块存储存在绑定关系；迁移或清理任一侧前应先确认引用数据的一致性。`lock_mode=strong` 需要两端 CAS 能力。
+- 导入包不会创建日志目录或接管宿主日志；需要可观测性时请显式配置。

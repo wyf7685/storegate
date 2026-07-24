@@ -1,8 +1,6 @@
 import contextlib
-import sys
 import traceback
 from contextlib import AbstractAsyncContextManager
-from copy import deepcopy
 from typing import final, override
 
 import anyio.lowlevel
@@ -11,37 +9,30 @@ from a2wsgi.asgi_typing import Receive, Scope, Send
 from a2wsgi.wsgi_typing import WSGIApp
 from wsgidav.wsgidav_app import WsgiDAVApp
 
-from storegate.log import LOGGING_CONFIG
 from storegate.storage import AbstractStorage
 
-from ..abstract import AbstractServer
+from ..abstract import AbstractServer, _is_loopback
 from .provider import StorageProvider
 from .utils import current_event_loop_token
 
 
-def create_wsgi_app(storage: AbstractStorage, host: str, port: int) -> WsgiDAVApp:
-    provider = StorageProvider(storage)
+def create_wsgi_app(
+    storage: AbstractStorage,
+    host: str,
+    port: int,
+    *,
+    read_only: bool = False,
+) -> WsgiDAVApp:
+    provider = StorageProvider(storage, read_only=read_only)
     config = {
         "host": host,
         "port": port,
         "provider_mapping": {"/": provider},
         "simple_dc": {"user_mapping": {"*": True}},
         "verbose": 3,
+        "logging": {"enable": False},
     }
     return WsgiDAVApp(config)
-
-
-def configure_logging() -> None:
-    import logging.config
-
-    config = deepcopy(LOGGING_CONFIG)
-    config["loggers"] = loggers = {}
-
-    for name in sys.modules:
-        if name.startswith("wsgidav"):
-            loggers[name] = {"handlers": ["default"], "level": "INFO", "propagate": False}
-
-    logging.config.dictConfig(config)
 
 
 class WSGIMiddlewareWithLifespan(WSGIMiddleware):
@@ -103,24 +94,33 @@ class DAVServer(AbstractServer):
         *,
         host: str = "127.0.0.1",
         port: int = 8080,
+        read_only: bool = False,
+        allow_insecure_public: bool = False,
     ) -> None:
         super().__init__(storage)
         self.host = host
         self.port = port
+        self.read_only = read_only
+
+        if not _is_loopback(host) and not allow_insecure_public:
+            raise ValueError(
+                f"Binding DAV server to {host!r} exposes anonymous access without "
+                "authentication. Set allow_insecure_public=True to confirm this "
+                "is intentional."
+            )
 
     @override
     async def serve(self) -> None:
         import uvicorn
 
-        configure_logging()
-        wsgi_app = create_wsgi_app(self.storage, self.host, self.port)
+        wsgi_app = create_wsgi_app(self.storage, self.host, self.port, read_only=self.read_only)
         app = WSGIMiddlewareWithLifespan(wsgi_app, lifespan=self.storage)
         config = uvicorn.Config(
             app,
             host=self.host,
             port=self.port,
             log_level="info",
-            log_config=LOGGING_CONFIG,
+            log_config=None,
             lifespan="on",
             interface="asgi3",
         )

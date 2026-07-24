@@ -2,11 +2,12 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
+import json
 import math
 from collections.abc import AsyncGenerator, AsyncIterable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import NoReturn, Self, final, override
+from typing import Literal, NoReturn, Self, final, override
 
 import anyio
 import anyio.lowlevel
@@ -15,9 +16,20 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from storegate.log import escape_tag
 
-from ..abstract import AbstractStorage, BytesLike, EntryKind, FileInfo, PathLike, WalkEntry, make_cache_identity
+from ..abstract import (
+    AbstractStorage,
+    BytesLike,
+    EntryKind,
+    FileInfo,
+    PathLike,
+    WalkEntry,
+    make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
+)
 from ._guard import download_private_file, lstat_private_entry, lstat_private_entry_or_none
-from .lock import LockLease, StorageFileLocker
+from .lock import LockLease, StorageFileLocker, _is_tombstone
 from .ref import ChunkRefManager, hash_to_path
 
 BLOCK_SIZE = 64 * 1024 * 1024  # 64 MB
@@ -61,7 +73,7 @@ class IndexStorage(AbstractStorage):
         chunks: AbstractStorage,
         block_size: int = BLOCK_SIZE,
         max_concurrent_uploads: int = MAX_CONCURRENT_UPLOADS,
-        skip_locking: bool = False,
+        lock_mode: Literal["strong", "best_effort", "disabled"] = "strong",
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
         lock_lease: float = DEFAULT_LOCK_LEASE,
     ):
@@ -75,6 +87,8 @@ class IndexStorage(AbstractStorage):
             or max_concurrent_uploads <= 0
         ):
             raise ValueError("max_concurrent_uploads must be a positive integer")
+        if lock_mode not in ("strong", "best_effort", "disabled"):
+            raise ValueError("lock_mode must be 'strong', 'best_effort', or 'disabled'")
         if not isinstance(lock_timeout, (int, float)) or not math.isfinite(lock_timeout) or lock_timeout <= 0:
             raise ValueError("lock_timeout must be finite and greater than zero")
         if not isinstance(lock_lease, (int, float)) or not math.isfinite(lock_lease) or lock_lease < MIN_LOCK_LEASE:
@@ -85,11 +99,12 @@ class IndexStorage(AbstractStorage):
         self._chunks = chunks
         self._block_size = block_size
         self._max_concurrent_uploads = max_concurrent_uploads
+        self._lock_mode = lock_mode
         self._locker = StorageFileLocker(
             self,
             lock_timeout=lock_timeout,
             lock_lease=lock_lease,
-            skip_locking=skip_locking,
+            lock_mode=lock_mode,
         )
         self._refs = ChunkRefManager(
             storage=self,
@@ -100,28 +115,27 @@ class IndexStorage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
-        return f"index:{self._index.id}#{self._chunks.id}"
+    def display_id(self) -> str:
+        return f"index:{self._index.display_id}#{self._chunks.display_id}"
 
     @property
     @override
-    def cache_identity(self) -> str | None:
-        index_identity = self._index.cache_identity
-        chunks_identity = self._chunks.cache_identity
-        if index_identity is None or chunks_identity is None:
-            return None
-        return make_cache_identity(
+    def namespace_identity(self) -> str:
+        return make_namespace_identity(
             "index",
             block_size=self._block_size,
-            chunks=chunks_identity,
-            index=index_identity,
+            chunks=self._chunks.namespace_identity,
+            index=self._index.namespace_identity,
         )
 
     @override
     async def connect(self) -> None:
         index = self._index
         chunks = self._chunks
-        self.log.info(f"Connecting IndexStorage (index=<c>{index.id}</c>, chunks=<c>{self._chunks.id}</c>)")
+        self.log.info(f"Connecting IndexStorage (index=<c>{index.display_id}</c>, chunks=<c>{chunks.display_id}</c>)")
+        if self._lock_mode == "strong":
+            self._require_compare_exchange(index, "index")
+            self._require_compare_exchange(chunks, "chunks")
         await self._retry_pending_rollback()
         index_started = False
         chunks_started = False
@@ -130,21 +144,52 @@ class IndexStorage(AbstractStorage):
             await index.connect()
             chunks_started = True
             await chunks.connect()
+            index_namespace_identity = index.namespace_identity
             try:
-                existing = (await download_private_file(chunks, CHUNKS_INDEX_FILE, label="binding file")).decode()
+                existing_raw = (await download_private_file(chunks, CHUNKS_INDEX_FILE, label="binding file")).decode()
             except FileNotFoundError:
-                existing = None
-            if existing is None:
-                await chunks.upload_bytes(index.id.encode(), CHUNKS_INDEX_FILE, overwrite=False)
-                self.log.success(f"Registered chunks storage <c>{chunks.id}</c> → index <c>{index.id}</c>")
-            elif existing != index.id:
-                self.log.error(
-                    f"Chunks storage <c>{chunks.id}</c> is already associated with "
-                    f"index <r>{escape_tag(existing)}</r>, rejecting index <c>{index.id}</c>"
+                existing_raw = None
+            if existing_raw is None:
+                payload = json.dumps(
+                    {
+                        "version": 2,
+                        "index_namespace_identity": index_namespace_identity,
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                await chunks.upload_bytes(payload, CHUNKS_INDEX_FILE, overwrite=False)
+                self.log.success(
+                    f"Registered chunks storage <c>{chunks.display_id}</c> → index <c>{index.display_id}</c>"
                 )
-                raise RuntimeError(f"Chunks storage is already associated with a different index storage: {existing}")
             else:
-                self.log.debug(f"Chunks storage <c>{chunks.id}</c> already bound to index <c>{existing}</c>")
+                try:
+                    existing = json.loads(existing_raw)
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(
+                        "Chunks storage binding uses an unsupported legacy format; "
+                        "clean cutover requires version 2 JSON with index_namespace_identity"
+                    ) from error
+                if (
+                    not isinstance(existing, dict)
+                    or existing.get("version") != 2
+                    or not isinstance(existing.get("index_namespace_identity"), str)
+                ):
+                    raise RuntimeError(
+                        "Chunks storage binding uses an unsupported legacy format; "
+                        "clean cutover requires version 2 JSON with index_namespace_identity"
+                    )
+                bound_identity = existing["index_namespace_identity"]
+                if bound_identity != index_namespace_identity:
+                    self.log.error(
+                        f"Chunks storage <c>{chunks.display_id}</c> is already associated with "
+                        f"index <r>{escape_tag(bound_identity)}</r>, rejecting index <c>{index.display_id}</c>"
+                    )
+                    raise RuntimeError(
+                        f"Chunks storage is already associated with a different index storage: {bound_identity}"
+                    )
+                self.log.debug(
+                    f"Chunks storage <c>{chunks.display_id}</c> already bound to index <c>{bound_identity}</c>"
+                )
         except BaseException as primary:
             cleanup_errors: list[BaseException] = []
             failed_cleanup: list[AbstractStorage] = []
@@ -167,6 +212,15 @@ class IndexStorage(AbstractStorage):
                     "Index storage connection rollback failed", [primary, *cleanup_errors]
                 ) from None
             raise
+
+    @staticmethod
+    def _require_compare_exchange(storage: AbstractStorage, label: str) -> None:
+        if not storage.capabilities.compare_exchange:
+            raise RuntimeError(
+                f"IndexStorage lock_mode='strong' requires compare_exchange capability "
+                f"on the {label} storage ({storage.display_id}), "
+                f"which does not support it. Use lock_mode='best_effort' or 'disabled' instead."
+            )
 
     async def _retry_pending_rollback(self) -> None:
         if not self._pending_rollback:
@@ -260,6 +314,9 @@ class IndexStorage(AbstractStorage):
             return None
         if not meta_bytes:
             return None
+        # Internal lock tombstones are not user file metadata.
+        if _is_tombstone(meta_bytes):
+            return None
         try:
             return FileMeta.model_validate_json(meta_bytes.decode())
         except (UnicodeDecodeError, ValidationError) as error:
@@ -268,15 +325,18 @@ class IndexStorage(AbstractStorage):
     async def _save_chunk_worker(
         self,
         recv: MemoryObjectReceiveStream[tuple[str, bytes, PathLike]],
-        incref_done: set[str],
+        newly_added_refs: set[str],
+        staged_bins: set[str],
     ) -> None:
-        """Worker：从 channel 拉取 block，保存或复用已有分块。"""
+        """Worker: pull blocks from channel, save or reuse existing chunks."""
         async for chunk_hash, data, remote_path in recv:
             bin_path = hash_to_path(chunk_hash, "bin")
 
             async with self._lock_chunk(chunk_hash):
                 chunk_info = await lstat_private_entry_or_none(self._chunks, bin_path, label="chunk data")
                 if chunk_info is None:
+                    # Record before the cancellable upload so commit-before-return still cleans up.
+                    staged_bins.add(chunk_hash)
                     start = anyio.current_time()
                     await self._chunks.upload_bytes(data, bin_path)
                     elapsed = anyio.current_time() - start
@@ -287,9 +347,105 @@ class IndexStorage(AbstractStorage):
                     raise IsADirectoryError(f"Chunk data path is a directory: {bin_path}")
                 else:
                     self.log.debug(f"Chunk <c>{chunk_hash[:8]}</c> already exists, skipping upload")
-                await self._refs.incref(chunk_hash, remote_path)
+                if await self._refs.incref(chunk_hash, remote_path):
+                    newly_added_refs.add(chunk_hash)
 
-            incref_done.add(chunk_hash)
+    @staticmethod
+    def _raise_upload_failure(primary: BaseException, cleanup_errors: list[BaseException]) -> NoReturn:
+        if not cleanup_errors:
+            raise primary
+        raise BaseExceptionGroup("Index upload and rollback failed", [primary, *cleanup_errors]) from None
+
+    async def _cleanup_staged_bins(self, staged_bins: set[str]) -> None:
+        for chunk_hash in staged_bins:
+            refs = await self._refs.load_refs(chunk_hash)
+            if refs:
+                continue
+            bin_path = hash_to_path(chunk_hash, "bin")
+            info = await lstat_private_entry_or_none(self._chunks, bin_path, label="chunk data")
+            if info is None:
+                continue
+            if info.kind is EntryKind.DIRECTORY:
+                raise IsADirectoryError(f"Chunk data path is a directory: {bin_path}")
+            await self._chunks.unlink(bin_path)
+
+    async def _rollback_upload_transaction(
+        self,
+        remote_path: PathLike,
+        newly_added_refs: set[str],
+        staged_bins: set[str],
+        guards: dict[str, str],
+    ) -> list[BaseException]:
+        cleanup_errors: list[BaseException] = []
+        with anyio.CancelScope(shield=True):
+            if newly_added_refs:
+                try:
+                    async with self._lock_chunks(newly_added_refs), anyio.create_task_group() as tg:
+                        for chunk_hash in newly_added_refs:
+                            tg.start_soon(self._refs.decref, chunk_hash, remote_path)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if staged_bins:
+                try:
+                    async with self._lock_chunks(staged_bins):
+                        await self._cleanup_staged_bins(staged_bins)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if guards:
+                try:
+                    async with self._lock_chunks(guards):
+                        await self._refs.release_rollback_guards(guards)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+        return cleanup_errors
+
+    async def _release_upload_guards(
+        self,
+        guards: dict[str, str],
+    ) -> None:
+        if not guards:
+            return
+        async with self._lock_chunks(guards):
+            await self._refs.release_rollback_guards(guards)
+        guards.clear()
+
+    async def _metadata_matches_upload(self, remote_path: PathLike, expected: bytes) -> bool:
+        try:
+            current = await download_private_file(self._index, remote_path, label="metadata entry")
+        except FileNotFoundError:
+            return False
+        return current == expected
+
+    async def _post_commit_upload_cleanup(
+        self,
+        remote_path: PathLike,
+        *,
+        old_only: set[str],
+        guards: dict[str, str],
+    ) -> None:
+        """Remove old-only refs and always attempt guard release afterward."""
+        primary: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+
+        if old_only:
+            try:
+                async with self._lock_chunks(old_only), anyio.create_task_group() as tg:
+                    for chunk_hash in old_only:
+                        tg.start_soon(self._refs.decref, chunk_hash, remote_path)
+            except BaseException as error:
+                primary = error
+
+        if guards:
+            try:
+                await self._release_upload_guards(guards)
+            except BaseException as error:
+                if primary is None:
+                    primary = error
+                else:
+                    cleanup_errors.append(error)
+
+        if primary is not None:
+            self._raise_upload_failure(primary, cleanup_errors)
 
     @override
     async def upload_stream(
@@ -316,20 +472,28 @@ class IndexStorage(AbstractStorage):
 
         chunk_hashes: list[str] = []
         total_size = 0
-        incref_done: set[str] = set()
+        newly_added_refs: set[str] = set()
+        staged_bins: set[str] = set()
+        guards: dict[str, str] = {}
         max_workers = self._max_concurrent_uploads
 
-        try:
-            async with self._lock_index(remote_path):
-                # 取出旧元数据，用于后续清理不再引用的旧分块
-                old_meta = await self._get_file_meta(remote_path)
+        async with self._lock_index(remote_path):
+            # load old metadata
+            old_meta = await self._get_file_meta(remote_path)
+            old_hashes = set(old_meta.chunks) if old_meta is not None else set()
 
-                send, recv = anyio.create_memory_object_stream[tuple[str, bytes, PathLike]](max_workers * 2)
+            # protect old chunks before any mutation that could drop them
+            if old_hashes:
+                async with self._lock_chunks(old_hashes):
+                    guards = await self._refs.add_rollback_guards(old_hashes)
 
+            send, recv = anyio.create_memory_object_stream[tuple[str, bytes, PathLike]](max_workers * 2)
+
+            try:
                 async with anyio.create_task_group() as tg, send:
                     for worker_idx in range(max_workers):
                         self.log.debug(f"Starting chunk upload worker #{worker_idx + 1}")
-                        tg.start_soon(self._save_chunk_worker, recv.clone(), incref_done)
+                        tg.start_soon(self._save_chunk_worker, recv.clone(), newly_added_refs, staged_bins)
                     recv.close()
 
                     buffer = bytearray()
@@ -389,44 +553,99 @@ class IndexStorage(AbstractStorage):
 
                 # send 关闭 → worker 退出 → tg 退出 → 所有上传完成
                 self.log.debug(f"All chunk upload workers completed for {_colored_path}")
-
-                now = datetime.now(UTC)
-                meta = FileMeta(
-                    info=FileInfo(
-                        path=remote_path.as_posix(),
-                        name=remote_path.name,
-                        kind=EntryKind.FILE,
-                        size=total_size,
-                        modified=now,
-                        created=now,
-                    ),
-                    chunks=chunk_hashes,
+            except BaseException as primary:
+                self.log.error(  # noqa: TRY400
+                    f"Upload failed: {_colored_path} "
+                    f"(<g>{total_size}</g> bytes streamed, "
+                    f"<g>{len(chunk_hashes)}</g> chunks processed)"
                 )
-                await self._index.mkdir(remote_path.parent, parents=True, exist_ok=True)
-                await self._index.upload_bytes(meta.model_dump_json().encode(), remote_path, overwrite=True)
+                cleanup_errors = await self._rollback_upload_transaction(
+                    remote_path,
+                    newly_added_refs,
+                    staged_bins,
+                    guards,
+                )
+                self._raise_upload_failure(primary, cleanup_errors)
 
-            # 清理旧文件不再引用的分块
-            if old_meta is not None:
-                async with self._lock_chunks(old_meta.chunks), anyio.create_task_group() as tg:
-                    for h in set(old_meta.chunks) - set(chunk_hashes):
-                        tg.start_soon(self._refs.decref, h, remote_path)
-
-            self.log.info(
-                f"Upload complete: {_colored_path} (<g>{total_size}</g> bytes in <g>{len(chunk_hashes)}</g> chunks)"
+            now = datetime.now(UTC)
+            meta = FileMeta(
+                info=FileInfo(
+                    path=remote_path.as_posix(),
+                    name=remote_path.name,
+                    kind=EntryKind.FILE,
+                    size=total_size,
+                    modified=now,
+                    created=now,
+                ),
+                chunks=chunk_hashes,
             )
-        except Exception:
-            self.log.error(  # noqa: TRY400
-                f"Upload failed: {_colored_path} "
-                f"(<g>{total_size}</g> bytes streamed, "
-                f"<g>{len(chunk_hashes)}</g> chunks processed)"
-            )
+            meta_bytes = meta.model_dump_json().encode()
+            old_only = old_hashes - set(chunk_hashes)
 
-            # 回滚已 incref 的分块
+            # Commit + post-commit cleanup are shielded so cancellation cannot
+            # re-enter pre-commit rollback after durable metadata exists.
             with anyio.CancelScope(shield=True):
-                async with self._lock_chunks(incref_done), anyio.create_task_group() as tg:
-                    for h in incref_done:
-                        tg.start_soon(self._refs.decref, h, remote_path)
-            raise
+                try:
+                    await self._index.mkdir(remote_path.parent, parents=True, exist_ok=True)
+                    await self._index.upload_bytes(meta_bytes, remote_path, overwrite=True)
+                except BaseException as primary:
+                    try:
+                        metadata_committed = await self._metadata_matches_upload(remote_path, meta_bytes)
+                    except BaseException as inspection_error:
+                        cleanup_errors: list[BaseException] = [inspection_error]
+                        try:
+                            await self._release_upload_guards(guards)
+                        except BaseException as cleanup_error:
+                            cleanup_errors.append(cleanup_error)
+                        self._raise_upload_failure(primary, cleanup_errors)
+
+                    if metadata_committed:
+                        self.log.error(  # noqa: TRY400
+                            f"Upload metadata committed with error: {_colored_path} "
+                            f"(<g>{total_size}</g> bytes, <g>{len(chunk_hashes)}</g> chunks)"
+                        )
+                        try:
+                            await self._post_commit_upload_cleanup(
+                                remote_path,
+                                old_only=old_only,
+                                guards=guards,
+                            )
+                        except BaseException as cleanup_error:
+                            self._raise_upload_failure(primary, [cleanup_error])
+                        raise
+
+                    self.log.error(  # noqa: TRY400
+                        f"Upload failed: {_colored_path} "
+                        f"(<g>{total_size}</g> bytes streamed, "
+                        f"<g>{len(chunk_hashes)}</g> chunks processed)"
+                    )
+                    cleanup_errors = await self._rollback_upload_transaction(
+                        remote_path,
+                        newly_added_refs,
+                        staged_bins,
+                        guards,
+                    )
+                    self._raise_upload_failure(primary, cleanup_errors)
+
+                try:
+                    await self._post_commit_upload_cleanup(
+                        remote_path,
+                        old_only=old_only,
+                        guards=guards,
+                    )
+                except BaseException:
+                    self.log.error(  # noqa: TRY400
+                        f"Upload post-commit cleanup failed: {_colored_path} "
+                        f"(<g>{total_size}</g> bytes, <g>{len(chunk_hashes)}</g> chunks)"
+                    )
+                    raise
+            # A cancellation requested during the shielded commit is delivered
+            # only after metadata and its required cleanup are durable.
+            await anyio.lowlevel.checkpoint()
+
+        self.log.info(
+            f"Upload complete: {_colored_path} (<g>{total_size}</g> bytes in <g>{len(chunk_hashes)}</g> chunks)"
+        )
 
     @override
     async def download_stream(
@@ -435,6 +654,7 @@ class IndexStorage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
+        offset = validate_download_offset(offset)
         remote_path = self.normalize_path(remote_path)
         _colored_path = f"<y>{escape_tag(remote_path)}</y>"
         self.log.debug(f"Download starting: {_colored_path}{f" (offset=<g>{offset}</g>)" if offset else ""}")
@@ -571,8 +791,22 @@ class IndexStorage(AbstractStorage):
             raise NotADirectoryError(f"Not a directory: {path}")
         if not await self._is_dir_empty(path):
             raise OSError(f"Directory not empty: {path}")
-
+        # Strong-mode release leaves tombstones at ``{child}.lock``. They are
+        # invisible to public iterdir, but still occupy the index directory.
+        await self._purge_private_directory_residue(path)
         await self._index.rmdir(path)
+
+    async def _purge_private_directory_residue(self, path: PurePosixPath) -> None:
+        """Remove internal lock tombstones so empty public dirs can rmdir."""
+        async for entry in self._index.iterdir(path):
+            entry_path = self.normalize_path(entry.path)
+            if entry.kind is not EntryKind.FILE:
+                raise OSError(f"Directory not empty: {path}")
+            if await self._read_is_tombstone(entry_path):
+                await self._index.unlink(entry_path, missing_ok=True)
+                continue
+            # Active lock files or other private residue still block removal.
+            raise OSError(f"Directory not empty: {path}")
 
     @override
     async def move(
@@ -584,12 +818,23 @@ class IndexStorage(AbstractStorage):
     ) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
-        if src == dst:
-            if await self._get_file_meta(src) is None:
-                raise FileNotFoundError(f"Source file not found: {src}")
-            if not overwrite:
-                raise FileExistsError(f"Destination file already exists: {dst}")
+        try:
+            source_info = await lstat_private_entry(self._index, src, label="source entry")
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source file not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
 
         _colored_src = f"<y>{escape_tag(src)}</y>"
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
@@ -667,12 +912,23 @@ class IndexStorage(AbstractStorage):
     ) -> None:
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
-        if src == dst:
-            if await self._get_file_meta(src) is None:
-                raise FileNotFoundError(f"Source file not found: {src}")
-            if not overwrite:
-                raise FileExistsError(f"Destination file already exists: {dst}")
+        try:
+            source_info = await lstat_private_entry(self._index, src, label="source entry")
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source file not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
 
         _colored_dst = f"<y>{escape_tag(dst)}</y>"
         async with self._lock_indexes(src, dst):
@@ -750,10 +1006,23 @@ class IndexStorage(AbstractStorage):
         _colored_path = f"<y>{escape_tag(path)}</y>"
         self.log.info(f"RmTree: {_colored_path}")
 
-        metas, relative_directories = await self._collect_tree(path)
+        metas, relative_directories, tombstone_locks = await self._collect_tree(path)
+        # Unlink user files first. Strong release writes a tombstone at ``{path}.lock``,
+        # which is the same object rmtree would otherwise delete for residual cleanup.
+        # Concurrent tombstone deletion races active holders (renewal/release CAS) and
+        # surfaces as LockLeaseLostError under ordinary contract cleanup.
         async with anyio.create_task_group() as tg:
             for file_path in metas:
                 tg.start_soon(self.unlink, file_path)
+        residual_locks = {self.normalize_path(lock_path) for lock_path in tombstone_locks}
+        residual_locks.update(self.normalize_path(f"{file_path}.lock") for file_path in metas)
+        async with anyio.create_task_group() as tg:
+            for lock_path in residual_locks:
+
+                async def _unlink_lock(target: PurePosixPath = lock_path) -> None:
+                    await self._index.unlink(target, missing_ok=True)
+
+                tg.start_soon(_unlink_lock)
         for relative in sorted(relative_directories, key=lambda item: len(item.parts), reverse=True):
             await self._index.rmdir(path / relative)
         await self._index.rmdir(path)
@@ -761,9 +1030,20 @@ class IndexStorage(AbstractStorage):
             f"RmTree complete: {_colored_path} (<g>{len(metas) + len(relative_directories)}</g> entries removed)"
         )
 
-    async def _collect_tree(self, root: PurePosixPath) -> tuple[dict[PurePosixPath, FileMeta], list[PurePosixPath]]:
+    async def _read_is_tombstone(self, entry_path: PurePosixPath) -> bool:
+        """Return True when *entry_path* is a recognised clean-release tombstone."""
+        try:
+            data = await download_private_file(self._index, entry_path, label="tree entry")
+            return _is_tombstone(data)
+        except FileNotFoundError, OSError:
+            return False
+
+    async def _collect_tree(
+        self, root: PurePosixPath
+    ) -> tuple[dict[PurePosixPath, FileMeta], list[PurePosixPath], list[PurePosixPath]]:
         metas: dict[PurePosixPath, FileMeta] = {}
         relatives: list[PurePosixPath] = []
+        tombstone_locks: list[PurePosixPath] = []
         async for walk_entry in self._index.walk(root):
             for entry in walk_entry.entries:
                 entry_path = self.normalize_path(entry.path)
@@ -771,13 +1051,19 @@ class IndexStorage(AbstractStorage):
                     case EntryKind.DIRECTORY:
                         relatives.append(entry_path.relative_to(root))
                     case EntryKind.FILE:
-                        meta = await self._get_file_meta(entry_path)
-                        if meta is None:
-                            raise FileNotFoundError(f"File not found: {entry_path}")
-                        metas[entry_path] = meta
+                        try:
+                            meta = await self._get_file_meta(entry_path)
+                        except OSError:
+                            meta = None
+                        if meta is not None:
+                            metas[entry_path] = meta
+                        elif await self._read_is_tombstone(entry_path):
+                            tombstone_locks.append(entry_path)
+                        # Non-metadata, non-tombstone files (e.g. active lock files)
+                        # are silently skipped.
                     case EntryKind.SYMLINK:
                         await lstat_private_entry(self._index, entry_path, label="tree entry")
-        return metas, relatives
+        return metas, relatives, tombstone_locks
 
     @staticmethod
     def _raise_tree_failure(primary: BaseException, rollback_error: BaseException | None) -> NoReturn:
@@ -855,7 +1141,7 @@ class IndexStorage(AbstractStorage):
         *,
         move: bool,
     ) -> tuple[int, int]:
-        source_metas, source_dirs = await self._collect_tree(src)
+        source_metas, source_dirs, _tombstone_locks = await self._collect_tree(src)
         destination_paths = {dst.joinpath(path.relative_to(src)) for path in source_metas}
         destination_metas: dict[PurePosixPath, FileMeta] = {}
         for path in destination_paths:
@@ -880,6 +1166,19 @@ class IndexStorage(AbstractStorage):
                 else:
                     await self.copy(source_path, destination_path, overwrite=True)
             if move:
+                # Clean up lock tombstones before rmdir; validate payload, not suffix.
+                tombstone_orphans: list[PurePosixPath] = []
+                for relative in sorted(
+                    [src] + [src / relative for relative in source_dirs],
+                    key=lambda path: len(path.parts),
+                    reverse=True,
+                ):
+                    async for entry in self._index.iterdir(relative):
+                        entry_path = relative / entry.name
+                        if await self._read_is_tombstone(entry_path):
+                            tombstone_orphans.append(entry_path)
+                for path in tombstone_orphans:
+                    await self._index.unlink(path)
                 for relative in sorted(source_dirs, key=lambda path: len(path.parts), reverse=True):
                     await self._index.rmdir(src / relative)
                 await self._index.rmdir(src)
@@ -914,14 +1213,25 @@ class IndexStorage(AbstractStorage):
         dst = self.normalize_path(dst)
         try:
             src_info = await lstat_private_entry(self._index, src, label="tree root")
-        except FileNotFoundError as error:
-            raise NotADirectoryError(f"Not a directory: {src}") from error
-        if src_info.kind is not EntryKind.DIRECTORY:
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = src_info.kind
+        if validate_same_path_tree_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
         dst_info = await lstat_private_entry_or_none(self._index, dst, label="tree destination")
         if not overwrite and dst_info is not None:
             raise FileExistsError(f"Destination already exists: {dst}")
-        if dst == src or dst.is_relative_to(src):
+        if dst.is_relative_to(src):
             raise ValueError("Destination must not be inside the source tree")
         async with self._lock_indexes(f"{src}.tree", f"{dst}.tree"):
             files, directories = await self._apply_tree_transaction(src, dst, move=False)
@@ -936,14 +1246,25 @@ class IndexStorage(AbstractStorage):
         dst = self.normalize_path(dst)
         try:
             src_info = await lstat_private_entry(self._index, src, label="tree root")
-        except FileNotFoundError as error:
-            raise NotADirectoryError(f"Not a directory: {src}") from error
-        if src_info.kind is not EntryKind.DIRECTORY:
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = src_info.kind
+        if validate_same_path_tree_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {src}")
         dst_info = await lstat_private_entry_or_none(self._index, dst, label="tree destination")
         if not overwrite and dst_info is not None:
             raise FileExistsError(f"Destination already exists: {dst}")
-        if dst == src or dst.is_relative_to(src):
+        if dst.is_relative_to(src):
             raise ValueError("Destination must not be inside the source tree")
         async with self._lock_indexes(f"{src}.tree", f"{dst}.tree"):
             files, directories = await self._apply_tree_transaction(src, dst, move=True)

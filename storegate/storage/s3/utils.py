@@ -74,11 +74,20 @@ class MultipartUploadTask:
         try:
             yield self
             await self.complete()
-        except Exception:
-            try:
-                await self.abort()
-            except Exception as abort_exc:
-                self.log.warning(f"Failed to abort multipart upload for {self.key}", exception=abort_exc)
+        except BaseException as primary:
+            abort_error: BaseException | None = None
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.abort()
+                except BaseException as secondary:
+                    abort_error = secondary
+            if abort_error is not None:
+                self.log.warning(f"Failed to abort multipart upload for {self.key}", exception=abort_error)
+                # Always re-raise primary-first so CancelScope cannot drop the cancel cause.
+                raise BaseExceptionGroup(
+                    "S3 multipart upload failed and abort failed",
+                    [primary, abort_error],
+                ) from None
             raise
 
     def next_part_number(self) -> int:

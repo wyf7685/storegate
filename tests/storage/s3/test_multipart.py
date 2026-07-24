@@ -4,6 +4,8 @@ from collections.abc import AsyncIterator
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
+import anyio.lowlevel
 import pytest
 from pydantic import SecretStr
 from pytest_mock import MockerFixture
@@ -63,11 +65,91 @@ async def test_create_aborts_and_preserves_body_error_when_abort_fails() -> None
     raw.complete_multipart_upload = AsyncMock()
     raw.abort_multipart_upload = AsyncMock(side_effect=OSError("abort failed"))
 
-    with pytest.raises(ValueError, match="upload failed"):
+    with pytest.raises(BaseExceptionGroup) as caught:
         async with MultipartUploadTask.create(client, "large.bin"):
             raise ValueError("upload failed")
 
+    assert [type(exc) for exc in caught.value.exceptions] == [ValueError, OSError]
+    assert [str(exc) for exc in caught.value.exceptions] == ["upload failed", "abort failed"]
     raw.abort_multipart_upload.assert_awaited_once_with(key="large.bin", upload_id="upload-1")
+    raw.complete_multipart_upload.assert_not_awaited()
+
+
+async def test_create_aborts_on_anyio_cancellation() -> None:
+    client, raw = _mock_client()
+    raw.create_multipart_upload = AsyncMock(return_value="upload-cancel")
+    raw.complete_multipart_upload = AsyncMock()
+    raw.abort_multipart_upload = AsyncMock()
+
+    async def body() -> None:
+        with anyio.CancelScope() as scope:
+            async with MultipartUploadTask.create(client, "cancel.bin") as _task:
+                scope.cancel()
+                await anyio.sleep(10)
+
+    # CancelScope converts CancelledError into scope.cancelled_caught; the body
+    # returns normally after abort. The important contract is that abort ran.
+    await body()
+    raw.abort_multipart_upload.assert_awaited_once_with(key="cancel.bin", upload_id="upload-cancel")
+    raw.complete_multipart_upload.assert_not_awaited()
+
+
+async def test_create_cancellation_with_abort_failure_keeps_primary_first_group() -> None:
+    client, raw = _mock_client()
+    raw.create_multipart_upload = AsyncMock(return_value="upload-cancel-fail")
+    raw.complete_multipart_upload = AsyncMock()
+    raw.abort_multipart_upload = AsyncMock(side_effect=OSError("abort failed"))
+
+    # Raise a real CancelledError into the multipart context so primary is preserved
+    # even when abort also fails (primary-first group contract).
+    cancelled = anyio.get_cancelled_exc_class()("cancelled during multipart")
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        async with MultipartUploadTask.create(client, "cancel-fail.bin") as _task:
+            raise cancelled
+
+    primary, secondary = caught.value.exceptions
+    assert primary is cancelled
+    assert isinstance(secondary, OSError)
+    assert str(secondary) == "abort failed"
+    raw.abort_multipart_upload.assert_awaited_once_with(key="cancel-fail.bin", upload_id="upload-cancel-fail")
+    raw.complete_multipart_upload.assert_not_awaited()
+
+
+async def test_storage_upload_aborts_when_stream_body_cancels(mocker: MockerFixture) -> None:
+    storage = S3Storage(_config())
+    client, raw = _mock_client()
+    storage._client = client
+    mocker.patch.object(storage, "stat", side_effect=FileNotFoundError)
+    mocker.patch.object(storage, "mkdir", new=AsyncMock())
+    raw.create_multipart_upload = AsyncMock(return_value="upload-stream-cancel")
+    raw.upload_part = AsyncMock(return_value="etag-1")
+    raw.complete_multipart_upload = AsyncMock()
+    raw.abort_multipart_upload = AsyncMock()
+    raw.put_object = AsyncMock()
+
+    started = anyio.Event()
+
+    async def infinite_chunks() -> AsyncIterator[bytes]:
+        yield b"x" * UPLOAD_CHUNK_SIZE
+        yield b"y" * UPLOAD_CHUNK_SIZE
+        started.set()
+        while True:
+            await anyio.lowlevel.checkpoint()
+            yield b"z" * UPLOAD_CHUNK_SIZE
+
+    cancel_scope = anyio.CancelScope()
+
+    async def upload() -> None:
+        with cancel_scope:
+            await storage.upload_stream(infinite_chunks(), "stream-cancel.bin")
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(upload)
+        await started.wait()
+        cancel_scope.cancel()
+
+    raw.abort_multipart_upload.assert_awaited()
     raw.complete_multipart_upload.assert_not_awaited()
 
 

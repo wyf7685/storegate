@@ -1,9 +1,9 @@
 import dataclasses
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Literal, Self, TypedDict
 
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 
 class S3Config(BaseModel):
@@ -24,10 +24,42 @@ class S3Config(BaseModel):
     # virtual-hosted-style (https://bucket.endpoint/key). Required by MinIO
     # and some S3-compatible services.
     path_style: bool = False
-    max_concurrency: int = 8
+    max_concurrency: int = Field(default=8, gt=0)
     session_token: str | None = None
-    scheme: str = "https"
-    timeout: float = 30
+    scheme: Literal["http", "https"] = "https"
+    timeout: float = Field(default=30, gt=0)
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        region = self.region.strip()
+        if not region:
+            raise ValueError("region must not be empty")
+        if "\x00" in region:
+            raise ValueError("region must not contain NUL")
+        self.region = region
+
+        bucket = self.bucket.strip()
+        if not bucket:
+            raise ValueError("bucket must not be empty")
+        if "\x00" in bucket:
+            raise ValueError("bucket must not contain NUL")
+        self.bucket = bucket
+
+        if self.endpoint_url is not None:
+            endpoint = self.endpoint_url.strip()
+            if not endpoint:
+                raise ValueError("endpoint_url must not be empty")
+            if "\x00" in endpoint:
+                raise ValueError("endpoint_url must not contain NUL")
+            if "://" in endpoint:
+                raise ValueError("endpoint_url must not include a scheme")
+            if "@" in endpoint:
+                raise ValueError("endpoint_url must not include userinfo")
+            if "/" in endpoint or "?" in endpoint or "#" in endpoint:
+                raise ValueError("endpoint_url must not include a path or query")
+            self.endpoint_url = endpoint
+
+        return self
 
     @classmethod
     def from_file(cls, path: str | Path) -> S3Config:

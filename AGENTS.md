@@ -108,7 +108,7 @@ tests/
 
 **测试辅助代码**：可导入辅助函数放在 `tests/support/`。`conftest.py` 只用于 fixture 和 pytest 配置，不作为普通 Python 模块导入。后端专属 fixture 放在对应目录的 `conftest.py`。
 
-**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest` 自动输出语句覆盖报告；使用 `--cov-branch` 可同时检查分支覆盖。当前测试源码收集为 1040 个参数化用例；无外部 S3 配置时执行 1037 个用例。
+**覆盖率**：`pytest-cov` 已配置，运行 `uv run pytest --cov --cov-branch` 自动输出语句与分支覆盖报告。运行 `uv run pytest --collect-only -q` 查看当前收集的测试用例数量。
 
 ## 架构
 

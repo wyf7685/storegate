@@ -19,8 +19,12 @@ class ProtocolStorage(AbstractStorage):
         self.lstat_errors: dict[str, OSError] = {}
 
     @property
-    def id(self) -> str:
+    def display_id(self) -> str:
         return "ftp-protocol-test"
+
+    @property
+    def namespace_identity(self) -> str:
+        return "ftp-protocol-test:sha256:test"
 
     async def connect(self) -> None:
         pass
@@ -283,3 +287,23 @@ async def ftp_protocol_server() -> AsyncIterator[tuple[str, int, ProtocolStorage
 async def ftp_endpoint(ftp_protocol_server: tuple[str, int, ProtocolStorage]) -> tuple[str, int]:
     host, port, _storage = ftp_protocol_server
     return host, port
+
+
+@pytest.fixture
+async def ftp_readonly_server() -> AsyncIterator[tuple[str, int, ProtocolStorage]]:
+    host = "127.0.0.1"
+    storage = ProtocolStorage()
+    storage.files.update(
+        {
+            "/readonly-test.txt": b"readonly content",
+            "/target-dir/sentinel.txt": b"sentinel",
+        }
+    )
+    storage.directories.update({"/target-dir"})
+    server = FTPServer(storage, host=host, port=0, read_only=True)
+    async with storage:
+        await server.server.start(host, 0)
+        try:
+            yield host, server.server.server_port, storage
+        finally:
+            await server.server.close()

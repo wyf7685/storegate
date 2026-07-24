@@ -4,6 +4,35 @@ version = "0.1.0"
 description = "Asynchronous multi-backend file storage and protocol gateway"
 readme = "README.md"
 requires-python = ">=3.14"
+license = "Apache-2.0"
+authors = [{ name = "wyf7685", email = "wyf7685@gmail.com" }]
+maintainers = [{ name = "wyf7685", email = "wyf7685@gmail.com" }]
+keywords = [
+  "async",
+  "storage",
+  "webdav",
+  "ftp",
+  "sftp",
+  "s3",
+  "gateway",
+  "filesystem",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Internet :: File Transfer Protocol (FTP)",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: System :: Filesystems",
+  "Typing :: Typed",
+  "Framework :: AsyncIO",
+]
+
 dependencies = [
   "anyio>=4.14.1",
   "expiringdictx>=1.1.0",
@@ -11,6 +40,11 @@ dependencies = [
   "loguru>=0.7.3",
   "pydantic>=2.13.4",
 ]
+[project.urls]
+Homepage = "https://github.com/wyf7685/storegate"
+Repository = "https://github.com/wyf7685/storegate"
+Issues = "https://github.com/wyf7685/storegate/issues"
+
 [project.optional-dependencies]
 ftp-server = ["aioftp>=0.27.2"]
 dav-server = ["a2wsgi>=1.10.10", "uvicorn[standard]>=0.50.2", "wsgidav>=4.3.5"]
@@ -25,6 +59,9 @@ uvloop = [
   "winloop>=0.6.3 ; sys_platform == 'win32'",
 ]
 full = ["storegate[standard,ayafileio,httpx2,uvloop]"]
+
+[project.scripts]
+storegate = "storegate.cli:main"
 
 [dependency-groups]
 dev = [

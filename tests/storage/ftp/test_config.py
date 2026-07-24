@@ -76,4 +76,4 @@ class TestFTPConfig:
         )
         storage = resolve_storage_from_file(path)
         assert isinstance(storage, FTPStorage)
-        assert storage.id == "ftp:anonymous@ftp.example.test:21/tenant"
+        assert storage.display_id == "ftp:anonymous@ftp.example.test:21/tenant"

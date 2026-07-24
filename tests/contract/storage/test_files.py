@@ -424,12 +424,21 @@ class TestDownloadStream:
         finally:
             await storage.delete(path)
 
-    async def test_download_stream_offset_beyond(self, storage: AbstractStorage):
-        path = f"test-dl-beyond-{uid()}"
+    @pytest.mark.parametrize("offset", [10, 100])
+    async def test_download_stream_at_or_beyond_size_is_empty(self, storage: AbstractStorage, offset: int):
+        path = f"test-dl-empty-{uid()}"
         try:
             await storage.upload_bytes(b"x" * 10, path)
-            chunks = [chunk async for chunk in storage.download_stream(path, offset=100)]
-            result = b"".join(chunks)
-            assert result == b""
+            chunks = [chunk async for chunk in storage.download_stream(path, offset=offset)]
+            assert chunks == []
+        finally:
+            await storage.delete(path)
+
+    async def test_download_stream_negative_offset_rejected(self, storage: AbstractStorage):
+        path = f"test-dl-negative-{uid()}"
+        try:
+            await storage.upload_bytes(b"content", path)
+            with pytest.raises(ValueError, match="non-negative"):
+                await anext(storage.download_stream(path, offset=-1))
         finally:
             await storage.delete(path)

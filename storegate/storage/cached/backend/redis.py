@@ -83,8 +83,8 @@ class RedisCacheBackend(CacheBackend):
 
     Each namespace is stored below a storage-specific prefix. With the default
     ``key_prefix="auto"``, :meth:`bind_storage` derives
-    ``storegate:v2:{sha256}:{namespace}:{key}`` from the wrapped storage's
-    stable, non-secret cache identity. Per-key TTL is set via ``SET … EX``.
+    ``storegate:v3:{sha256}:{namespace}:{key}`` from the wrapped storage's
+    stable, non-secret namespace identity. Per-key TTL is set via ``SET … EX``.
 
     Parameters
     ----------
@@ -164,9 +164,9 @@ class RedisCacheBackend(CacheBackend):
         if self._key_prefix != "auto":
             return
         if identity is None:
-            raise ValueError("RedisCacheBackend requires a stable cache identity when key_prefix='auto'")
+            raise ValueError("RedisCacheBackend requires a stable namespace identity when key_prefix='auto'")
 
-        instance_prefix = f"{self._PREFIX}:v2:{hashlib.sha256(identity.encode()).hexdigest()}"
+        instance_prefix = f"{self._PREFIX}:v3:{hashlib.sha256(identity.encode()).hexdigest()}"
         if self._bound_identity is not None and self._bound_identity != identity:
             raise ValueError("RedisCacheBackend cannot be bound to multiple storage identities")
         self._bound_identity = identity
@@ -174,6 +174,16 @@ class RedisCacheBackend(CacheBackend):
 
     @override
     def configure_namespace(self, name: str, ttl: int, **opts: Any) -> None:
+        del opts  # Redis namespaces ignore capacity and other memory-only options.
+        if ttl <= 0:
+            raise ValueError("ttl must be > 0")
+        existing = self._ttls.get(name)
+        if existing is not None:
+            if existing == ttl:
+                return
+            raise ValueError(
+                f"namespace {name!r} already configured with ttl={existing}; cannot reconfigure with ttl={ttl}"
+            )
         self._ttls[name] = ttl
         self._serializers[name], self._deserializers[name] = _serializers_for(name)
 

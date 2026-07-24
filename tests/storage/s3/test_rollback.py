@@ -115,7 +115,11 @@ class TestMoveRollback:
     ) -> None:
         storage = s3_mocked
         mocker.patch.object(storage, "copy", new=AsyncMock())
-        mocker.patch.object(storage._client, "head_object", new=AsyncMock(return_value=None))
+
+        async def _head(key: str) -> MagicMock | None:
+            return MagicMock() if key == "src.txt" else None
+
+        mocker.patch.object(storage._client, "head_object", side_effect=_head)
         mocker.patch.object(storage._client, "put_object_copy", new=AsyncMock())
 
         async def delete(key: str) -> None:

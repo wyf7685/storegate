@@ -81,14 +81,14 @@ class TestDirectoryOperations:
                 await index_storage.rmtree(dst)
 
 
-class TestSkipLocking:
-    """IndexStorage with skip_locking=True."""
+class TestDisabledLocking:
+    """IndexStorage with lock_mode='disabled'."""
 
     async def test_upload_without_locking(self):
         async with (
             MemoryStorage("/") as idx,
             MemoryStorage("/") as chunks,
-            IndexStorage(idx, chunks, block_size=BLOCK_SIZE, skip_locking=True) as s,
+            IndexStorage(idx, chunks, block_size=BLOCK_SIZE, lock_mode="disabled") as s,
         ):
             path = f"test-nolock-{uid()}"
             try:

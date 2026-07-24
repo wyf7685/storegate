@@ -1,4 +1,3 @@
-from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import cast, final, override
 
@@ -6,25 +5,22 @@ import aioftp
 from aioftp.common import Connection
 from aioftp.errors import PathIOError
 
-from storegate.log import LOGGING_CONFIG
 from storegate.storage import AbstractStorage
 
-from ..abstract import AbstractServer
+from ..abstract import AbstractServer, _is_loopback
 from .pathio import StoragePathIO
 
 
-def configure_logging() -> None:
-    import logging.config
-
-    config = deepcopy(LOGGING_CONFIG)
-    config["loggers"] = {
-        "aioftp.server": {"handlers": ["default"], "level": "DEBUG", "propagate": False},
-    }
-
-    logging.config.dictConfig(config)
-
-
 class StorageFTPProtocolServer(aioftp.Server):
+    """aioftp protocol server with optional read-only enforcement.
+
+    When ``read_only`` is ``True`` every mutation command (STOR, DELE,
+    MKD, RMD, RNFR, RNTO) is rejected with ``550 Permission denied``
+    **before** the underlying storage is touched.
+    """
+
+    read_only: bool = False
+
     @staticmethod
     def _close_data_connection(connection: Connection) -> None:
         if connection.future.data_connection.done():
@@ -42,6 +38,9 @@ class StorageFTPProtocolServer(aioftp.Server):
 
     @override
     async def mkd(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        if self.read_only:
+            connection.response("550", "Permission denied")
+            return True
         real_path, _virtual_path = self.get_paths(connection, rest)
         path_io = cast("StoragePathIO", connection.path_io)
         if await path_io.is_hidden_symlink(real_path):
@@ -57,6 +56,9 @@ class StorageFTPProtocolServer(aioftp.Server):
         rest: str | PurePosixPath,
         mode: str = "wb",
     ) -> bool:
+        if self.read_only:
+            connection.response("550", "Permission denied")
+            return True
         if connection.restart_offset != 0:
             connection.restart_offset = 0
             self._close_data_connection(connection)
@@ -80,6 +82,9 @@ class StorageFTPProtocolServer(aioftp.Server):
 
     @override
     async def rnto(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        if self.read_only:
+            connection.response("550", "Permission denied")
+            return True
         if not self._has_completed_rename_from(connection):
             connection.response("503", "no filename (use RNFR firstly)")
             return True
@@ -102,6 +107,27 @@ class StorageFTPProtocolServer(aioftp.Server):
             self._clear_rename_from(connection)
             raise
 
+    @override
+    async def dele(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        if self.read_only:
+            connection.response("550", "Permission denied")
+            return True
+        return await super().dele(connection, rest)
+
+    @override
+    async def rmd(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        if self.read_only:
+            connection.response("550", "Permission denied")
+            return True
+        return await super().rmd(connection, rest)
+
+    @override
+    async def rnfr(self, connection: Connection, rest: str | PurePosixPath) -> bool:
+        if self.read_only:
+            connection.response("550", "Permission denied")
+            return True
+        return await super().rnfr(connection, rest)
+
 
 @final
 class FTPServer(AbstractServer):
@@ -111,18 +137,29 @@ class FTPServer(AbstractServer):
         *,
         host: str = "127.0.0.1",
         port: int = 2121,
+        read_only: bool = False,
+        allow_insecure_public: bool = False,
     ) -> None:
         super().__init__(storage)
         self.host = host
         self.port = port
+        self.read_only = read_only
+
+        if not _is_loopback(host) and not allow_insecure_public:
+            raise ValueError(
+                f"Binding FTP server to {host!r} exposes anonymous access without "
+                "authentication. Set allow_insecure_public=True to confirm this "
+                "is intentional."
+            )
+
         self.server = StorageFTPProtocolServer(
             users=[aioftp.User(login=None, password=None, base_path=str(Path()), home_path="/")],
             path_io_factory=StoragePathIO.with_storage(storage),
         )
+        self.server.read_only = read_only
         self.server.commands_mapping.pop("appe")
 
     @override
     async def serve(self) -> None:
-        configure_logging()
         async with self.storage:
             await self.server.run(self.host, self.port)

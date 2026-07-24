@@ -1,6 +1,7 @@
 import contextlib
 import ssl
 from collections.abc import AsyncIterator
+from pathlib import PurePosixPath
 from types import TracebackType
 from typing import Literal, Self
 from urllib.parse import quote
@@ -67,7 +68,17 @@ class AsyncDavClient:
         return self._client
 
     def _build_path(self, path: str) -> str:
-        """Build the URL path for *path*: ``root_prefix`` + URL-encoded segments."""
+        """Build the URL path for *path*: ``root_prefix`` + URL-encoded segments.
+
+        *path* must already be a validated storage-relative path. Independent
+        ``..`` segments and NUL bytes are rejected before any URL is formed so
+        HTTP clients cannot normalize out of ``root_prefix``.
+        """
+        if "\x00" in path:
+            raise ValueError("path must not contain NUL")
+        if ".." in PurePosixPath(path).parts:
+            raise ValueError("path must not contain '..' segments")
+
         rel = path.lstrip("/")
         encoded = quote(rel, safe="/") if rel else ""
         if encoded:

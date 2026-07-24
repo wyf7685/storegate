@@ -1,7 +1,5 @@
 """Global pytest configuration."""
 
-import sys
-
 import pytest
 
 pytest_plugins = (
@@ -11,16 +9,12 @@ pytest_plugins = (
 
 
 @pytest.fixture(autouse=True, scope="session")
-def configure_logging() -> None:
-    """Configure logging for tests."""
-    from storegate.log import log_format, log_level_filter, logger, remove_loguru_sinks
+def _configure_test_logging() -> None:
+    """Configure logging for tests — removes existing sinks first, then adds
+    a console sink with ``diagnose=False``."""
+    import loguru
 
-    remove_loguru_sinks()
-    logger.add(
-        sys.stdout,
-        level="DEBUG",
-        diagnose=False,
-        enqueue=False,
-        format=log_format,
-        filter=log_level_filter(),
-    )
+    from storegate.log import configure_logging
+
+    loguru.logger.remove()
+    configure_logging(console=True, diagnose=False, enqueue=False)

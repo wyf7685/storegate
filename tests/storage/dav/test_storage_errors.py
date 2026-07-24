@@ -42,6 +42,30 @@ def _resource(href: str, *resource_types: str) -> DavResource:
     )
 
 
+class TestDownloadOffset:
+    async def test_negative_offset_rejected_before_stat(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
+        stat_mock = mocker.patch.object(dav_mocked, "stat", AsyncMock())
+
+        with pytest.raises(ValueError, match="non-negative"):
+            await anext(dav_mocked.download_stream("file.bin", offset=-1))
+
+        stat_mock.assert_not_awaited()
+
+    @pytest.mark.parametrize("offset", [4, 5])
+    async def test_at_or_beyond_size_skips_get(
+        self, dav_mocked: DavStorage, mocker: MockerFixture, offset: int
+    ) -> None:
+        mocker.patch.object(
+            dav_mocked,
+            "stat",
+            AsyncMock(return_value=FileInfo(path="/file.bin", name="file.bin", kind=EntryKind.FILE, size=4)),
+        )
+        stream_get = mocker.patch.object(dav_mocked._client, "stream_get")
+
+        assert [chunk async for chunk in dav_mocked.download_stream("file.bin", offset=offset)] == []
+        stream_get.assert_not_called()
+
+
 class TestStatErrorMapping:
     async def test_stat_404_raises_filenotfound(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
         mocker.patch.object(
@@ -482,6 +506,25 @@ class TestMoveOverwrite:
 
         move_mock.assert_not_awaited()
 
+    async def test_move_root_self_move_raises_isadir(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
+        """Root self-move must reach same-path validation and raise IsADirectoryError via source-kind."""
+        mocker.patch.object(
+            dav_mocked,
+            "stat",
+            new=AsyncMock(return_value=FileInfo(path="/", name="", kind=EntryKind.DIRECTORY)),
+        )
+        move_mock = mocker.patch.object(dav_mocked._client, "move", AsyncMock())
+
+        with pytest.raises(IsADirectoryError):
+            await dav_mocked.move("/", "/")
+
+        move_mock.assert_not_awaited()
+
+    async def test_move_root_to_other_raises_oserror(self, dav_mocked: DavStorage) -> None:
+        """Moving root to another destination must remain prohibited."""
+        with pytest.raises(OSError, match="Cannot move root"):
+            await dav_mocked.move("/", "/elsewhere")
+
 
 class TestCopytreeFallback:
     async def test_server_copy_501_triggers_fallback(self, dav_mocked: DavStorage, mocker: MockerFixture) -> None:
@@ -721,3 +764,213 @@ class TestCopytreeFallbackRollback:
         flattened = list(flatten_exception_group(caught.value))
         assert "copy failed" in str(flattened[0])
         assert "restore failed" in str(flattened[1])
+
+    async def test_public_copytree_restore_failure_preserves_group(
+        self, dav_mocked: DavStorage, mocker: MockerFixture
+    ) -> None:
+        snapshot = (
+            WalkEntry(
+                path="/src",
+                entries=(FileInfo(path="/src/a.txt", name="a.txt", kind=EntryKind.FILE),),
+            ),
+            WalkEntry(
+                path="/src/sub",
+                entries=(FileInfo(path="/src/sub/b.txt", name="b.txt", kind=EntryKind.FILE),),
+            ),
+        )
+
+        async def stat(path: str | PurePosixPath) -> FileInfo:
+            text = str(path)
+            if text in {"/src", "src"}:
+                return FileInfo(path="/src", name="src", kind=EntryKind.DIRECTORY)
+            if text.endswith("a.txt"):
+                return FileInfo(path="/dst/a.txt", name="a.txt", kind=EntryKind.FILE)
+            raise FileNotFoundError(text)
+
+        mocker.patch.object(dav_mocked, "stat", new=stat)
+        mocker.patch.object(dav_mocked, "exists", new=AsyncMock(return_value=True))
+        mocker.patch.object(dav_mocked, "mkdir", new=AsyncMock())
+        mocker.patch.object(dav_mocked, "copy", new=AsyncMock(side_effect=[None, OSError("copy failed")]))
+        mocker.patch.object(dav_mocked, "unlink", new=AsyncMock())
+        mocker.patch.object(
+            dav_mocked,
+            "_strict_walk_snapshot",
+            new=AsyncMock(return_value=snapshot),
+        )
+        mocker.patch.object(
+            dav_mocked._client,
+            "copy",
+            new=AsyncMock(side_effect=DavHttpStatusError("COPY", "http://u/src", 501, "not implemented")),
+        )
+        mocker.patch.object(
+            dav_mocked._client,
+            "move",
+            new=AsyncMock(side_effect=[None, OSError("restore failed")]),
+        )
+
+        with pytest.raises(BaseExceptionGroup) as caught:
+            await dav_mocked.copytree("/src", "/dst", overwrite=True)
+        flattened = list(flatten_exception_group(caught.value))
+        assert len(flattened) == 2
+        assert "copy failed" in str(flattened[0])
+        assert "restore failed" in str(flattened[1])
+
+
+class TestPathEscapeRejection:
+    """Public storage ops reject escape/NUL paths before any client request."""
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    async def test_stat_rejects_escape_before_propfind(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        path: str,
+    ) -> None:
+        propfind = mocker.patch.object(dav_mocked._client, "propfind", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.stat(path)
+        propfind.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    async def test_download_rejects_escape_before_get(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        path: str,
+    ) -> None:
+        stream_get = mocker.patch.object(dav_mocked._client, "stream_get")
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            async for _ in dav_mocked.download_stream(path):
+                pass
+        stream_get.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    async def test_upload_rejects_escape_before_put(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        path: str,
+    ) -> None:
+        put = mocker.patch.object(dav_mocked._client, "put", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.upload_bytes(b"data", path)
+        put.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    async def test_unlink_rejects_escape_before_delete(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        path: str,
+    ) -> None:
+        delete = mocker.patch.object(dav_mocked._client, "delete", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.unlink(path)
+        delete.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("src", "dst"),
+        [
+            ("../x", "safe"),
+            ("safe", "a/../../x"),
+            ("x/../y", "z"),
+            ("safe", "bad\x00name"),
+        ],
+    )
+    async def test_copy_rejects_escape_before_request(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        src: str,
+        dst: str,
+    ) -> None:
+        propfind = mocker.patch.object(dav_mocked._client, "propfind", AsyncMock())
+        copy = mocker.patch.object(dav_mocked._client, "copy", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.copy(src, dst)
+        propfind.assert_not_awaited()
+        copy.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("src", "dst"),
+        [
+            ("../x", "safe"),
+            ("safe", "a/../../x"),
+            ("x/../y", "z"),
+            ("safe", "bad\x00name"),
+        ],
+    )
+    async def test_move_rejects_escape_before_request(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        src: str,
+        dst: str,
+    ) -> None:
+        propfind = mocker.patch.object(dav_mocked._client, "propfind", AsyncMock())
+        move = mocker.patch.object(dav_mocked._client, "move", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.move(src, dst)
+        propfind.assert_not_awaited()
+        move.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "invalid_path",
+        ["../x", "a/../../x", "x/../y", "bad\x00name"],
+    )
+    @pytest.mark.parametrize("invalid_side", ["source", "destination"])
+    async def test_movetree_rejects_escape_before_request(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+        invalid_path: str,
+        invalid_side: str,
+    ) -> None:
+        src, dst = (invalid_path, "safe") if invalid_side == "source" else ("safe", invalid_path)
+        propfind = mocker.patch.object(dav_mocked._client, "propfind", AsyncMock())
+        move = mocker.patch.object(dav_mocked._client, "move", AsyncMock())
+        with pytest.raises(ValueError, match=r"NUL|\.\."):
+            await dav_mocked.movetree(src, dst)
+        propfind.assert_not_awaited()
+        move.assert_not_awaited()
+
+    async def test_allows_hidden_and_double_dot_names(
+        self,
+        dav_mocked: DavStorage,
+        mocker: MockerFixture,
+    ) -> None:
+        mocker.patch.object(
+            dav_mocked._client,
+            "propfind",
+            AsyncMock(
+                return_value=[
+                    _resource("/dav/.hidden", "{DAV:}collection"),
+                ]
+            ),
+        )
+        info = await dav_mocked.stat(".hidden")
+        assert info.path == "/.hidden"
+
+        mocker.patch.object(
+            dav_mocked._client,
+            "propfind",
+            AsyncMock(
+                return_value=[
+                    _resource("/dav/a..b"),
+                ]
+            ),
+        )
+        info = await dav_mocked.stat("a..b")
+        assert info.path == "/a..b"

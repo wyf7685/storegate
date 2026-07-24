@@ -37,11 +37,11 @@ class TestIdentityAndPaths:
             )
         )
 
-        assert first.cache_identity == rotated.cache_identity
-        assert first.cache_identity != other_user.cache_identity
-        assert first.id != other_user.id
-        assert "first" not in first.id
-        assert "first" not in first.cache_identity
+        assert first.namespace_identity == rotated.namespace_identity
+        assert first.namespace_identity != other_user.namespace_identity
+        assert first.display_id != other_user.display_id
+        assert "first" not in first.display_id
+        assert "first" not in first.namespace_identity
 
         wider_pool = FTPStorage(
             FTPConfig(
@@ -52,8 +52,8 @@ class TestIdentityAndPaths:
                 max_connections=4,
             )
         )
-        assert first.id == wider_pool.id
-        assert first.cache_identity == wider_pool.cache_identity
+        assert first.display_id == wider_pool.display_id
+        assert first.namespace_identity == wider_pool.namespace_identity
 
     async def test_rejects_traversal_and_nul(self, ftp_storage: FTPStorage) -> None:
         with pytest.raises(ValueError, match="segments"):
@@ -66,7 +66,7 @@ class TestIdentityAndPaths:
             await ftp_storage.rmdir("/")
         with pytest.raises(OSError, match="Cannot remove root"):
             await ftp_storage.rmtree("/")
-        with pytest.raises(OSError, match="Cannot move root"):
+        with pytest.raises(IsADirectoryError):
             await ftp_storage.move("/", "/elsewhere")
         with pytest.raises(OSError, match="Cannot move root"):
             await ftp_storage.movetree("/", "/elsewhere")

@@ -21,11 +21,19 @@ from .utils import (
 @final
 class StorageCollection(BaseDAVCollection):
     @override
-    def __init__(self, path: str, environ: dict[str, object], storage: AbstractStorage) -> None:
+    def __init__(
+        self,
+        path: str,
+        environ: dict[str, object],
+        storage: AbstractStorage,
+        *,
+        read_only: bool = False,
+    ) -> None:
         super().__init__(path, environ)
         self._storage = storage
         self._pure_path = PurePosixPath(path)
         self._info: FileInfo | None = None
+        self._read_only = read_only
 
     def _get_file_info(self) -> FileInfo:
         if self._info is None:
@@ -48,23 +56,27 @@ class StorageCollection(BaseDAVCollection):
 
     @override
     def create_empty_resource(self, name: str) -> StorageResource:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         path = (self._pure_path / name).as_posix()
         try:
             run_async(reject_hidden_destination, self._storage, path)
         except FileNotFoundError as exc:
             raise dav_error.DAVError(dav_error.HTTP_NOT_FOUND, path) from exc
         run_async(self._storage.upload_bytes, b"", path, overwrite=False)
-        return StorageResource(path, self.environ, self._storage)
+        return StorageResource(path, self.environ, self._storage, read_only=self._read_only)
 
     @override
     def create_collection(self, name: str) -> StorageCollection:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         path = (self._pure_path / name).as_posix()
         try:
             run_async(reject_hidden_destination, self._storage, path)
         except FileNotFoundError as exc:
             raise dav_error.DAVError(dav_error.HTTP_NOT_FOUND, path) from exc
         run_async(self._storage.mkdir, path)
-        return StorageCollection(path, self.environ, self._storage)
+        return StorageCollection(path, self.environ, self._storage, read_only=self._read_only)
 
     @override
     def get_member(self, name: str) -> StorageResource | StorageCollection | None:
@@ -76,9 +88,9 @@ class StorageCollection(BaseDAVCollection):
 
         match info.kind:
             case EntryKind.FILE:
-                return StorageResource(path, self.environ, self._storage)
+                return StorageResource(path, self.environ, self._storage, read_only=self._read_only)
             case EntryKind.DIRECTORY:
-                return StorageCollection(path, self.environ, self._storage)
+                return StorageCollection(path, self.environ, self._storage, read_only=self._read_only)
             case EntryKind.SYMLINK:
                 return None
 
@@ -100,9 +112,9 @@ class StorageCollection(BaseDAVCollection):
             path = self._pure_path.joinpath(info.name).as_posix()
             match info.kind:
                 case EntryKind.FILE:
-                    members.append(StorageResource(path, self.environ, self._storage))
+                    members.append(StorageResource(path, self.environ, self._storage, read_only=self._read_only))
                 case EntryKind.DIRECTORY:
-                    members.append(StorageCollection(path, self.environ, self._storage))
+                    members.append(StorageCollection(path, self.environ, self._storage, read_only=self._read_only))
                 case EntryKind.SYMLINK:
                     continue
         return members
@@ -116,15 +128,21 @@ class StorageCollection(BaseDAVCollection):
         return True
 
     async def _delete_visible(self) -> None:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         await require_visible_directory(self._storage, self.path)
         await self._storage.rmtree(self.path)
 
     async def _copy_visible(self, dest_path: str) -> None:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         await require_visible_directory(self._storage, self.path)
         await reject_hidden_destination(self._storage, dest_path)
         await self._storage.copytree(self.path, dest_path, overwrite=True)
 
     async def _move_visible(self, dest_path: str) -> None:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         await require_visible_directory(self._storage, self.path)
         await reject_hidden_destination(self._storage, dest_path)
         await self._storage.movetree(self.path, dest_path, overwrite=True)
@@ -143,6 +161,8 @@ class StorageCollection(BaseDAVCollection):
 
     @override
     def copy_move_single(self, dest_path: str, *, is_move: bool) -> None:
+        if self._read_only:
+            raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         run_async(require_visible_directory, self._storage, self.path)
         run_async(reject_hidden_destination, self._storage, dest_path)
         run_async(self._storage.mkdir, dest_path, parents=True, exist_ok=True)

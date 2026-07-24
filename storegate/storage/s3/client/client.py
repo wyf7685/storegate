@@ -1,12 +1,14 @@
 import base64
+import contextlib
 import hashlib
 import xml.etree.ElementTree as ET
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Literal, Self
 from urllib.parse import quote
 
+import anyio
 import anyio.lowlevel
 
 from storegate.utils import httpx
@@ -349,8 +351,93 @@ class AsyncS3Client:
         response = await self._request(method="GET", key=key, headers=headers)
         return response.content
 
-    async def put_object(self, key: str, data: bytes) -> None:
-        await self._request(method="PUT", key=key, content=data)
+    async def put_object(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> str:
+        """Upload *data* and return the response ETag (including surrounding quotes)."""
+        response = await self._request(method="PUT", key=key, content=data, headers=headers)
+        etag = response.headers.get("ETag")
+        if etag is None or etag == "":
+            raise S3ResponseParseError("Missing ETag in put_object response")
+        return etag
+
+    @contextlib.asynccontextmanager
+    async def stream_get(
+        self,
+        key: str,
+        *,
+        range_start: int | None = None,
+    ) -> AsyncIterator[httpx.Response]:
+        """Stream a signed GET response; the concurrency lease covers the full body.
+
+        When *range_start* is a positive offset, a single open-ended Range GET is issued.
+        The caller must fully consume or close the response; ``aclose``/cancel/error paths
+        all release both the HTTP response and the semaphore. Response close is shielded so
+        real cancellation cannot leave the underlying stream open.
+        """
+        headers: dict[str, str] = {}
+        if range_start is not None and range_start > 0:
+            headers["Range"] = f"bytes={range_start}-"
+
+        query: dict[str, str] = {}
+        request_path = self._build_request_path(key)
+        now = datetime.now(UTC)
+        signed_headers = self._build_signed_headers(
+            method="GET",
+            canonical_uri=request_path,
+            params=query,
+            headers=headers,
+            now=now,
+        )
+
+        client = self._require_client()
+        async with self._semaphore:
+            request = client.build_request(method="GET", url=request_path, headers=signed_headers)
+            response = await client.send(request, stream=True)
+            try:
+                if response.status_code >= 400:
+                    body_bytes = await self._read_limited_body(response, limit=4096)
+                    body = body_bytes.decode(errors="replace").strip()
+                    if not body:
+                        body = "<empty body>"
+                    raise S3HttpStatusError(
+                        method="GET",
+                        url=str(response.request.url),
+                        status_code=response.status_code,
+                        body=body,
+                    )
+                yield response
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await response.aclose()
+
+    @staticmethod
+    async def _read_limited_body(response: httpx.Response, *, limit: int) -> bytes:
+        """Read at most *limit* diagnostic bytes without trusting Content-Length."""
+        if limit <= 0:
+            return b"<body omitted: diagnostic limit is zero>"
+
+        content_length = response.headers.get("Content-Length")
+        if content_length is None:
+            return b"<body omitted: unknown content length>"
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            return b"<body omitted: invalid content length>"
+        if declared_length < 0 or declared_length > limit:
+            return b"<body omitted: content length exceeds diagnostic limit>"
+
+        body = bytearray()
+        async for chunk in response.aiter_bytes(chunk_size=limit):
+            remaining = limit - len(body)
+            body.extend(chunk[:remaining])
+            if len(body) >= limit:
+                break
+        return bytes(body)
 
     async def put_object_copy(self, source_key: str, target_key: str) -> CopyObjectResult:
         """Copy an existing S3 object to a new key (server-side, no data transfer).

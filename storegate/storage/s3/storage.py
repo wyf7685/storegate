@@ -16,10 +16,15 @@ from storegate.storage.abstract import (
     EntryKind,
     FileInfo,
     PathLike,
+    StorageCapabilities,
+    VersionedBytes,
     WalkEntry,
-    make_cache_identity,
+    make_namespace_identity,
+    validate_download_offset,
+    validate_same_path_file_operation,
+    validate_same_path_tree_operation,
 )
-from storegate.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
+from storegate.utils import ExceptionTranslator, coalesce_chunks
 
 from .client import (
     AsyncS3Client,
@@ -33,7 +38,7 @@ from .client import (
 from .utils import MultipartUploadTask, deserialize_file_info, serialize_file_info
 
 UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB
-DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB — retained for copy multipart sizing only
 # Files larger than this are copied via multipart upload to stay within
 # the CopyObject 5 GiB limit and to allow parallel part copies.
 COPY_MULTIPART_THRESHOLD = 4 * 1024 * 1024  # 4MB
@@ -47,9 +52,11 @@ translator = ExceptionTranslator(
 
 
 @translator.handles(S3HttpStatusError)
-def _(exc_group: ExceptionGroup[S3HttpStatusError], msg: str) -> OSError:
-    first = next(flatten_exception_group(exc_group))
-    return {404: FileNotFoundError, 403: PermissionError}.get(first.status_code, OSError)(f"{msg}: {first}")
+def _(exc: S3HttpStatusError, msg: str) -> OSError:
+    return {404: FileNotFoundError, 403: PermissionError}.get(exc.status_code, OSError)(f"{msg}: {exc}")
+
+
+_S3_CAPABILITIES = StorageCapabilities(compare_exchange=True)
 
 
 @final
@@ -63,14 +70,14 @@ class S3Storage(AbstractStorage):
 
     @property
     @override
-    def id(self) -> str:
+    def display_id(self) -> str:
         return f"s3:{self._config.bucket}:{self._config.region}"
 
     @property
     @override
-    def cache_identity(self) -> str:
+    def namespace_identity(self) -> str:
         config = self._config
-        return make_cache_identity(
+        return make_namespace_identity(
             "s3",
             bucket=config.bucket,
             endpoint_url=config.endpoint_url,
@@ -78,6 +85,61 @@ class S3Storage(AbstractStorage):
             region=config.region,
             scheme=config.scheme,
         )
+
+    @property
+    @override
+    def capabilities(self) -> StorageCapabilities:
+        return _S3_CAPABILITIES
+
+    @override
+    @translator.wrap("Failed to read versioned object {path}")
+    async def read_versioned(self, path: PathLike) -> VersionedBytes | None:
+        key = self._remote_path_to_key(path)
+        client = self._ensure_client()
+        # Read data and ETag from one GET so the token identifies the returned bytes.
+        try:
+            async with client.stream_get(key) as response:
+                etag = response.headers.get("ETag")
+                if etag is None or etag == "":
+                    raise S3ClientError("Missing ETag in versioned GET response")
+                data = await response.aread()
+        except S3HttpStatusError as exc:
+            if exc.status_code == 404:
+                if await self.is_dir(path):
+                    raise IsADirectoryError(f"Not a regular file: {path}") from None
+                return None
+            raise
+        return VersionedBytes(data=data, token=etag)
+
+    @override
+    @translator.wrap("Failed to compare-exchange {path}")
+    async def compare_exchange(
+        self,
+        path: PathLike,
+        *,
+        expected_token: str | None,
+        data: BytesLike,
+    ) -> VersionedBytes | None:
+        path = self.normalize_path(path)
+        client = self._ensure_client()
+        key = self._remote_path_to_key(path)
+
+        # Refuse directory markers / directory targets before conditional PUT.
+        # Conflict path must not create parents or perform other writes.
+        if await self.is_dir(path):
+            raise IsADirectoryError(f"Is a directory: {path}")
+
+        payload = bytes(data)
+        headers = {"If-None-Match": "*"} if expected_token is None else {"If-Match": expected_token}
+
+        try:
+            etag = await client.put_object(key=key, data=payload, headers=headers)
+        except S3HttpStatusError as exc:
+            if exc.status_code == 412:
+                return None
+            raise
+
+        return VersionedBytes(data=payload, token=etag)
 
     @override
     async def connect(self) -> None:
@@ -135,10 +197,9 @@ class S3Storage(AbstractStorage):
         return self._client
 
     def _remote_path_to_key(self, remote_path: PathLike) -> str:
-        path = PurePosixPath(remote_path)
-        if path.is_absolute():
-            path = path.relative_to("/")
-        return str(path) if path != PurePosixPath(".") else ""
+        path = self.normalize_path(remote_path)
+        relative = path.relative_to("/")
+        return relative.as_posix() if relative != PurePosixPath(".") else ""
 
     def _dir_key(self, path: PathLike) -> str | None:
         """返回目录标记对象的 S3 键。
@@ -207,34 +268,34 @@ class S3Storage(AbstractStorage):
         *,
         offset: int = 0,
     ) -> AsyncGenerator[bytes]:
-        client = self._ensure_client()
+        offset = validate_download_offset(offset)
         key = self._remote_path_to_key(remote_path)
+        client = self._ensure_client()
         head = await client.head_object(key=key)
         if head is None:
+            # Preserve directory/404 contract: directory markers are not downloadable files.
+            if await self.is_dir(remote_path):
+                raise IsADirectoryError(f"Is a directory: {remote_path}")
             raise FileNotFoundError(f"Object not found: {remote_path}")
         total_size = head.content_length
 
         if offset >= total_size:
             return
 
-        num_chunks = (total_size - offset + DOWNLOAD_CHUNK_SIZE - 1) // DOWNLOAD_CHUNK_SIZE
-
+        range_start = offset if offset > 0 else None
         self.log.debug(
-            f"Download: <y>{escape_tag(key)}</y> (<g>{total_size}</g> bytes, "
-            f"offset=<g>{offset}</g>, <g>{num_chunks}</g> chunks)"
+            f"Download: <y>{escape_tag(key)}</y> (<g>{total_size}</g> bytes, offset=<g>{offset}</g>, single stream GET)"
         )
-
-        for i in range(num_chunks):
-            start = offset + i * DOWNLOAD_CHUNK_SIZE
-            end = min(start + DOWNLOAD_CHUNK_SIZE - 1, total_size - 1)
-            chunk = await client.get_object(key=key, range=(start, end))
-            yield chunk
+        async with client.stream_get(key, range_start=range_start) as response:
+            async for chunk in response.aiter_bytes():
+                if chunk:
+                    yield chunk
 
     @override
     @translator.wrap("Failed to unlink {path} (missing_ok={missing_ok})")
     async def unlink(self, path: PathLike, *, missing_ok: bool = False) -> None:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
 
         # 1. 文件：直接删除
         if await client.head_object(key=key) is not None:
@@ -253,8 +314,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to remove directory {path}")
     async def rmdir(self, path: PathLike) -> None:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         if await client.head_object(key=key) is not None:
             raise NotADirectoryError(f"Not a directory: {path}")
         if await self.is_dir(path):
@@ -269,8 +330,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to delete {path}")
     async def delete(self, path: PathLike) -> None:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         if await client.head_object(key=key) is not None:
             await client.delete_object(key=key)
             return
@@ -286,7 +347,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to delete objects: {paths}")
     async def delete_many(self, *paths: PathLike) -> None:
-        for path in paths:
+        normalized = tuple(self.normalize_path(path) for path in paths)
+        for path in normalized:
             try:
                 await self.delete(path)
             except FileNotFoundError:
@@ -336,23 +398,31 @@ class S3Storage(AbstractStorage):
 
     @override
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        if self._remote_path_to_key(src) == self._remote_path_to_key(dst):
-            if not overwrite:
-                raise FileExistsError(f"Source and destination are the same: {src}")
-            if await self.is_dir(src):
-                raise IsADirectoryError(f"Is a directory: {src}")
-            if await self._ensure_client().head_object(key=self._remote_path_to_key(src)) is None:
-                raise FileNotFoundError(f"Source not found: {src}")
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
+        try:
+            source_info = await self.stat(src)
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
             return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
 
-        client = self._ensure_client()
         src_key = self._remote_path_to_key(src)
         dst_key = self._remote_path_to_key(dst)
-        try:
-            if await self.is_dir(dst):
-                raise IsADirectoryError(f"Destination is a directory: {dst}")
-        except TypeError:
-            pass
+        client = self._ensure_client()
+        if await self.is_dir(dst):
+            raise IsADirectoryError(f"Destination is a directory: {dst}")
         if not overwrite and await self.exists(dst):
             raise FileExistsError(f"Destination already exists: {dst}")
 
@@ -394,20 +464,30 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to copy {src} → {dst}")
     async def copy(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
+        try:
+            source_info = await self.stat(src)
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_file_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is EntryKind.DIRECTORY:
+            raise IsADirectoryError(f"Is a directory: {src}")
+
         src_key = self._remote_path_to_key(src)
         dst_key = self._remote_path_to_key(dst)
         client = self._ensure_client()
-        if src_key == dst_key:
-            if not overwrite:
-                raise FileExistsError(f"Source and destination are the same: {src}")
-            if await self.is_dir(src):
-                raise IsADirectoryError(f"Is a directory: {src}")
-            if await client.head_object(key=src_key) is None:
-                raise FileNotFoundError(f"Source not found: {src}")
-            return
         head = await client.head_object(key=src_key)
-        if await self.is_dir(src):
-            raise IsADirectoryError(f"Is a directory: {src}")
         if head is None:
             raise FileNotFoundError(f"Source not found: {src}")
         if await self.is_dir(dst):
@@ -476,8 +556,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to remove directory tree {path}")
     async def rmtree(self, path: PathLike) -> None:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         self.log.info(f"RmTree: <y>{escape_tag(key)}</y>")
 
         if not await self.is_dir(path):
@@ -608,17 +688,29 @@ class S3Storage(AbstractStorage):
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
-        client = self._ensure_client()
-
-        # 类型和策略校验
-        if not await self.is_dir(src):
-            raise NotADirectoryError(f"Not a directory: {src}")
-        if not overwrite and await self.is_dir(dst):
-            raise FileExistsError(f"Destination already exists: {dst}")
-
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
+        try:
+            source_info = await self.stat(src)
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_tree_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {src}")
+        if not overwrite and await self.exists(dst):
+            raise FileExistsError(f"Destination already exists: {dst}")
 
+        client = self._ensure_client()
         # walk 收集源树所有文件和目录
         file_paths: list[PurePosixPath] = []
         dir_paths: list[PurePosixPath] = []
@@ -689,6 +781,31 @@ class S3Storage(AbstractStorage):
         await self._cleanup_copytree_backups(client, backups.values())
 
     @override
+    @translator.wrap("Failed to move tree {src} → {dst} (overwrite={overwrite})")
+    async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        src = self.normalize_path(src)
+        dst = self.normalize_path(dst)
+        try:
+            source_info = await self.stat(src)
+        except FileNotFoundError:
+            source_kind = None
+        else:
+            source_kind = source_info.kind
+        if validate_same_path_tree_operation(
+            src,
+            dst,
+            source_kind=source_kind,
+            overwrite=overwrite,
+        ):
+            return
+        if source_kind is None:
+            raise FileNotFoundError(f"Source not found: {src}")
+        if source_kind is not EntryKind.DIRECTORY:
+            raise NotADirectoryError(f"Not a directory: {src}")
+        await self.copytree(src, dst, overwrite=overwrite)
+        await self.rmtree(src)
+
+    @override
     @translator.wrap("Failed to check existence of {path}")
     async def exists(self, path: PathLike) -> bool:
         try:
@@ -700,8 +817,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to check if path is a file: {path}")
     async def is_file(self, path: PathLike) -> bool:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         return await client.head_object(key=key) is not None
 
     @override
@@ -716,9 +833,9 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to stat {path}")
     async def stat(self, path: PathLike) -> FileInfo:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
         np = self.normalize_path(path)
+        client = self._ensure_client()
 
         # 根目录：不需要 S3 请求
         if key == "":
@@ -807,8 +924,8 @@ class S3Storage(AbstractStorage):
     @override
     @translator.wrap("Failed to list directory {path}")
     async def list_(self, path: PathLike) -> list[FileInfo]:
-        client = self._ensure_client()
         key = self._remote_path_to_key(path)
+        client = self._ensure_client()
         prefix = (key + "/") if key else None
         infos: list[FileInfo] = []
 
