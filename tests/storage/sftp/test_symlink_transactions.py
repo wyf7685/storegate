@@ -6,6 +6,7 @@ from pydantic import SecretStr
 
 from storegate.storage import EntryKind
 from storegate.storage.sftp import SFTPConfig, SFTPStorage
+from storegate.utils import flatten_exception_group
 from tests.storage.sftp.fake_client import FakePool, FakeSFTPClient, install_fake_pool
 
 
@@ -243,4 +244,97 @@ async def test_tree_failure_group_keeps_primary_first_and_recovers_without_leaks
     assert str(captured.value.exceptions[0]) == "primary mutation failure"
     assert await storage.readlink("/destination/link") == "old-missing"
     assert await storage.readlink("/source/link") == "new-missing"
+    assert_no_temporaries(client)
+
+
+@pytest.mark.anyio
+async def test_overwrite_upload_commits_without_posix_rename() -> None:
+    """Servers lacking posix-rename@openssh.com take the staged backup path.
+
+    That whole fallback -- rename target aside, rename temp into place, drop the
+    backup -- was never executed by the suite because the fake always implemented
+    the extension.
+    """
+    storage, client, _ = fake_storage()
+    client.supports_posix_rename = False
+    client.add_dir("/storage/root")
+    client.add_file("/storage/root/file.bin", b"old-content")
+
+    await storage.upload_bytes(b"new-content", "/root/file.bin")
+
+    assert await storage.download_bytes("/root/file.bin") == b"new-content"
+    assert_no_temporaries(client)
+
+
+@pytest.mark.anyio
+async def test_staged_commit_rollback_restores_target_without_posix_rename() -> None:
+    """If the temp->target rename fails, the backup must come back."""
+    storage, client, _ = fake_storage()
+    client.supports_posix_rename = False
+    client.add_dir("/storage/root")
+    client.add_file("/storage/root/file.bin", b"old-content")
+
+    target = "/storage/root/file.bin"
+    client.fail(
+        "rename",
+        lambda args: (
+            ".storegate-" in PurePosixPath(str(args[0])).name
+            and ".storegate-backup-" not in PurePosixPath(str(args[0])).name
+            and args[1] == target
+        ),
+        OSError("staged commit failure"),
+    )
+
+    with pytest.raises(OSError, match="staged commit failure"):
+        await storage.upload_bytes(b"new-content", "/root/file.bin")
+
+    # The original content is intact and nothing is stranded under a temp name.
+    assert await storage.download_bytes("/root/file.bin") == b"old-content"
+    assert_no_temporaries(client)
+
+
+@pytest.mark.anyio
+async def test_staged_commit_rollback_failure_is_grouped_primary_first() -> None:
+    """When restoring the backup also fails, both errors survive, primary first."""
+    storage, client, _ = fake_storage()
+    client.supports_posix_rename = False
+    client.add_dir("/storage/root")
+    client.add_file("/storage/root/file.bin", b"old-content")
+
+    target = "/storage/root/file.bin"
+    client.fail(
+        "rename",
+        lambda args: (
+            ".storegate-" in PurePosixPath(str(args[0])).name
+            and ".storegate-backup-" not in PurePosixPath(str(args[0])).name
+            and args[1] == target
+        ),
+        OSError("staged commit failure"),
+    )
+    client.fail(
+        "rename",
+        lambda args: ".storegate-backup-" in PurePosixPath(str(args[0])).name and args[1] == target,
+        OSError("backup restore failure"),
+    )
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        await storage.upload_bytes(b"new-content", "/root/file.bin")
+
+    flattened = list(flatten_exception_group(captured.value))
+    assert str(flattened[0]) == "staged commit failure"
+    assert any("backup restore failure" in str(exc) for exc in flattened[1:])
+
+
+@pytest.mark.anyio
+async def test_move_overwrite_uses_backup_path_without_posix_rename() -> None:
+    storage, client, _ = fake_storage()
+    client.supports_posix_rename = False
+    client.add_dir("/storage/root")
+    client.add_file("/storage/root/source.bin", b"source-content")
+    client.add_file("/storage/root/target.bin", b"target-content")
+
+    await storage.move("/root/source.bin", "/root/target.bin", overwrite=True)
+
+    assert await storage.download_bytes("/root/target.bin") == b"source-content"
+    assert not await storage.exists("/root/source.bin")
     assert_no_temporaries(client)

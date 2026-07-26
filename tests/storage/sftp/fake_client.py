@@ -48,6 +48,9 @@ class FakeSFTPClient:
         self.failures: list[FailureRule] = []
         self.readlink_calls: list[str] = []
         self.symlink_calls: list[tuple[str, str]] = []
+        # Servers without the OpenSSH posix-rename@openssh.com extension force the
+        # staged backup/rename fallback. Flip this to model one.
+        self.supports_posix_rename = True
 
     @staticmethod
     def _path(path: str | PurePosixPath) -> PurePosixPath:
@@ -232,6 +235,8 @@ class FakeSFTPClient:
     async def posix_rename(self, source: str, destination: str) -> None:
         args: tuple[object, ...] = (source, destination)
         self._check_failure("posix_rename", args, after=False)
+        if not self.supports_posix_rename:
+            raise asyncssh.SFTPOpUnsupported("posix-rename@openssh.com is not supported")
         src = self._path(source)
         dst = self._path(destination)
         if src not in self.nodes:
