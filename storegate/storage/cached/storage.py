@@ -679,12 +679,14 @@ class CachedStorage(AbstractStorage):
 
     @override
     async def _is_dir_empty(self, path: PathLike) -> bool:
-        # Serve from a cached listing when present, otherwise delegate so
-        # backends with a cheap emptiness probe (S3 max_keys=2, DAV Depth:1)
-        # keep it instead of paying a full iterdir through this layer.
+        # This gates destructive rmdir/delete, so a cached listing may only *veto*
+        # the operation, never authorize it. A stale "empty" snapshot would let
+        # rmdir destroy a directory that has since regained children, so emptiness
+        # is always confirmed against the backend -- which keeps its cheap probe
+        # (S3 max_keys=2, DAV Depth:1) instead of paying a full iterdir here.
         cached: list[FileInfo] | None = await self._cache.get("iterdir", self._normalize(path))
-        if cached is not None:
-            return not cached
+        if cached:
+            return False
         return await self._storage._is_dir_empty(path)  # noqa: SLF001
 
     @override

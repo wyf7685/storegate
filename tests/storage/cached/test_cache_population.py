@@ -1,5 +1,8 @@
 """CachedStorage behavior tests."""
 
+import pytest
+
+from storegate.storage.abstract import PathLike
 from storegate.storage.cached import CachedStorage
 from tests.storage.cached.helpers import _clear_path
 from tests.support.ids import uid
@@ -173,6 +176,58 @@ class TestIterdirCacheHit:
             entries2 = [e async for e in cached.iterdir(dirpath)]
             assert len(entries2) == 1
             assert entries2[0].name == "a.txt"
+        finally:
+            await cached.rmtree(dirpath)
+
+
+class TestIsDirEmptyGate:
+    """``_is_dir_empty`` gates destructive rmdir/delete, so it must never trust a stale
+    cached listing that says "empty"."""
+
+    async def test_stale_empty_listing_does_not_authorize_rmdir(self, cached: CachedStorage):
+        dirpath = f"test-emptygate-stale-{uid()}"
+        filepath = f"{dirpath}/appeared.txt"
+        try:
+            await cached.mkdir(dirpath)
+
+            # Warm the iterdir cache while the directory really is empty.
+            assert [e async for e in cached.iterdir(dirpath)] == []
+            assert dirpath in cached.dump_cache().get("iterdir", {})
+
+            # A child appears out of band (a second process / sibling CachedStorage),
+            # so the cached "empty" snapshot is now stale.
+            await cached._storage.upload_bytes(b"data", filepath)
+
+            assert await cached._is_dir_empty(dirpath) is False
+            with pytest.raises(OSError, match="not empty"):
+                await cached.rmdir(dirpath)
+            assert await cached._storage.download_bytes(filepath) == b"data"
+        finally:
+            await cached.rmtree(dirpath)
+
+    async def test_cached_non_empty_listing_still_vetoes_without_backend_probe(self, cached: CachedStorage):
+        """A cached listing may veto the operation outright -- that direction is safe."""
+        dirpath = f"test-emptygate-veto-{uid()}"
+        filepath = f"{dirpath}/a.txt"
+        try:
+            await cached.mkdir(dirpath)
+            await cached.upload_bytes(b"a", filepath)
+            assert len([e async for e in cached.iterdir(dirpath)]) == 1
+
+            probed = False
+            original_probe = cached._storage._is_dir_empty
+
+            async def _tracking_probe(path: PathLike) -> bool:
+                nonlocal probed
+                probed = True
+                return await original_probe(path)
+
+            cached._storage._is_dir_empty = _tracking_probe  # ty: ignore[invalid-assignment]
+            try:
+                assert await cached._is_dir_empty(dirpath) is False
+            finally:
+                cached._storage._is_dir_empty = original_probe  # ty: ignore[invalid-assignment]
+            assert not probed, "a non-empty cached listing should veto without a backend probe"
         finally:
             await cached.rmtree(dirpath)
 
