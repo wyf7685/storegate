@@ -15,6 +15,19 @@ from storegate.storage.index.lock import LockLeaseLostError, StorageFileLocker
 from storegate.storage.index.ref import hash_to_path
 from storegate.storage.memory import MemoryStorage
 
+# Tests that assert cleanup is *bounded* reuse ``lock_timeout`` as the cleanup
+# budget, but the same knob also bounds the uncontended acquisition those tests
+# must first complete. Keep it generous enough to survive a loaded CI box: the
+# proof is that cleanup finishes within a bound at all, not that the bound is
+# small. The outer deadline stays a multiple above so a regression that hangs
+# forever still fails instead of silently passing.
+CLEANUP_LOCK_TIMEOUT = 0.5
+CLEANUP_OUTER_DEADLINE = 2.5
+# Deadline used to *trigger* an external cancellation while the holder is parked,
+# rather than as a safety net. It must fire well before CLEANUP_OUTER_DEADLINE so
+# the shielded cleanup that follows still has room to finish inside the test.
+CANCEL_TRIGGER_DEADLINE = 0.15
+
 
 class _CommitThenBlockStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
     def __init__(self, blocked_path: str):
@@ -481,7 +494,7 @@ async def test_release_backend_operations_respect_cleanup_deadline(blocked_opera
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.08, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=CLEANUP_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
         lease = await storage._locker.acquire_lock(index, "/release-timeout.lock")
         assert lease is not None
@@ -492,7 +505,7 @@ async def test_release_backend_operations_respect_cleanup_deadline(blocked_opera
         else:
             index.block_unlink = True
         key = f"{index.namespace_identity}:/release-timeout.lock"
-        with anyio.fail_after(0.3) as outer_timeout:
+        with anyio.fail_after(CLEANUP_OUTER_DEADLINE) as outer_timeout:
             with pytest.raises(TimeoutError, match="Timed out releasing"):
                 await storage._locker.release_lock(index, "/release-timeout.lock", lease)
         assert not outer_timeout.cancel_called
@@ -505,7 +518,7 @@ async def test_release_guard_wait_respects_cleanup_deadline() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=CLEANUP_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
         lease = await storage._locker.acquire_lock(index, "/release-guard.lock")
         assert lease is not None
@@ -520,7 +533,7 @@ async def test_release_guard_wait_respects_cleanup_deadline() -> None:
         async with anyio.create_task_group() as tg:
             tg.start_soon(hold_guard)
             await entered.wait()
-            with anyio.fail_after(0.15) as outer_timeout:
+            with anyio.fail_after(CLEANUP_OUTER_DEADLINE) as outer_timeout:
                 with pytest.raises(TimeoutError, match="Timed out releasing"):
                     await storage._locker.release_lock(index, "/release-guard.lock", lease)
             assert not outer_timeout.cancel_called
@@ -534,7 +547,7 @@ async def test_normal_lock_exit_propagates_cleanup_timeout() -> None:
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=CLEANUP_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
 
         async def exit_lock() -> None:
@@ -542,7 +555,7 @@ async def test_normal_lock_exit_propagates_cleanup_timeout() -> None:
                 index.block_download(1)
 
         key = f"{index.namespace_identity}:/normal-cleanup.lock"
-        with anyio.fail_after(0.15) as outer_timeout:
+        with anyio.fail_after(CLEANUP_OUTER_DEADLINE) as outer_timeout:
             with pytest.raises(TimeoutError, match="Timed out releasing"):
                 await exit_lock()
         assert not outer_timeout.cancel_called
@@ -556,7 +569,7 @@ async def test_cancelled_lock_exit_bounds_cleanup_and_reclaims_registry() -> Non
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.08, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=CLEANUP_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
 
         async def hold_lock() -> None:
@@ -566,7 +579,7 @@ async def test_cancelled_lock_exit_bounds_cleanup_and_reclaims_registry() -> Non
 
         key = f"{index.namespace_identity}:/cancel-cleanup.lock"
         with pytest.raises(TimeoutError):
-            with anyio.fail_after(0.3) as outer_timeout:
+            with anyio.fail_after(CANCEL_TRIGGER_DEADLINE) as outer_timeout:
                 await hold_lock()
         assert outer_timeout.cancel_called
         assert key not in StorageFileLocker.local_lock_guards
@@ -580,10 +593,10 @@ async def test_partial_lock_rollback_bounds_cleanup_failure() -> None:
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=CLEANUP_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
         key = f"{index.namespace_identity}:/a.lock"
-        with anyio.fail_after(0.15) as outer_timeout:
+        with anyio.fail_after(CLEANUP_OUTER_DEADLINE) as outer_timeout:
             with pytest.raises(RuntimeError, match="later lock failure"):
                 async with storage._lock_indexes("/b", "/a"):
                     raise AssertionError("multi-lock context unexpectedly yielded")
