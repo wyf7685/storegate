@@ -108,21 +108,32 @@ class AsyncDavClient:
 
     @contextlib.asynccontextmanager
     async def stream_get(self, path: str, *, range_start: int | None = None) -> AsyncIterator[httpx.Response]:
-        """Stream a GET response body without buffering it fully into memory."""
+        """Stream a GET response body without buffering it fully into memory.
+
+        The concurrency lease covers the full body, mirroring ``AsyncS3Client.stream_get``:
+        a streamed GET pins a connection for as long as the consumer reads it, so leaving
+        it outside the semaphore would let streaming reads fan out past ``max_concurrency``
+        and starve every other request of the httpx pool.
+        """
         client = self._require_client()
         headers: dict[str, str] = {}
         if range_start:
             headers["Range"] = f"bytes={range_start}-"
         request = client.build_request("GET", self._build_url(path), headers=headers)
-        response = await client.send(request, stream=True)
-        try:
-            if response.status_code >= 400:
-                await response.aread()
-                body = response.text.strip() or "<empty body>"
-                raise DavHttpStatusError("GET", str(response.request.url), response.status_code, body)
-            yield response
-        finally:
-            await response.aclose()
+        async with self._semaphore:
+            response = await client.send(request, stream=True)
+            try:
+                if response.status_code >= 400:
+                    await response.aread()
+                    body = response.text.strip() or "<empty body>"
+                    raise DavHttpStatusError("GET", str(response.request.url), response.status_code, body)
+                yield response
+            finally:
+                # Shielded: an unshielded aclose() raises CancelledError at its first
+                # checkpoint when the consumer is cancelled mid-stream, so the connection
+                # is never returned to the pool.
+                with anyio.CancelScope(shield=True):
+                    await response.aclose()
 
     async def put(self, path: str, content: bytes | AsyncIterator[bytes]) -> None:
         await self._request(method="PUT", path=path, content=content)
