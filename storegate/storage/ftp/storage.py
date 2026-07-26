@@ -793,6 +793,15 @@ class FTPStorage(AbstractStorage):
                 await self._reconcile_move_failure(source, destination, temporary, destination_existed)
                 raise failure
             if backup_exists is None:
+                # The probe itself failed, so reconcile cannot run: the previous
+                # destination content may survive only under the temporary name.
+                # Say so -- otherwise the caller sees a plain move failure and has
+                # no idea a backup is stranded.
+                self.log.error(
+                    f"Could not determine move backup state for <y>{escape_tag(temporary)}</y>; "
+                    f"destination <y>{escape_tag(destination)}</y> may survive only under that "
+                    f"temporary name and was not reconciled"
+                )
                 raise failure
             self.log.warning(f"Move backup cleanup response lost after commit: {temporary}")
 

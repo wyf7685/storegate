@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+from unittest.mock import AsyncMock
 
 import anyio
 import pytest
@@ -722,6 +723,130 @@ class TestTreeTransactionRollback:
             assert await storage.download_bytes(f"{dst}/one.txt") == b"old-one"
             assert await storage.download_bytes(f"{dst}/two.txt") == b"old-two"
         finally:
+            with contextlib.suppress(Exception):
+                await storage.rmtree(src)
+            with contextlib.suppress(Exception):
+                await storage.rmtree(dst)
+
+    async def test_rollback_failure_is_grouped_primary_first(
+        self, index_storage: IndexStorage, mocker: MockerFixture
+    ) -> None:
+        """When the rollback itself fails, both errors must survive, primary first.
+
+        This is the last line of defence for a whole-tree operation: if it
+        mis-reports, a half-copied tree looks like a plain OSError and the caller
+        retries into a corrupt state.
+        """
+        storage = index_storage
+        src = f"test-tree-dblfail-src-{uid()}"
+        dst = f"test-tree-dblfail-dst-{uid()}"
+        try:
+            await storage.upload_bytes(b"new-one", f"{src}/one.txt")
+            await storage.upload_bytes(b"new-two", f"{src}/two.txt")
+            await storage.upload_bytes(b"old-one", f"{dst}/one.txt")
+
+            original_copy = storage.copy
+
+            async def fail_second(source: str, destination: str, *, overwrite: bool = True) -> None:
+                if str(destination).endswith("/two.txt"):
+                    raise OSError("injected tree copy failure")
+                await original_copy(source, destination, overwrite=overwrite)
+
+            mocker.patch.object(storage, "copy", fail_second)
+            mocker.patch.object(
+                storage,
+                "_restore_tree_transaction",
+                AsyncMock(side_effect=RuntimeError("injected rollback failure")),
+            )
+
+            with pytest.raises(BaseExceptionGroup) as caught:
+                await storage.copytree(src, dst, overwrite=True)
+
+            flattened = list(flatten_exception_group(caught.value))
+            assert len(flattened) == 2
+            assert "injected tree copy failure" in str(flattened[0])
+            assert "injected rollback failure" in str(flattened[1])
+        finally:
+            mocker.stopall()
+            with contextlib.suppress(Exception):
+                await storage.rmtree(src)
+            with contextlib.suppress(Exception):
+                await storage.rmtree(dst)
+
+    async def test_guard_release_failure_is_reported_when_rollback_succeeds(
+        self, index_storage: IndexStorage, mocker: MockerFixture
+    ) -> None:
+        """A stranded rollback guard pins chunk data forever, so it must not be silent."""
+        storage = index_storage
+        src = f"test-tree-guardfail-src-{uid()}"
+        dst = f"test-tree-guardfail-dst-{uid()}"
+        try:
+            await storage.upload_bytes(b"new-one", f"{src}/one.txt")
+            await storage.upload_bytes(b"new-two", f"{src}/two.txt")
+            await storage.upload_bytes(b"old-one", f"{dst}/one.txt")
+
+            original_copy = storage.copy
+
+            async def fail_second(source: str, destination: str, *, overwrite: bool = True) -> None:
+                if str(destination).endswith("/two.txt"):
+                    raise OSError("injected tree copy failure")
+                await original_copy(source, destination, overwrite=overwrite)
+
+            mocker.patch.object(storage, "copy", fail_second)
+            mocker.patch.object(
+                storage._refs,
+                "release_tree_rollback_guards",
+                AsyncMock(side_effect=RuntimeError("injected guard release failure")),
+            )
+
+            with pytest.raises(BaseExceptionGroup) as caught:
+                await storage.copytree(src, dst, overwrite=True)
+
+            flattened = list(flatten_exception_group(caught.value))
+            assert "injected tree copy failure" in str(flattened[0])
+            assert "injected guard release failure" in str(flattened[1])
+        finally:
+            mocker.stopall()
+            with contextlib.suppress(Exception):
+                await storage.rmtree(src)
+            with contextlib.suppress(Exception):
+                await storage.rmtree(dst)
+
+    async def test_cancelled_rollback_takes_precedence_over_primary(
+        self, index_storage: IndexStorage, mocker: MockerFixture
+    ) -> None:
+        """A cancelled rollback must propagate the cancellation, not the primary error.
+
+        Swapping a CancelledError for an OSError here would let the surrounding
+        cancel scope believe the task ran to completion.
+        """
+        storage = index_storage
+        src = f"test-tree-cancelroll-src-{uid()}"
+        dst = f"test-tree-cancelroll-dst-{uid()}"
+        try:
+            await storage.upload_bytes(b"new-one", f"{src}/one.txt")
+            await storage.upload_bytes(b"new-two", f"{src}/two.txt")
+            await storage.upload_bytes(b"old-one", f"{dst}/one.txt")
+
+            original_copy = storage.copy
+
+            async def fail_second(source: str, destination: str, *, overwrite: bool = True) -> None:
+                if str(destination).endswith("/two.txt"):
+                    raise OSError("injected tree copy failure")
+                await original_copy(source, destination, overwrite=overwrite)
+
+            cancelled_cls = anyio.get_cancelled_exc_class()
+            mocker.patch.object(storage, "copy", fail_second)
+            mocker.patch.object(
+                storage,
+                "_restore_tree_transaction",
+                AsyncMock(side_effect=cancelled_cls()),
+            )
+
+            with pytest.raises(cancelled_cls):
+                await storage.copytree(src, dst, overwrite=True)
+        finally:
+            mocker.stopall()
             with contextlib.suppress(Exception):
                 await storage.rmtree(src)
             with contextlib.suppress(Exception):

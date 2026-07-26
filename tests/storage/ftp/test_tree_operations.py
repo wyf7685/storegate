@@ -1,9 +1,11 @@
 """FTPStorage behavior tests."""
 
 from pathlib import PurePosixPath
+from unittest.mock import AsyncMock
 
 import aioftp
 import pytest
+from pytest_mock import MockerFixture
 
 from storegate.storage.ftp import FTPStorage
 from storegate.utils import flatten_exception_group
@@ -304,6 +306,45 @@ class TestCopyAndTrees:
             entries = [info async for info in ftp_storage.iterdir(base)]
             assert not any(info.name.startswith(".storegate-move-") for info in entries)
         finally:
+            await ftp_storage.rmtree(base)
+
+    async def test_move_backup_probe_failure_reports_unreconciled_backup(
+        self, ftp_storage: FTPStorage, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+    ) -> None:
+        """When the probe fails, reconcile cannot run -- that must not be silent.
+
+        The previous destination content may survive only as `.storegate-move-*`,
+        so the caller needs to be told rather than seeing a plain move failure.
+        """
+        base = f"/ftp-move-probe-failure-{uid()}"
+        source = PurePosixPath(base, "source.bin")
+        destination = PurePosixPath(base, "destination.bin")
+        await ftp_storage.upload_bytes(b"source", source)
+        await ftp_storage.upload_bytes(b"existing", destination)
+        original_rename = aioftp.Client.rename
+        raised = False
+
+        async def mutate_then_raise(client: aioftp.Client, old: str, new: str) -> None:
+            nonlocal raised
+            await original_rename(client, old, new)
+            if not raised and old.endswith("/source.bin") and new.endswith("/destination.bin"):
+                raised = True
+                raise OSError("rename response lost after commit")
+
+        monkeypatch.setattr(aioftp.Client, "rename", mutate_then_raise)
+        mocker.patch.object(FTPStorage, "_move_backup_exists", AsyncMock(return_value=None))
+        error = mocker.patch.object(ftp_storage.log, "error")
+        try:
+            with pytest.raises(OSError, match="rename response lost"):
+                await ftp_storage.move(source, destination, overwrite=True)
+
+            error.assert_called_once()
+            message = error.call_args.args[0]
+            assert ".storegate-move-" in message
+            assert "not reconciled" in message
+        finally:
+            mocker.stopall()
+            monkeypatch.setattr(aioftp.Client, "rename", original_rename)
             await ftp_storage.rmtree(base)
 
     async def test_movetree_failure_keeps_source(
