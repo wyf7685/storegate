@@ -66,6 +66,13 @@ except ImportError:
 
 @functools.cache
 def is_uvloop_available() -> bool:
+    """Report whether the optional ``uvloop`` extra is installed.
+
+    Checks ``winloop`` on Windows and ``uvloop`` elsewhere, matching the
+    platform split that AnyIO's ``use_uvloop`` backend option performs. Pass
+    the result as ``anyio.run(..., backend_options={"use_uvloop": ...})``
+    so AnyIO imports the accelerated loop only when it is present.
+    """
     module_name = "winloop" if sys.platform == "win32" else "uvloop"
     try:
         importlib.metadata.version(module_name)
@@ -85,16 +92,18 @@ def requires_extra(*check_package_names: str, extra_name: str) -> None:
             ) from None
 
 
-type _ValidLogLevel = Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]
-_valid_log_levels: set[_ValidLogLevel] = {
-    "TRACE",
-    "DEBUG",
-    "INFO",
-    "SUCCESS",
-    "WARNING",
-    "ERROR",
-    "CRITICAL",
-}
+type ValidLogLevel = Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]
+VALID_LOG_LEVELS: frozenset[ValidLogLevel] = frozenset(
+    {
+        "TRACE",
+        "DEBUG",
+        "INFO",
+        "SUCCESS",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
+    }
+)
 
 
 class LoguruOpts(TypedDict, total=False):
@@ -115,7 +124,7 @@ class LoggerWrapper:
 
     def log(
         self,
-        level: _ValidLogLevel,
+        level: ValidLogLevel,
         message: str,
         **opts: Unpack[LoguruOpts],
     ) -> None:
@@ -138,7 +147,7 @@ class LoggerWrapper:
 
         def __getattr__(self, item: str) -> Callable[[str, Exception | None], None]:
             level = item.upper()
-            if level not in _valid_log_levels:
+            if level not in VALID_LOG_LEVELS:
                 raise AttributeError(f"Invalid log level: {item}")
 
             def method(message: str, **opts: Unpack[LoguruOpts]) -> None:

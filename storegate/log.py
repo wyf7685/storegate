@@ -6,13 +6,11 @@ Use ``configure_logging()`` to explicitly add sinks.
 
 from __future__ import annotations
 
-import functools
 import inspect
 import logging
 import logging.config
 import re
 import sys
-from collections.abc import Callable
 from types import TracebackType
 from typing import Self
 
@@ -62,21 +60,6 @@ LOGGING_CONFIG: dict[str, object] = {
 }
 
 log_format = "<g>{time:HH:mm:ss}</g> [<lvl>{level:>7}</lvl>] <c><u>{name}</u></c> | {message}"
-
-
-@functools.cache
-def get_log_level() -> int:
-    return logger.level("DEBUG").no
-
-
-def log_level_filter() -> Callable[[loguru.Record], bool]:
-    def filter_func(record: loguru.Record) -> bool:
-        try:
-            return record["level"].no >= get_log_level()
-        except Exception:
-            return True
-
-    return filter_func
 
 
 _HIDDEN_NAMES = ("uvicorn", "starlette", "httpx", "httpx2", "wsgidav", "aioftp")
@@ -171,7 +154,6 @@ def configure_logging(
                 diagnose=diagnose,
                 enqueue=enqueue,
                 format=log_format,
-                filter=log_level_filter(),
             )
         )
 

@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 from pathlib import Path
 from typing import Any, NoReturn
 
+import anyio
 from pydantic import ValidationError
 
 from storegate.factory import FactoryMode, resolve_server
 from storegate.log import configure_logging, logger
 from storegate.server.abstract import AbstractServer
+from storegate.utils import VALID_LOG_LEVELS, is_uvloop_available
 
 EXIT_OK = 0
 EXIT_RUNTIME = 1
@@ -39,6 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log-level",
         default="INFO",
+        choices=sorted(VALID_LOG_LEVELS),
+        type=str.upper,
         help="Log level (default: INFO)",
     )
     parser.add_argument(
@@ -198,11 +203,18 @@ def main(argv: list[str] | None = None) -> int:
     logger.remove()
     configure_logging(level=args.log_level, file_path=args.log_file)
 
+    backend_options = {"use_uvloop": is_uvloop_available()}
     try:
         if args.command == "check":
-            return asyncio.run(cmd_check(args.config, trusted=args.trusted_factory))
+            return anyio.run(
+                functools.partial(cmd_check, args.config, trusted=args.trusted_factory),
+                backend_options=backend_options,
+            )
         if args.command == "serve":
-            return asyncio.run(cmd_serve(args.config, trusted=args.trusted_factory))
+            return anyio.run(
+                functools.partial(cmd_serve, args.config, trusted=args.trusted_factory),
+                backend_options=backend_options,
+            )
         parser.error(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
         return EXIT_INTERRUPTED
