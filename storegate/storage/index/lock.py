@@ -4,7 +4,7 @@ import json
 import uuid
 from collections.abc import AsyncGenerator, Iterable
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import ClassVar, Literal
 
 import anyio
 import anyio.lowlevel
@@ -15,9 +15,6 @@ from storegate.storage.abstract import PathLike
 from storegate.utils import logger_wrapper
 
 from ._guard import download_private_file, lstat_private_entry, lstat_private_entry_or_none
-
-if TYPE_CHECKING:
-    from .storage import IndexStorage
 
 
 class LockLeaseLostError(RuntimeError):
@@ -53,7 +50,7 @@ class StorageFileLocker:
 
     def __init__(
         self,
-        storage: IndexStorage,
+        storage: AbstractStorage,
         lock_lease: float,
         lock_timeout: float,
         lock_mode: _LockMode = "strong",

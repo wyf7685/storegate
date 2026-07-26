@@ -1,7 +1,6 @@
 import contextlib
 import uuid
 from collections.abc import AsyncGenerator, Callable, Iterable
-from typing import TYPE_CHECKING
 
 import anyio
 
@@ -12,9 +11,6 @@ from storegate.utils import logger_wrapper
 
 from ._guard import download_private_file, lstat_private_entry_or_none
 
-if TYPE_CHECKING:
-    from .storage import IndexStorage
-
 
 def hash_to_path(hash_str: str, suffix: str | None = None) -> str:
     """Convert a hash string to a path with subdirectories."""
@@ -24,7 +20,7 @@ def hash_to_path(hash_str: str, suffix: str | None = None) -> str:
 class ChunkRefManager:
     def __init__(
         self,
-        storage: IndexStorage,
+        storage: AbstractStorage,
         chunks: AbstractStorage,
         lock_chunk: Callable[[str], contextlib.AbstractAsyncContextManager[object]],
     ):
