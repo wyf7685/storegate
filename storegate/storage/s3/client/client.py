@@ -294,6 +294,7 @@ class AsyncS3Client:
         response = await self._request(method="GET", key="", params=params)
         root = _parse_xml(response.content)
         is_truncated = _find_required_text(root, "IsTruncated").lower() == "true"
+        seen_tokens: set[str] = set()
 
         while True:
             for common_prefix in root.findall(".//{*}CommonPrefixes"):
@@ -317,7 +318,18 @@ class AsyncS3Client:
             if not is_truncated:
                 break
 
+            # A server that keeps reporting truncation without advancing the token
+            # would spin here forever, hanging every walk/rmtree against it. The
+            # token is the only thing that makes progress, so refusing to repeat
+            # one is both necessary and sufficient to terminate.
             next_token = _find_required_text(root, "NextContinuationToken")
+            if next_token in seen_tokens:
+                raise S3ResponseParseError(
+                    "S3 list_objects reported more results but repeated continuation token "
+                    f"{next_token!r}; refusing to loop forever"
+                )
+            seen_tokens.add(next_token)
+
             response = await self._request(method="GET", key="", params=params | {"continuation-token": next_token})
             root = _parse_xml(response.content)
             is_truncated = _find_required_text(root, "IsTruncated").lower() == "true"

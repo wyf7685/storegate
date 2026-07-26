@@ -91,6 +91,64 @@ async def test_list_objects_paginates_and_parses_entries() -> None:
     assert requests[1].url.params["continuation-token"] == "token-2"
 
 
+async def test_list_objects_rejects_repeated_continuation_token() -> None:
+    """A server that never advances the token must not spin the generator forever.
+
+    Regression: `while True` was bounded only by IsTruncated, so an S3-compatible
+    server returning the same token indefinitely hung every walk/rmtree against it.
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            content=b"""
+                <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <IsTruncated>true</IsTruncated>
+                  <NextContinuationToken>stuck</NextContinuationToken>
+                  <Contents>
+                    <Key>root/loop.txt</Key>
+                    <LastModified>2025-01-01T00:00:00+00:00</LastModified>
+                    <ETag>etag-loop</ETag>
+                    <Size>1</Size>
+                  </Contents>
+                </ListBucketResult>
+            """,
+        )
+
+    async with _mocked_client(handler) as client:
+        with pytest.raises(S3ResponseParseError, match="repeated continuation token"):
+            _ = [item async for item in client.list_objects(prefix="root")]
+
+    # Terminates on the second page rather than looping.
+    assert len(requests) == 2
+
+
+async def test_list_objects_rejects_truncated_page_without_token() -> None:
+    """IsTruncated=true with no NextContinuationToken is unusable, not "the end"."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"""
+                <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <IsTruncated>true</IsTruncated>
+                  <Contents>
+                    <Key>root/partial.txt</Key>
+                    <LastModified>2025-01-01T00:00:00+00:00</LastModified>
+                    <ETag>etag-partial</ETag>
+                    <Size>2</Size>
+                  </Contents>
+                </ListBucketResult>
+            """,
+        )
+
+    async with _mocked_client(handler) as client:
+        with pytest.raises(S3ResponseParseError, match="NextContinuationToken"):
+            _ = [item async for item in client.list_objects(prefix="root")]
+
+
 async def test_list_objects_rejects_malformed_xml() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"<ListBucketResult>")
