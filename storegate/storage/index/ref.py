@@ -79,7 +79,16 @@ class ChunkRefManager:
 
         refs = await self.load_refs(chunk_hash)
         if refs is None:
-            self.log.warning(f"Chunk {_colored_hash} ref file missing, skip decref ({_colored_remote_paths})")
+            # The ref file is the only record of which paths share this chunk, so
+            # its loss means we can no longer tell whether the data is still in
+            # use. Deleting the .bin would break every file that still points at
+            # it, and raising would make a corrupted store undeletable -- so the
+            # chunk is deliberately leaked, loudly, with the key an operator needs.
+            self.log.warning(
+                f"Chunk {_colored_hash} reference file missing, skipping decref for {_colored_remote_paths}; "
+                f"leaking chunk data <y>{escape_tag(hash_to_path(chunk_hash, "bin"))}</y> "
+                f"because the remaining referrers are unknown"
+            )
             return
 
         removed = False

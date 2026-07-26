@@ -120,6 +120,60 @@ class TestRefCounting:
 
         await s.delete(path)
 
+    async def test_missing_ref_file_does_not_destroy_shared_chunk_data(self, index_storage: IndexStorage):
+        """Losing the ref file must not take the chunk data with it.
+
+        The ref file is the only record of which paths share a chunk, and
+        download reads the .bin directly. If decref deleted the orphaned .bin it
+        would break every file still pointing at it, so the chunk is leaked
+        deliberately rather than reclaimed on a guess.
+        """
+        s = index_storage
+        data = b"S" * BLOCK_SIZE
+        kept = f"test-refc-orphan-kept-{uid()}"
+        removed = f"test-refc-orphan-removed-{uid()}"
+
+        # Both files dedup onto the same chunk.
+        await s.upload_bytes(data, kept)
+        await s.upload_bytes(data, removed)
+        meta = await s._get_file_meta(kept)
+        assert meta is not None
+        chunk_hash = meta.chunks[0]
+        assert await s._refs.load_refs(chunk_hash) == {f"/{kept}", f"/{removed}"}
+
+        # The ref file is lost out of band (partial write, external deletion).
+        await s._chunks.unlink(f"{hash_to_path_stem(chunk_hash)}.ref")
+
+        await s.unlink(removed)
+
+        # The surviving file is still readable: its chunk data was not reclaimed.
+        assert await s._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin")
+        assert await s.download_bytes(kept) == data
+
+        await s.delete(kept)
+
+    async def test_missing_ref_file_is_reported_with_the_leaked_chunk(
+        self, index_storage: IndexStorage, mocker: MockerFixture
+    ):
+        """The leak is silent otherwise, so the warning must name the chunk path."""
+        s = index_storage
+        data = b"W" * BLOCK_SIZE
+        path = f"test-refc-orphan-warn-{uid()}"
+
+        await s.upload_bytes(data, path)
+        meta = await s._get_file_meta(path)
+        assert meta is not None
+        chunk_hash = meta.chunks[0]
+        await s._chunks.unlink(f"{hash_to_path_stem(chunk_hash)}.ref")
+
+        warning = mocker.patch.object(s._refs.log, "warning")
+        await s.unlink(path)
+
+        warning.assert_called_once()
+        message = warning.call_args.args[0]
+        assert "reference file missing" in message
+        assert f"{hash_to_path_stem(chunk_hash)}.bin" in message
+
     async def test_copy_increfs_chunks(self, index_storage: IndexStorage):
         data = b"C" * BLOCK_SIZE
         src = f"test-refc-copy-src-{uid()}"
