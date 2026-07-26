@@ -11,7 +11,10 @@ from storegate.log import escape_tag
 from storegate.storage.abstract import EntryKind, FileInfo
 from storegate.utils import httpx, logger_wrapper
 
-from .client import AsyncS3Client, CompletedPart
+from .client import AsyncS3Client, CompletedPart, S3HttpStatusError
+
+# Base delay between multipart part retries; doubled per attempt.
+RETRY_BACKOFF_SECONDS = 0.5
 
 
 def serialize_file_info(info: FileInfo) -> bytes:
@@ -95,10 +98,22 @@ class MultipartUploadTask:
         self._next_part_number += 1
         return value
 
+    @staticmethod
+    def _is_retryable(exc: BaseException) -> bool:
+        """Transport hiccups and S3's own throttle/5xx signals are worth another try.
+
+        A 4xx other than 429 is a client error -- a bad key, a denied request, an
+        upload id that no longer exists -- and retrying it only wastes the parts
+        already uploaded before the inevitable abort.
+        """
+        if isinstance(exc, httpx.RequestError):
+            return True
+        return isinstance(exc, S3HttpStatusError) and (exc.status_code == 429 or exc.status_code >= 500)
+
     async def put_chunk(self, part_number: int, chunk: bytes) -> None:
         self.log.debug(f"Uploading #<y>{part_number}</>")
 
-        last_exc = None
+        last_exc: BaseException | None = None
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
@@ -108,11 +123,17 @@ class MultipartUploadTask:
                     part_number=part_number,
                     upload_id=self.upload_id,
                 )
-            except httpx.RequestError as exc:
+            except (httpx.RequestError, S3HttpStatusError) as exc:
+                if not self._is_retryable(exc):
+                    raise
                 last_exc = exc
                 self.log.warning(
                     f"Attempt <g>{attempt + 1}</> to upload #<y>{part_number}</> failed: <r>{escape_tag(repr(exc))}</>"
                 )
+                # Back off before retrying: S3 answers 503 SlowDown precisely to
+                # ask for a pause, so an immediate retry just earns another one.
+                if attempt + 1 < max_attempts:
+                    await anyio.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
             else:
                 break
         else:
