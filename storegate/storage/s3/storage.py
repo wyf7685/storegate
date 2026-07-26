@@ -575,12 +575,24 @@ class S3Storage(AbstractStorage):
             )
             dir_paths.extend(entry.path for entry in walked.entries if entry.kind is EntryKind.DIRECTORY)
 
-        # 批量删除文件
+        # Batch file deletion. S3 has no tree delete, so this is inherently
+        # non-atomic and a mid-way failure cannot be rolled back -- the objects
+        # already deleted are gone. Name the keys that survived instead of
+        # letting the caller guess which half of the tree is left.
         deleted_files = 0
         for batch in itertools.batched(file_keys, 100):
-            if batch:
+            if not batch:
+                continue
+            try:
                 await client.delete_objects(batch)
-                deleted_files += len(batch)
+            except BaseException as error:
+                survivors = sorted(file_keys[deleted_files:])
+                message = (
+                    f"Partially removed directory tree {key}: deleted {deleted_files} of "
+                    f"{len(file_keys)} files; {len(survivors)} remain: {survivors}"
+                )
+                raise OSError(message) from error
+            deleted_files += len(batch)
 
         # 自底向上删除目录标记对象
         deleted_dirs = 0

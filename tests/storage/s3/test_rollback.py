@@ -378,3 +378,45 @@ class TestCopyMultipartRollback:
         mock_upload_part.assert_awaited_once()
         mock_complete.assert_awaited_once_with(dst_key, "upload-small", [{"PartNumber": 1, "ETag": "etag-1"}])
         mock_abort.assert_not_awaited()
+
+
+class TestRmtreeBatching:
+    """S3 has no tree delete, so rmtree deletes in batches of 100 and cannot roll
+    back. A mid-way failure must at least name what survived."""
+
+    async def test_batch_failure_reports_surviving_keys(self, s3_mocked: S3Storage, mocker: MockerFixture):
+        storage = s3_mocked
+        # 250 files -> batches of 100, 100, 50. Fail on the second batch.
+        names = [f"f{index:03d}.txt" for index in range(250)]
+
+        async def _walk(_path: PathLike) -> AsyncIterator[WalkEntry]:
+            yield WalkEntry(
+                path="/tree",
+                entries=tuple(FileInfo(path=f"/tree/{name}", name=name, kind=EntryKind.FILE) for name in names),
+            )
+
+        deleted: list[str] = []
+
+        async def _delete_objects(keys: Iterable[str]) -> list[str]:
+            batch = list(keys)
+            if len(deleted) >= 100:
+                raise S3HttpStatusError("POST", "/?delete", 500, "simulated batch failure")
+            deleted.extend(batch)
+            return batch
+
+        mocker.patch.object(storage, "is_dir", new=AsyncMock(return_value=True))
+        storage.walk = _walk  # ty: ignore[invalid-assignment]
+        storage._client.delete_objects = _delete_objects  # ty: ignore[invalid-assignment]
+
+        with pytest.raises(OSError, match="Partially removed directory tree") as caught:
+            await storage.rmtree("/tree")
+
+        message = str(caught.value)
+        assert "Partially removed directory tree" in message
+        assert "deleted 100 of 250 files" in message
+        assert "150 remain" in message
+        # The surviving keys are named, not left for the caller to guess.
+        assert "tree/f100.txt" in message
+        assert "tree/f249.txt" in message
+        assert "tree/f099.txt" not in message
+        assert len(deleted) == 100
