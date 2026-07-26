@@ -460,6 +460,50 @@ class TestRollback:
         await s.delete(src)
         await s.delete(dst)
 
+    async def test_move_src_unlink_failure_rolls_back_instead_of_stranding_src(
+        self, index_storage: IndexStorage, mocker: MockerFixture
+    ):
+        """Removing the source is the commit point, so its failure must roll the move back.
+
+        Regression: the src unlink used to sit outside every rollback arm. A failure there
+        left src readable while all of its chunks had been transref'd to dst, so a later
+        unlink(dst) decref'd them to zero and destroyed data src still pointed at.
+        """
+        s = index_storage
+        data = b"U" * BLOCK_SIZE
+        src = f"test-rollb-mvsrc-src-{uid()}"
+        dst = f"test-rollb-mvsrc-dst-{uid()}"
+
+        await s.upload_bytes(data, src)
+        src_meta = await s._get_file_meta(src)
+        assert src_meta is not None
+        chunk_hashes = src_meta.chunks[:]
+
+        original_unlink = s._index.unlink
+
+        async def _fail_src_unlink(remote_path: str, *, missing_ok: bool = False) -> None:
+            if str(remote_path) == f"/{src}":
+                raise OSError("simulated src unlink failure")
+            await original_unlink(remote_path, missing_ok=missing_ok)
+
+        mocker.patch.object(s._index, "unlink", _fail_src_unlink)
+
+        with pytest.raises(OSError, match="simulated src unlink failure"):
+            await s.move(src, dst)
+
+        mocker.stopall()
+
+        # The move is fully undone: src is readable and dst never materialised.
+        assert await s.download_bytes(src) == data
+        assert await s._get_file_meta(dst) is None
+        # Chunks belong to src alone, so unlinking dst cannot reap them.
+        for chunk_hash in chunk_hashes:
+            refs = await s._refs.load_refs(chunk_hash)
+            assert refs is not None
+            assert refs == {f"/{src}"}
+
+        await s.delete(src)
+
     async def test_overwrite_cancellation_releases_rollback_guards(
         self, index_storage: IndexStorage, mocker: MockerFixture
     ):

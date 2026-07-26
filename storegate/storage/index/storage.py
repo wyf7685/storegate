@@ -907,10 +907,23 @@ class IndexStorage(AbstractStorage):
                     try:
                         for chunk_hash in old_only:
                             await self._refs.decref(chunk_hash, dst)
+                        # Removing the source is the commit point, not an epilogue: it must
+                        # sit inside the rollback arm below. Outside it, a failure here would
+                        # leave a readable src whose chunks are only referenced by dst, so a
+                        # later unlink(dst) reaps the chunks and silently guts src.
+                        await self._index.unlink(src)
                     except BaseException:
                         with anyio.CancelScope(shield=True):
+                            # src metadata is restored unconditionally: the unlink above may
+                            # have landed before raising, and re-uploading identical bytes is
+                            # idempotent when it did not.
+                            await self._index.upload_bytes(src_meta.model_dump_json().encode(), src, overwrite=True)
                             if dst_meta is not None:
                                 await self._index.upload_bytes(dst_meta.model_dump_json().encode(), dst, overwrite=True)
+                            else:
+                                # dst did not exist before the move, so the metadata written
+                                # at the start of this transaction has to go with it.
+                                await self._index.unlink(dst, missing_ok=True)
                             async with anyio.create_task_group() as tg:
                                 for chunk_hash in old_only:
                                     tg.start_soon(self._refs.incref, chunk_hash, dst)
@@ -928,7 +941,6 @@ class IndexStorage(AbstractStorage):
                         await self._refs.release_rollback_guards(guards)
                 except BaseException:  # noqa: TRY203
                     raise
-            await self._index.unlink(src)
 
     @override
     async def copy(
