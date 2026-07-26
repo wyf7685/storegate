@@ -75,6 +75,54 @@ SPECIAL_RESOURCE = b"""<?xml version="1.0"?>
   </D:response>
 </D:multistatus>"""
 
+MIXED_PROPSTAT_STATUS = b"""<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/dav/storegate/ok.txt</D:href>
+    <D:propstat>
+      <D:prop><D:resourcetype/><D:getcontentlength>4</D:getcontentlength></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/dav/storegate/forbidden.txt</D:href>
+    <D:propstat>
+      <D:prop><D:resourcetype/><D:getcontentlength/></D:prop>
+      <D:status>HTTP/1.1 403 Forbidden</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"""
+
+RESPONSE_LEVEL_404 = b"""<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/dav/storegate/present.txt</D:href>
+    <D:propstat>
+      <D:prop><D:resourcetype/><D:getcontentlength>9</D:getcontentlength></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/dav/storegate/vanished.txt</D:href>
+    <D:status>HTTP/1.1 404 Not Found</D:status>
+  </D:response>
+</D:multistatus>"""
+
+PARTIAL_PROPSTAT = b"""<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/dav/storegate/partial.txt</D:href>
+    <D:propstat>
+      <D:prop><D:resourcetype/><D:getcontentlength>12</D:getcontentlength></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+    <D:propstat>
+      <D:prop><D:getcontentlength>999</D:getcontentlength><D:displayname/></D:prop>
+      <D:status>HTTP/1.1 404 Not Found</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"""
+
 
 class TestParseMultistatus:
     def test_parses_files_and_collections(self) -> None:
@@ -119,6 +167,29 @@ class TestParseMultistatus:
         resource = parse_multistatus(SPECIAL_RESOURCE)[0]
         assert resource.resource_types == ("{DAV:}collection", "{urn:example:links}symlink")
         assert resource.is_collection is True
+
+    def test_failed_propstat_resource_is_skipped(self) -> None:
+        """A 403 propstat means "inaccessible", not "a zero-byte file".
+
+        Regression: propstat statuses were ignored, so an unreadable child was
+        emitted as a normal empty file. walk/copytree then copied a phantom
+        empty over a real destination, and _is_dir_empty counted it as present.
+        """
+        resources = parse_multistatus(MIXED_PROPSTAT_STATUS)
+        assert [resource.href for resource in resources] == ["/dav/storegate/ok.txt"]
+        assert resources[0].content_length == 4
+
+    def test_response_level_failure_status_is_skipped(self) -> None:
+        resources = parse_multistatus(RESPONSE_LEVEL_404)
+        assert [resource.href for resource in resources] == ["/dav/storegate/present.txt"]
+        assert resources[0].content_length == 9
+
+    def test_properties_come_from_the_successful_propstat(self) -> None:
+        """Values must not be harvested out of a 404 propstat in the same response."""
+        resource = parse_multistatus(PARTIAL_PROPSTAT)[0]
+        assert resource.href == "/dav/storegate/partial.txt"
+        assert resource.content_length == 12
+        assert resource.display_name is None
 
 
 class TestHrefToStoragePath:

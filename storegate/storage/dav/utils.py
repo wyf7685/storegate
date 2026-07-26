@@ -57,6 +57,47 @@ def _find_text(elem: ET.Element | None, tag: str) -> str | None:
     return value if value not in (None, "") else None
 
 
+def _status_code(status_text: str | None) -> int | None:
+    """Extract the numeric code from an RFC 4918 ``status`` line ("HTTP/1.1 404 Not Found")."""
+    if not status_text:
+        return None
+    for token in status_text.split():
+        if token.isdigit():
+            return int(token)
+    return None
+
+
+def _successful_prop(response: ET.Element) -> ET.Element | None:
+    """Return the ``prop`` element of the 2xx ``propstat``, or None when there is none.
+
+    A ``response`` carries one ``propstat`` per status class, so harvesting props
+    from any of them conflates "this property is missing" with "this resource is
+    inaccessible". Only a 2xx propstat describes a resource that actually exists.
+    """
+    propstats = response.findall("./{*}propstat")
+    if not propstats:
+        # No propstat at all: a bare href, or a response-level status such as a
+        # 404 child. Only treat it as a resource when nothing marks it failed.
+        code = _status_code(_find_text(response, "status"))
+        if code is not None and not (200 <= code < 300):
+            return None
+        return response.find(".//{*}prop")
+
+    fallback: ET.Element | None = None
+    for propstat in propstats:
+        prop = propstat.find("./{*}prop")
+        if prop is None:
+            continue
+        code = _status_code(_find_text(propstat, "status"))
+        if code is not None and 200 <= code < 300:
+            return prop
+        if code is None:
+            # A propstat without a status is malformed; keep it only as a last
+            # resort so servers omitting it still work.
+            fallback = fallback if fallback is not None else prop
+    return fallback
+
+
 def _parse_http_date(value: str) -> datetime | None:
     try:
         return parsedate_to_datetime(value)
@@ -80,11 +121,19 @@ def parse_multistatus(content: bytes) -> list[DavResource]:
         if not href:
             continue
         href = unquote(href)
-        prop = response.find(".//{*}prop")
-        resource_type = prop.find("./{*}resourcetype") if prop is not None else None
+        # Skip resources the server reported as inaccessible. Emitting them would
+        # surface a 404/403 child as a zero-byte file, so walk/copytree would copy
+        # phantom empties over real destinations and _is_dir_empty would count an
+        # unreadable child as present.
+        prop = _successful_prop(response)
+        if prop is None:
+            continue
+        resource_type = prop.find("./{*}resourcetype")
         resource_types = tuple(child.tag for child in resource_type) if resource_type is not None else ()
 
-        length_text = _find_text(response, "getcontentlength")
+        # Read every property from the successful propstat: `_find_text(response, ...)`
+        # would search the whole response and pull values out of a failed propstat.
+        length_text = _find_text(prop, "getcontentlength")
         content_length: int | None = None
         if length_text is not None:
             try:
@@ -92,13 +141,13 @@ def parse_multistatus(content: bytes) -> list[DavResource]:
             except ValueError:
                 content_length = None
 
-        last_modified_text = _find_text(response, "getlastmodified")
+        last_modified_text = _find_text(prop, "getlastmodified")
         last_modified = _parse_http_date(last_modified_text) if last_modified_text else None
 
-        creation_text = _find_text(response, "creationdate")
+        creation_text = _find_text(prop, "creationdate")
         creation_date = _parse_iso_date(creation_text) if creation_text else None
 
-        display_name = _find_text(response, "displayname")
+        display_name = _find_text(prop, "displayname")
 
         resources.append(
             DavResource(
