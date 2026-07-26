@@ -5,12 +5,9 @@ import ntpath
 import os
 import shutil
 import stat
-import tempfile
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterable
-from dataclasses import dataclass
 from datetime import datetime
-from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import final, override
 
@@ -32,69 +29,21 @@ from storegate.storage.abstract import (
     validate_same_path_tree_operation,
 )
 
+from .models import (
+    _MutationJournal as _MutationJournal,
+)
+from .models import (
+    _RawKind as _RawKind,
+)
+from .models import (
+    _TreeEntry as _TreeEntry,
+)
+
 _LOCAL_CAPABILITIES = StorageCapabilities(symlink_metadata=True, readlink=True, symlink_create=True)
 _UNSUPPORTED_ERRNO = getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)
 _MAX_SYMLINK_HOPS = 40
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _DIRECTORY_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
-
-
-class _RawKind(StrEnum):
-    FILE = "file"
-    DIRECTORY = "directory"
-    SYMLINK = "symlink"
-    JUNCTION = "junction"
-    SPECIAL = "special"
-
-
-@dataclass(slots=True, frozen=True)
-class _TreeEntry:
-    relative_parts: tuple[str, ...]
-    kind: EntryKind
-    link_target: str | None = None
-    target_is_directory: bool = False
-
-
-@dataclass(slots=True)
-class _MutationJournal:
-    root: Path
-    created: list[Path]
-    backups: list[tuple[Path, Path]]
-    backup_root: Path | None = None
-
-    @classmethod
-    def create(cls, root: Path) -> _MutationJournal:
-        return cls(root=root, created=[], backups=[])
-
-    def record_created(self, path: Path) -> None:
-        self.created.append(path)
-
-    def backup(self, path: Path) -> None:
-        if self.backup_root is None:
-            self.backup_root = Path(tempfile.mkdtemp(prefix=".storegate-local-backup-", dir=self.root))
-        backup_path = self.backup_root / uuid.uuid4().hex
-        path.replace(backup_path)
-        self.backups.append((path, backup_path))
-
-    def rollback(self) -> None:
-        for path in reversed(self.created):
-            try:
-                result = os.lstat(path)
-            except FileNotFoundError:
-                continue
-            if stat.S_ISDIR(result.st_mode) and not stat.S_ISLNK(result.st_mode):
-                path.rmdir()
-            else:
-                path.unlink()
-        for original, backup in reversed(self.backups):
-            original.parent.mkdir(parents=True, exist_ok=True)
-            backup.replace(original)
-        self.cleanup()
-
-    def cleanup(self) -> None:
-        if self.backup_root is not None:
-            shutil.rmtree(self.backup_root, ignore_errors=False)
-            self.backup_root = None
 
 
 @final
