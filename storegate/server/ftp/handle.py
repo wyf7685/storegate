@@ -74,7 +74,11 @@ class ReadHandle(FileHandle):
             await _guard_not_symlink(self.storage, self.path)
             self.agen = self.storage.download_stream(self.path, offset=self.offset)
 
-        while len(self.buffer) < size:
+        # A negative size means "read to EOF", matching file.read(-1) and aioftp's
+        # own PathIO. Comparing against it directly would exit the loop immediately
+        # and `buffer[:size]` would then silently drop trailing bytes.
+        drain_all = size < 0
+        while drain_all or len(self.buffer) < size:
             try:
                 chunk = await anext(self.agen)
             except StopAsyncIteration:
@@ -84,6 +88,11 @@ class ReadHandle(FileHandle):
 
         if not self.buffer:
             return b""
+
+        if drain_all:
+            result = bytes(self.buffer)
+            self.buffer.clear()
+            return result
 
         result = self.buffer[:size]
         del self.buffer[:size]

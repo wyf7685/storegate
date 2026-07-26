@@ -6,7 +6,7 @@ import aioftp
 import pytest
 
 from storegate.server.ftp.handle import ReadHandle, WriteHandle
-from storegate.server.ftp.pathio import _file_info_to_stat
+from storegate.server.ftp.pathio import StoragePathIO, _file_info_to_stat
 from storegate.storage import AbstractStorage, EntryKind, FileInfo
 from tests.server.ftp.conftest import ProtocolStorage
 
@@ -297,6 +297,57 @@ async def test_handles_recheck_symlink_kind_before_backend_stream_access(
     write_handle = WriteHandle(storage, PurePosixPath("/file-link"))
     with pytest.raises(FileNotFoundError, match="File unavailable"):
         await write_handle.close()
+
+
+async def test_read_handle_negative_size_drains_to_eof(
+    ftp_protocol_server: tuple[str, int, AbstractStorage],
+) -> None:
+    """A negative size means "read to EOF", matching file.read(-1).
+
+    Regression: the fill loop compared `len(buffer) < size`, which is false
+    immediately for a negative size, so read(-1) returned b"" on a non-empty
+    file. StoragePathIO.read declares `block_size: int = -1`, so any caller
+    using that documented default saw an empty file.
+    """
+    _host, _port, storage = ftp_protocol_server
+
+    handle = ReadHandle(storage, PurePosixPath("/target.txt"))
+    try:
+        assert await handle.read(-1) == b"original target"
+        # The buffer is drained, so a follow-up read reports EOF.
+        assert await handle.read(-1) == b""
+    finally:
+        await handle.close()
+
+
+async def test_pathio_read_default_block_size_returns_whole_file(
+    ftp_protocol_server: tuple[str, int, AbstractStorage],
+) -> None:
+    """StoragePathIO.read's documented default block_size=-1 must not truncate."""
+    _host, _port, storage = ftp_protocol_server
+
+    pathio = StoragePathIO.with_storage(storage)()
+    handle = ReadHandle(storage, PurePosixPath("/target.txt"))
+    try:
+        assert await pathio.read(handle) == b"original target"
+    finally:
+        await handle.close()
+
+
+async def test_read_handle_positive_size_still_chunks(
+    ftp_protocol_server: tuple[str, int, AbstractStorage],
+) -> None:
+    """The negative-size path must not disturb ordinary sized reads."""
+    _host, _port, storage = ftp_protocol_server
+
+    handle = ReadHandle(storage, PurePosixPath("/target.txt"))
+    try:
+        collected = bytearray()
+        while chunk := await handle.read(4):
+            collected.extend(chunk)
+        assert bytes(collected) == b"original target"
+    finally:
+        await handle.close()
 
 
 async def test_readonly_stor_rejected_without_modifying_file(
