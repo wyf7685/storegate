@@ -100,6 +100,8 @@ class ResourceWriter:
         self._token = current_event_loop_token.get()
         self._scope = None
         self._scope_lock = threading.Lock()
+        self._worker_error: BaseException | None = None
+        self._aborted = False
         self._worker_thread = threading.Thread(
             target=self._run,
             name="ResourceWriterWorker",
@@ -119,6 +121,12 @@ class ResourceWriter:
         self._closed = True
         run_async(self._send.aclose)
         self._worker_thread.join()
+        # upload_fn runs on the worker thread, so a commit-time failure raised
+        # after the stream was drained (S3 CompleteMultipartUpload, an index
+        # commit) would otherwise die with the thread and let wsgidav answer the
+        # PUT with 201/204 -- silent data loss.
+        if self._worker_error is not None and not self._aborted:
+            raise self._worker_error
 
     def _run(self) -> None:
         with current_event_loop_token.set(self._token):
@@ -131,7 +139,11 @@ class ResourceWriter:
                     self._scope = scope
                 self._worker_ready.set()
                 await self._upload_fn(self._recv)
+        except BaseException as error:
+            self._worker_error = error
         finally:
+            # Unblock a writer parked on send() when the upload died early.
+            self._worker_ready.set()
             with self._scope_lock:
                 self._scope = None
 
@@ -146,6 +158,9 @@ class ResourceWriter:
             scope.cancel()
 
     def abort(self) -> None:
+        # end_write(with_errors=True) aborts and then closes, so record that the
+        # teardown was requested: close() must not report it as an upload failure.
+        self._aborted = True
         run_async(self._abort)
 
 

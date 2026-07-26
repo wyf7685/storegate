@@ -38,7 +38,13 @@ pytestmark = [pytest.mark.integration, pytest.mark.httpx, pytest.mark.usefixture
 
 
 class LeakyStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
-    """Fails every mutation with an exception carrying a backend secret."""
+    """Fails every mutation with an exception carrying a backend secret.
+
+    ``seeding`` lets a test place fixture content through the real MemoryStorage
+    implementation before arming the failure.
+    """
+
+    seeding = False
 
     @override
     async def upload_stream(
@@ -48,6 +54,9 @@ class LeakyStorage(MemoryStorage):  # ty: ignore[subclass-of-final-class]
         *,
         overwrite: bool = True,
     ) -> None:
+        if self.seeding:
+            await super().upload_stream(stream, remote_path, overwrite=overwrite)
+            return
         async for _ in stream:
             pass
         raise RuntimeError(SECRET)
@@ -77,3 +86,26 @@ async def test_backend_error_details_are_not_disclosed(method: str, path: str, c
     assert response.status_code == 500
     assert SECRET not in response.text
     assert "RuntimeError" not in response.text
+
+
+async def test_put_over_existing_file_reports_commit_failure() -> None:
+    """A PUT whose backend commit fails must not be answered with success.
+
+    Overwriting an existing resource goes through ResourceWriter, whose
+    upload_fn runs on a worker thread. LeakyStorage.upload_stream drains the
+    body and only then raises, which used to die with that thread and let
+    wsgidav report 204 for an upload that never landed.
+    """
+    storage = LeakyStorage("/")
+    async with storage:
+        storage.seeding = True
+        await storage.upload_bytes(b"original", "/existing.txt")
+        storage.seeding = False
+        app = create_wsgi_app(storage, "127.0.0.1", 8080)
+
+        response = await anyio.to_thread.run_sync(
+            functools.partial(_request, app, "PUT", "/existing.txt", content=b"payload")
+        )
+
+    assert response.status_code >= 500, f"a failed commit must not report success, got {response.status_code}"
+    assert SECRET not in response.text

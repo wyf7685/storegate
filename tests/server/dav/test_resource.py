@@ -109,6 +109,63 @@ async def test_writer_abort_cancels_active_upload() -> None:
     await anyio.to_thread.run_sync(writer.close)
 
 
+async def test_writer_close_raises_commit_failure_after_stream_drained() -> None:
+    """A commit-time failure must reach close(), not die with the worker thread.
+
+    Regression: upload_fn runs on the writer's own thread, so an error raised
+    after the stream was consumed (S3 CompleteMultipartUpload, an index commit)
+    was swallowed and close() returned None -- wsgidav then answered the PUT
+    with 201/204 for an upload that never landed.
+    """
+    received = bytearray()
+
+    async def upload(stream: AsyncIterable[bytes]) -> None:
+        async for chunk in stream:
+            received.extend(chunk)
+        raise OSError("simulated commit failure")
+
+    writer = ResourceWriter(upload)
+    await anyio.to_thread.run_sync(writer.start)
+    await anyio.to_thread.run_sync(writer.write, b"payload")
+    with pytest.raises(OSError, match="simulated commit failure"):
+        await anyio.to_thread.run_sync(writer.close)
+
+    # The whole body still reached upload_fn; only the commit failed.
+    assert received == b"payload"
+
+
+async def test_writer_close_raises_failure_from_mid_stream() -> None:
+    """A failure while the stream is still being consumed also surfaces."""
+
+    async def upload(stream: AsyncIterable[bytes]) -> None:
+        async for _chunk in stream:
+            raise RuntimeError("simulated mid-stream failure")
+
+    writer = ResourceWriter(upload)
+    await anyio.to_thread.run_sync(writer.start)
+    await anyio.to_thread.run_sync(writer.write, b"payload")
+    with pytest.raises(RuntimeError, match="simulated mid-stream failure"):
+        await anyio.to_thread.run_sync(writer.close)
+
+
+async def test_writer_abort_suppresses_upload_error_on_close() -> None:
+    """end_write(with_errors=True) aborts then closes; the teardown is not an error."""
+    upload_started = anyio.Event()
+
+    async def upload(stream: AsyncIterable[bytes]) -> None:
+        upload_started.set()
+        async for _chunk in stream:
+            pass
+        raise OSError("commit failure the caller already gave up on")
+
+    writer = ResourceWriter(upload)
+    await anyio.to_thread.run_sync(writer.start)
+    await upload_started.wait()
+    await anyio.to_thread.run_sync(writer.abort)
+    # Must not raise: the caller requested the abort.
+    await anyio.to_thread.run_sync(writer.close)
+
+
 async def test_storage_resource_write_state_transitions(mocker: MockerFixture) -> None:
     storage = SymlinkTrapStorage()
     storage.files["/file.bin"] = b"original"
