@@ -1,8 +1,10 @@
 """Foundation utils contract tests."""
 
+import contextlib
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock
 
+import anyio
 import pytest
 from pydantic import SecretStr
 
@@ -176,6 +178,87 @@ async def test_exception_translator_wrap_agen_maps_group_tree() -> None:
     assert [type(exc) for exc in group.exceptions] == [RuntimeError, KeyError]
     assert str(group.exceptions[0]) == "stream x: bad"
     assert isinstance(group.exceptions[1], KeyError)
+
+
+class TestExceptionTranslatorCancellation:
+    """Every backend's iterdir/walk/download_stream routes through these decorators,
+    so a reclassified cancellation would deadlock a task group at shutdown."""
+
+    translator = ExceptionTranslator(bypass=KeyError, catch=ValueError, default=RuntimeError)
+
+    async def test_bare_cancellation_is_not_translated(self) -> None:
+        cancelled = anyio.get_cancelled_exc_class()()
+        # CancelledError is a BaseException, not an Exception, so it must pass
+        # through untouched rather than becoming the default error type.
+        assert self.translator.translate(cancelled, "op") is cancelled
+
+    async def test_group_keeps_cancellation_leaf_and_base_group_type(self) -> None:
+        cancelled = anyio.get_cancelled_exc_class()()
+        group = BaseExceptionGroup("mixed", [ValueError("boom"), cancelled])
+
+        mapped = self.translator.translate(group, "op")
+
+        # derive() must not narrow to a plain ExceptionGroup: that would drop the
+        # cancellation leaf and AnyIO's cancel scope would never observe it.
+        assert isinstance(mapped, BaseExceptionGroup)
+        assert not isinstance(mapped, ExceptionGroup)
+        assert [type(exc) for exc in mapped.exceptions] == [RuntimeError, type(cancelled)]
+        assert mapped.exceptions[1] is cancelled
+
+    async def test_wrap_propagates_cancellation_and_scope_completes(self) -> None:
+        entered = anyio.Event()
+
+        class Host:
+            @self.translator.wrap("host {name}")
+            async def run(self, name: str) -> None:
+                _ = name
+                entered.set()
+                await anyio.sleep_forever()
+
+        with anyio.move_on_after(1) as scope:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(Host().run, "op")
+                await entered.wait()
+                tg.cancel_scope.cancel()
+
+        # A swallowed or reclassified cancellation would leave the task group
+        # hanging until move_on_after fired.
+        assert not scope.cancelled_caught
+
+    async def test_wrap_agen_propagates_cancellation_and_scope_completes(self) -> None:
+        entered = anyio.Event()
+
+        class Host:
+            @self.translator.wrap_agen("stream {name}")
+            async def items(self, name: str) -> AsyncIterator[int]:
+                _ = name
+                yield 1
+                entered.set()
+                await anyio.sleep_forever()
+
+        async def consume() -> None:
+            async with contextlib.aclosing(Host().items("x")) as agen:
+                async for _item in agen:
+                    pass
+
+        with anyio.move_on_after(1) as scope:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(consume)
+                await entered.wait()
+                tg.cancel_scope.cancel()
+
+        assert not scope.cancelled_caught
+
+    async def test_wrap_still_translates_ordinary_errors(self) -> None:
+        """The cancellation passthrough must not disable normal translation."""
+
+        class Host:
+            @self.translator.wrap("host {name}")
+            async def run(self, name: str) -> None:
+                raise ValueError(name)
+
+        with pytest.raises(RuntimeError, match="host op: op"):
+            await Host().run("op")
 
 
 async def test_cached_storage_preserves_memory_compare_exchange_contract() -> None:
