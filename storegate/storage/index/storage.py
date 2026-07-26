@@ -1,4 +1,3 @@
-import dataclasses
 import functools
 import hashlib
 from collections.abc import AsyncGenerator
@@ -274,7 +273,7 @@ class IndexStorage(IndexUploadMixin, IndexTreeMixin):
                             for chunk_hash in src_meta.chunks:
                                 tg.start_soon(self._refs.transref, chunk_hash, (src, dst))
                         new_meta = FileMeta(
-                            info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=dst.name),
+                            info=src_meta.info.at_path(dst),
                             chunks=src_meta.chunks.copy(),
                         )
                         await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
@@ -381,7 +380,7 @@ class IndexStorage(IndexUploadMixin, IndexTreeMixin):
                                 if chunk_hash not in old_hashes:
                                     tg.start_soon(self._refs.incref, chunk_hash, dst)
                         new_meta = FileMeta(
-                            info=dataclasses.replace(src_meta.info, path=dst.as_posix(), name=dst.name),
+                            info=src_meta.info.at_path(dst),
                             chunks=src_meta.chunks.copy(),
                         )
                         await self._index.mkdir(dst.parent, parents=True, exist_ok=True)
@@ -503,11 +502,11 @@ class IndexStorage(IndexUploadMixin, IndexTreeMixin):
         except FileNotFoundError as error:
             raise FileNotFoundError(f"File not found: {path}") from error
         if info.kind is EntryKind.DIRECTORY:
-            return dataclasses.replace(info, path=path.as_posix(), name=path.name)
+            return info.at_path(path)
         meta = await self._get_file_meta(path)
         if meta is None:
             raise FileNotFoundError(f"File not found: {path}")
-        return dataclasses.replace(meta.info, path=path.as_posix(), name=path.name)
+        return meta.info.at_path(path)
 
     @override
     async def iterdir(self, path: PathLike) -> AsyncGenerator[FileInfo]:
@@ -519,11 +518,11 @@ class IndexStorage(IndexUploadMixin, IndexTreeMixin):
             entry_path = self.normalize_path(entry.path)
             match entry.kind:
                 case EntryKind.DIRECTORY:
-                    yield dataclasses.replace(entry, path=entry_path.as_posix(), name=entry_path.name)
+                    yield entry.at_path(entry_path)
                 case EntryKind.FILE:
                     meta = await self._get_file_meta(entry_path)
                     if meta is not None:
-                        yield dataclasses.replace(meta.info, path=entry_path.as_posix(), name=entry_path.name)
+                        yield meta.info.at_path(entry_path)
                 case EntryKind.SYMLINK:
                     await lstat_private_entry(self._index, entry_path, label="directory entry")
 
@@ -537,7 +536,7 @@ class IndexStorage(IndexUploadMixin, IndexTreeMixin):
         async def _fetch_meta(entry_path: PurePosixPath, entries: list[FileInfo]) -> None:
             meta = await self._get_file_meta(entry_path)
             if meta is not None:
-                entries.append(dataclasses.replace(meta.info, path=entry_path.as_posix(), name=entry_path.name))
+                entries.append(meta.info.at_path(entry_path))
 
         async for underlying_entry in self._index.walk(path):
             entries: list[FileInfo] = []
@@ -546,7 +545,7 @@ class IndexStorage(IndexUploadMixin, IndexTreeMixin):
                     entry_path = self.normalize_path(entry.path)
                     match entry.kind:
                         case EntryKind.DIRECTORY:
-                            entries.append(dataclasses.replace(entry, path=entry_path.as_posix(), name=entry_path.name))
+                            entries.append(entry.at_path(entry_path))
                         case EntryKind.FILE:
                             tg.start_soon(_fetch_meta, entry_path, entries)
                         case EntryKind.SYMLINK:

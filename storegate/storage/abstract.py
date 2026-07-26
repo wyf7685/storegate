@@ -1,11 +1,11 @@
 import contextlib
+import dataclasses
 import errno
 import functools
 import hashlib
 import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
-from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path, PurePath, PurePosixPath
@@ -24,7 +24,7 @@ class EntryKind(StrEnum):
     SYMLINK = "symlink"
 
 
-@dataclass(slots=True, frozen=True)
+@dataclasses.dataclass(slots=True, frozen=True)
 class FileInfo:
     path: str
     name: str
@@ -45,14 +45,24 @@ class FileInfo:
     def is_symlink(self) -> bool:
         return self.kind is EntryKind.SYMLINK
 
+    def at_path(self, path: PurePosixPath) -> FileInfo:
+        """Return a copy of this entry rebased onto *path*.
 
-@dataclass(slots=True, frozen=True)
+        ``path`` and ``name`` are always derived from the same path, so they
+        cannot drift apart. Prefer this over ``dataclasses.replace``, whose
+        ``**changes`` is typed ``Any`` and therefore accepts a misspelled field
+        name or a wrongly typed value without complaint.
+        """
+        return dataclasses.replace(self, path=path.as_posix(), name=path.name)
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
 class WalkEntry:
     path: str
     entries: tuple[FileInfo, ...]
 
 
-@dataclass(slots=True, frozen=True)
+@dataclasses.dataclass(slots=True, frozen=True)
 class StorageCapabilities:
     symlink_metadata: bool = False
     readlink: bool = False
@@ -60,7 +70,7 @@ class StorageCapabilities:
     compare_exchange: bool = False
 
 
-@dataclass(slots=True, frozen=True)
+@dataclasses.dataclass(slots=True, frozen=True)
 class VersionedBytes:
     data: bytes
     token: str
