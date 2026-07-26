@@ -11,7 +11,7 @@ from storegate.storage.dav import DavConfig, DavStorage
 from storegate.storage.memory import MemoryStorage
 from storegate.storage.s3 import S3Storage
 from storegate.storage.s3.client import S3Config
-from storegate.utils import ExceptionTranslator, coalesce_chunks
+from storegate.utils import ExceptionTranslator, coalesce_chunks, flatten_exception_group
 
 
 async def _chunks(*parts: bytes) -> AsyncIterator[bytes]:
@@ -32,6 +32,56 @@ async def test_coalesce_chunks_rejects_non_positive_size() -> None:
 async def test_coalesce_chunks_repacks_to_requested_size() -> None:
     result = [chunk async for chunk in coalesce_chunks(_chunks(b"ab", b"cd", b"e"), chunk_size=2)]
     assert result == [b"ab", b"cd", b"e"]
+
+
+class TestFlattenExceptionGroup:
+    """Four backend suites index ``flattened[0]``/``[1]`` to assert primary-first
+    rollback errors, so depth-first order is a load-bearing contract."""
+
+    def test_preserves_depth_first_order(self) -> None:
+        primary = ValueError("primary")
+        rollback = OSError("rollback")
+        group = ExceptionGroup("op and rollback failed", [primary, rollback])
+
+        assert list(flatten_exception_group(group)) == [primary, rollback]
+
+    def test_flattens_nested_groups_depth_first(self) -> None:
+        a, b, c, d = (ValueError(name) for name in ("a", "b", "c", "d"))
+        group = ExceptionGroup(
+            "top",
+            [a, ExceptionGroup("mid", [b, ExceptionGroup("deep", [c])]), d],
+        )
+
+        # A breadth-first or set-based flatten would yield [a, d, b, c].
+        assert list(flatten_exception_group(group)) == [a, b, c, d]
+
+    def test_single_exception_group_yields_that_exception(self) -> None:
+        only = RuntimeError("only")
+        assert list(flatten_exception_group(ExceptionGroup("solo", [only]))) == [only]
+
+    def test_nested_group_of_one_is_unwrapped(self) -> None:
+        leaf = RuntimeError("leaf")
+        group = ExceptionGroup("outer", [ExceptionGroup("inner", [leaf])])
+        assert list(flatten_exception_group(group)) == [leaf]
+
+    def test_duplicate_instances_are_not_deduplicated(self) -> None:
+        """Positional assertions break if repeats collapse."""
+        shared = ValueError("same")
+        assert list(flatten_exception_group(ExceptionGroup("dup", [shared, shared]))) == [shared, shared]
+
+    def test_base_exception_leaves_survive(self) -> None:
+        """A cancellation leaf must reach the caller so AnyIO still observes it."""
+        primary = OSError("primary")
+        cancelled = KeyboardInterrupt()
+        group = BaseExceptionGroup("mixed", [primary, cancelled])
+
+        assert list(flatten_exception_group(group)) == [primary, cancelled]
+
+    def test_is_lazy(self) -> None:
+        """It is a generator: nothing is walked until the caller iterates."""
+        first = ValueError("first")
+        generator = flatten_exception_group(ExceptionGroup("lazy", [first, ValueError("second")]))
+        assert next(generator) is first
 
 
 def test_exception_translator_single_exception_stays_single() -> None:
