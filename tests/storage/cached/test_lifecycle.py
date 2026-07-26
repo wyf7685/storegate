@@ -134,9 +134,9 @@ async def test_compare_exchange_proxies_capability_and_invalidates_caches() -> N
         assert snap["download"].get("cas.txt") == b"v1"
 
         # Seed a stale download/metadata view that CAS must replace.
-        await cached._cache.set(DOWNLOAD, "cas.txt", b"stale")
+        await cached._cache.set(DOWNLOAD.entry("cas.txt", b"stale"))
         stale_info = FileInfo(path="cas.txt", name="cas.txt", kind=EntryKind.FILE, size=99)
-        await cached._cache.set(STAT, "cas.txt", stale_info)
+        await cached._cache.set(STAT.entry("cas.txt", stale_info))
 
         updated = await cached.compare_exchange("cas.txt", expected_token=created.token, data=b"v2")
         assert updated is not None

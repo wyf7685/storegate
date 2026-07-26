@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from storegate.storage.abstract import FileInfo
 
@@ -30,6 +30,23 @@ class Namespace[T]:
     name: str
     dumps: Callable[[T], bytes]
     loads: Callable[[bytes], T]
+
+    def entry(self, key: str, value: T) -> CacheEntry[T]:
+        """Pair *value* with this namespace for a batch write.
+
+        Batch writes are variadic and therefore heterogeneous, so the element
+        type cannot name a single ``T``. Building each element here instead
+        checks *value* against this namespace at the point it is written down.
+        """
+        return CacheEntry(self, key, value)
+
+
+class CacheEntry[T](NamedTuple):
+    """One ``(namespace, key, value)`` write, built by :meth:`Namespace.entry`."""
+
+    namespace: Namespace[T]
+    key: str
+    value: T
 
 
 EXISTS = Namespace[bool]("exists", bool_to_bytes, bool_from_bytes)
@@ -122,14 +139,8 @@ class CacheBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def set[T](
-        self,
-        namespace: Namespace[T],
-        key: str,
-        value: T,
-        ttl: int | None = None,
-    ) -> None:
-        """Store *value* under *key* in *namespace*.
+    async def set[T](self, entry: CacheEntry[T], ttl: int | None = None) -> None:
+        """Store one entry, built by :meth:`Namespace.entry`.
 
         Parameters
         ----------
@@ -183,11 +194,11 @@ class CacheBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def mset(self, *entries: tuple[Namespace[Any], str, Any]) -> None:
+    async def mset(self, *entries: CacheEntry[Any]) -> None:
         """Batch set.
 
-        Each element of *entries* is a ``(namespace, key, value)``
-        triple.  All entries use their namespace's default TTL.
+        Build each element with :meth:`Namespace.entry`, which checks the value
+        against its namespace. All entries use their namespace's default TTL.
         """
         raise NotImplementedError
 

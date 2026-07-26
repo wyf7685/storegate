@@ -122,10 +122,10 @@ async def test_auto_prefix_isolates_shared_redis() -> None:
     first = _backend(redis, '{"kind":"local","root":"/first"}')
     second = _backend(redis, '{"kind":"local","root":"/second"}')
 
-    await first.set(EXISTS, "same.txt", True)
-    await second.set(EXISTS, "same.txt", False)
-    await first.mset((EXISTS, "batch.txt", True))
-    await second.mset((EXISTS, "batch.txt", False))
+    await first.set(EXISTS.entry("same.txt", True))
+    await second.set(EXISTS.entry("same.txt", False))
+    await first.mset(EXISTS.entry("batch.txt", True))
+    await second.mset(EXISTS.entry("batch.txt", False))
 
     assert await first.get(EXISTS, "same.txt") is True
     assert await second.get(EXISTS, "same.txt") is False
@@ -160,10 +160,10 @@ async def test_v2_file_info_roundtrip_and_strict_kind() -> None:
     )
     directory = FileInfo(path="/dir", name="dir", kind=EntryKind.DIRECTORY)
 
-    await backend.set(STAT, "link", link)
-    await backend.set(LSTAT, "link", link)
-    await backend.set(ITERDIR, "", [directory, link])
-    await backend.set(IS_SYMLINK, "link", True)
+    await backend.set(STAT.entry("link", link))
+    await backend.set(LSTAT.entry("link", link))
+    await backend.set(ITERDIR.entry("", [directory, link]))
+    await backend.set(IS_SYMLINK.entry("link", True))
 
     assert backend._scope_prefix().startswith("storegate:v3:")
     assert await backend.get(STAT, "link") == link
@@ -198,7 +198,7 @@ async def test_cached_storage_close_preserves_redis_entries(tmp_path: Path) -> N
     first_backend = RedisCacheBackend()
     _install_fake_client(first_backend, FakeRedis(values))
     first = CachedStorage(LocalStorage(tmp_path), cache=first_backend)
-    await first_backend.set(EXISTS, "cached.txt", True)
+    await first_backend.set(EXISTS.entry("cached.txt", True))
 
     await first.close()
     assert first_backend._redis is None

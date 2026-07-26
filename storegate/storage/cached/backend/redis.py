@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, final, override
 
 from storegate.utils import requires_extra
 
-from .base import CacheBackend, Namespace
+from .base import CacheBackend, CacheEntry, Namespace
 
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
@@ -148,15 +148,10 @@ class RedisCacheBackend(CacheBackend):
         return namespace.loads(raw)
 
     @override
-    async def set[T](
-        self,
-        namespace: Namespace[T],
-        key: str,
-        value: T,
-        ttl: int | None = None,
-    ) -> None:
-        rk = self._rk(namespace, key)
-        raw = namespace.dumps(value)
+    async def set[T](self, entry: CacheEntry[T], ttl: int | None = None) -> None:
+        namespace = entry.namespace
+        rk = self._rk(namespace, entry.key)
+        raw = namespace.dumps(entry.value)
         ex = ttl if ttl is not None else self._ttls[namespace.name]
         with contextlib.suppress(Exception):
             await self._ensure_client().set(rk, raw, ex=ex)
@@ -201,7 +196,7 @@ class RedisCacheBackend(CacheBackend):
         ]
 
     @override
-    async def mset(self, *entries: tuple[Namespace[Any], str, Any]) -> None:
+    async def mset(self, *entries: CacheEntry[Any]) -> None:
         pipe = self._ensure_client().pipeline(transaction=False)
         for ns, key, value in entries:
             rk = self._rk(ns, key)

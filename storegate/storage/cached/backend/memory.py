@@ -2,7 +2,7 @@ from typing import Any, final, override
 
 from expiringdictx import ExpiringDict
 
-from .base import CacheBackend, Namespace
+from .base import CacheBackend, CacheEntry, Namespace
 
 
 @final
@@ -90,15 +90,9 @@ class MemoryCacheBackend(CacheBackend):
         return value
 
     @override
-    async def set[T](
-        self,
-        namespace: Namespace[T],
-        key: str,
-        value: T,
-        ttl: int | None = None,
-    ) -> None:
+    async def set[T](self, entry: CacheEntry[T], ttl: int | None = None) -> None:
         # ttl is ignored: ExpiringDict has per-dict default_age, not per-key
-        self._caches[namespace.name][key] = value
+        self._caches[entry.namespace.name][entry.key] = entry.value
 
     @override
     async def delete(self, namespace: Namespace[Any], key: str) -> bool:
@@ -121,7 +115,7 @@ class MemoryCacheBackend(CacheBackend):
         return [self._caches[ns.name].get(key) for ns, key in keys]
 
     @override
-    async def mset(self, *entries: tuple[Namespace[Any], str, Any]) -> None:
+    async def mset(self, *entries: CacheEntry[Any]) -> None:
         for ns, key, value in entries:
             self._caches[ns.name][key] = value
 

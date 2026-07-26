@@ -168,8 +168,8 @@ async def test_symlink_failure_invalidates_overwrite_rollback_state(
 ) -> None:
     await cached.symlink("old-target", "link")
     await cached.lstat("link")
-    await cached._cache.set(STAT, "link", FileInfo(path="/link", name="link", kind=EntryKind.FILE))
-    await cached._cache.set(DOWNLOAD, "link", b"stale")
+    await cached._cache.set(STAT.entry("link", FileInfo(path="/link", name="link", kind=EntryKind.FILE)))
+    await cached._cache.set(DOWNLOAD.entry("link", b"stale"))
     original = cached._storage.symlink
 
     async def failed_overwrite(
@@ -232,8 +232,8 @@ async def test_nested_destination_invalidates_all_ancestor_listings(
         await cached.symlink("missing-target", source)
 
     assert await _listing_paths(cached, "") == [f"/{source}"]
-    await cached._cache.set(ITERDIR, "nested", [])
-    await cached._cache.set(ITERDIR, f"nested/{operation}", [])
+    await cached._cache.set(ITERDIR.entry("nested", []))
+    await cached._cache.set(ITERDIR.entry(f"nested/{operation}", []))
 
     await getattr(cached, operation)(source, destination)
 
@@ -265,8 +265,8 @@ async def test_nested_destination_failure_invalidates_all_ancestor_listings(
         await cached.symlink("missing-target", source)
 
     assert await _listing_paths(cached, "") == [f"/{source}"]
-    await cached._cache.set(ITERDIR, "partial", [])
-    await cached._cache.set(ITERDIR, f"partial/{operation}", [])
+    await cached._cache.set(ITERDIR.entry("partial", []))
+    await cached._cache.set(ITERDIR.entry(f"partial/{operation}", []))
     original = getattr(cached._storage, operation)
 
     async def partial_failure(src: str, dst: str, *, overwrite: bool = True) -> None:

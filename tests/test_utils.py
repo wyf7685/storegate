@@ -292,8 +292,8 @@ async def test_cached_storage_preserves_memory_compare_exchange_contract() -> No
 
 async def test_cached_storage_rejects_invalid_paths_before_cache_lookup() -> None:
     cached = CachedStorage(MemoryStorage("/"))
-    await cached._cache.set(EXISTS, "../escape", True)
-    await cached._cache.set(IS_SYMLINK, "../escape", False)
+    await cached._cache.set(EXISTS.entry("../escape", True))
+    await cached._cache.set(IS_SYMLINK.entry("../escape", False))
     with pytest.raises(ValueError, match="segments"):
         await cached.exists("../escape")
 
