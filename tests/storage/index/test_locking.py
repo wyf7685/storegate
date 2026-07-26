@@ -15,13 +15,28 @@ from storegate.storage.index.lock import LockLeaseLostError, StorageFileLocker
 from storegate.storage.index.ref import hash_to_path
 from storegate.storage.memory import MemoryStorage
 
+# ``lock_timeout`` plays two opposite roles in these tests, and conflating them is
+# what makes them flaky. Pick the constant that matches the role under test:
+#
+# * PATIENT_LOCK_TIMEOUT — the test needs an acquisition to SUCCEED (usually to set
+#   up the scenario). The value must exceed real scheduling jitter on a loaded box,
+#   so never shrink it to make an assertion "tighter".
+# * IMPATIENT_LOCK_TIMEOUT — the test asserts an acquisition TIMES OUT against a
+#   lock that is genuinely held or blocked. Small is correct here: the contended
+#   lock is never released, so no amount of load can turn the timeout into success.
+#
+# A storage that must do both (acquire first, then prove a contender gives up) uses
+# PATIENT for itself and a separate IMPATIENT contender.
+PATIENT_LOCK_TIMEOUT = 0.5
+IMPATIENT_LOCK_TIMEOUT = 0.03
+
 # Tests that assert cleanup is *bounded* reuse ``lock_timeout`` as the cleanup
 # budget, but the same knob also bounds the uncontended acquisition those tests
 # must first complete. Keep it generous enough to survive a loaded CI box: the
 # proof is that cleanup finishes within a bound at all, not that the bound is
 # small. The outer deadline stays a multiple above so a regression that hangs
 # forever still fails instead of silently passing.
-CLEANUP_LOCK_TIMEOUT = 0.5
+CLEANUP_LOCK_TIMEOUT = PATIENT_LOCK_TIMEOUT
 CLEANUP_OUTER_DEADLINE = 2.5
 # Deadline used to *trigger* an external cancellation while the holder is parked,
 # rather than as a safety net. It must fire well before CLEANUP_OUTER_DEADLINE so
@@ -158,25 +173,34 @@ async def test_active_lease_is_renewed() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.15, lock_lease=0.06, lock_mode="best_effort") as storage,
+        IndexStorage(
+            index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=0.06, lock_mode="best_effort"
+        ) as storage,
         storage._lock_index("/renew"),
     ):
         # Hold past several renewal intervals so contenders still time out only if
         # the active holder successfully extends its lease under load.
         await anyio.sleep(0.25)
+        contender = IndexStorage(
+            index, chunks, lock_timeout=IMPATIENT_LOCK_TIMEOUT, lock_lease=0.06, lock_mode="best_effort"
+        )
         with pytest.raises(TimeoutError):
-            await storage._locker.acquire_lock(index, "/renew.lock")
+            await contender._locker.acquire_lock(index, "/renew.lock")
 
 
 async def test_delayed_renewal_keeps_active_holder_exclusive() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.2, lock_lease=0.06, lock_mode="best_effort") as storage,
+        IndexStorage(
+            index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=0.06, lock_mode="best_effort"
+        ) as storage,
         storage._lock_index("/delayed-renew"),
     ):
         await anyio.sleep(0.3)
-        contender = IndexStorage(index, chunks, lock_timeout=0.08, lock_lease=0.06, lock_mode="best_effort")
+        contender = IndexStorage(
+            index, chunks, lock_timeout=IMPATIENT_LOCK_TIMEOUT, lock_lease=0.06, lock_mode="best_effort"
+        )
         with pytest.raises(TimeoutError):
             await contender._locker.acquire_lock(index, "/delayed-renew.lock")
 
@@ -185,7 +209,9 @@ async def test_renewal_owner_loss_cancels_holder() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.05, lock_lease=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(
+            index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=0.03, lock_mode="best_effort"
+        ) as storage,
     ):
 
         async def lose_owner() -> None:
@@ -209,7 +235,9 @@ async def test_renewal_does_not_overwrite_replaced_lock_record() -> None:
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.2, lock_lease=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(
+            index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=0.03, lock_mode="best_effort"
+        ) as storage,
     ):
         lease = await storage._locker.acquire_lock(index, "/renew-replaced.lock")
         assert lease is not None
@@ -225,7 +253,9 @@ async def test_slow_successful_handoff_has_fresh_exclusive_lease() -> None:
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.2, lock_lease=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(
+            index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=0.03, lock_mode="best_effort"
+        ) as storage,
     ):
         lease = await storage._locker.acquire_lock(index, "/slow-handoff.lock")
         assert lease is not None
@@ -235,7 +265,9 @@ async def test_slow_successful_handoff_has_fresh_exclusive_lease() -> None:
         assert lease.expires == expires
 
         index.upload_delay = 0.0
-        contender = IndexStorage(index, chunks, lock_timeout=0.03, lock_lease=0.03, lock_mode="best_effort")
+        contender = IndexStorage(
+            index, chunks, lock_timeout=IMPATIENT_LOCK_TIMEOUT, lock_lease=0.03, lock_mode="best_effort"
+        )
         with pytest.raises(TimeoutError, match="Timed out waiting"):
             await contender._locker.acquire_lock(index, "/slow-handoff.lock")
         assert json.loads((await index.download_bytes("/slow-handoff.lock")).decode())["owner"] == lease.owner
@@ -246,7 +278,9 @@ async def test_renewal_guard_contention_retries_before_expiry() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.03, lock_lease=0.12, lock_mode="best_effort") as storage,
+        IndexStorage(
+            index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=0.12, lock_mode="best_effort"
+        ) as storage,
     ):
         lease = await storage._locker.acquire_lock(index, "/renew-contention.lock")
         assert lease is not None
@@ -263,13 +297,18 @@ async def test_renewal_guard_contention_retries_before_expiry() -> None:
             released.set()
 
         async def contend() -> None:
+            # A separate impatient locker: the lock stays held by the renewing lease
+            # above for the whole window, so a short timeout cannot flake into success.
+            contender = IndexStorage(
+                index, chunks, lock_timeout=IMPATIENT_LOCK_TIMEOUT, lock_lease=0.12, lock_mode="best_effort"
+            )
             try:
-                candidate = await storage._locker.acquire_lock(index, "/renew-contention.lock")
+                candidate = await contender._locker.acquire_lock(index, "/renew-contention.lock")
             except TimeoutError:
                 outcome.append("timeout")
             else:
                 outcome.append("acquired")
-                await storage._locker.release_lock(index, "/renew-contention.lock", candidate)
+                await contender._locker.release_lock(index, "/renew-contention.lock", candidate)
             done.set()
 
         async with anyio.create_task_group() as tg:
@@ -288,12 +327,19 @@ async def test_active_lock_times_out_without_being_stolen() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.05, lock_lease=10, lock_mode="best_effort") as storage,
+        IndexStorage(
+            index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=10, lock_mode="best_effort"
+        ) as storage,
     ):
         lease = await storage._locker.acquire_lock(index, "/held.lock")
         assert lease is not None
+        # The lease above is held for the rest of the test (lock_lease=10), so an
+        # impatient contender can only ever time out here.
+        contender = IndexStorage(
+            index, chunks, lock_timeout=IMPATIENT_LOCK_TIMEOUT, lock_lease=10, lock_mode="best_effort"
+        )
         with pytest.raises(TimeoutError, match="Timed out waiting"):
-            await storage._locker.acquire_lock(index, "/held.lock")
+            await contender._locker.acquire_lock(index, "/held.lock")
         assert await index.exists("/held.lock")
         await storage._locker.release_lock(index, "/held.lock", lease)
 
@@ -302,7 +348,9 @@ async def test_stale_lock_is_recovered() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.2, lock_lease=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(
+            index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=0.03, lock_mode="best_effort"
+        ) as storage,
     ):
         await index.upload_bytes(
             b'{"owner":"dead","created":"2000-01-01T00:00:00+00:00","expires":"2000-01-01T00:00:00+00:00"}',
@@ -348,7 +396,7 @@ async def test_stale_takeover_does_not_delete_replaced_lock() -> None:
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=IMPATIENT_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
         await index.upload_bytes(stale, "/takeover.lock", overwrite=False)
         index.replace_after_next_read("/takeover.lock", replacement)
@@ -396,7 +444,7 @@ async def test_same_path_lock_critical_sections_do_not_overlap() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.2, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
         active = 0
         maximum = 0
@@ -437,7 +485,7 @@ async def test_local_guard_wait_uses_lock_timeout_and_reclaims_entry() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=IMPATIENT_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
         key = f"{index.namespace_identity}:/blocked.lock"
         entered = anyio.Event()
@@ -462,9 +510,9 @@ async def test_storage_probe_respects_lock_timeout() -> None:
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=IMPATIENT_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
-        with anyio.fail_after(0.15) as outer_timeout:
+        with anyio.fail_after(CLEANUP_OUTER_DEADLINE) as outer_timeout:
             with pytest.raises(TimeoutError, match="Timed out waiting"):
                 await storage._locker.acquire_lock(index, "/blocked-probe.lock")
         assert not outer_timeout.cancel_called
@@ -476,10 +524,10 @@ async def test_handoff_upload_respects_acquisition_deadline_and_cleans_lock() ->
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.03, lock_mode="best_effort") as storage,
+        IndexStorage(index, chunks, lock_timeout=IMPATIENT_LOCK_TIMEOUT, lock_mode="best_effort") as storage,
     ):
         key = f"{index.namespace_identity}:/handoff-timeout.lock"
-        with anyio.fail_after(0.15) as outer_timeout:
+        with anyio.fail_after(CLEANUP_OUTER_DEADLINE) as outer_timeout:
             with pytest.raises(TimeoutError, match="Timed out waiting"):
                 await storage._locker.acquire_lock(index, "/handoff-timeout.lock")
         assert not outer_timeout.cancel_called
@@ -692,7 +740,7 @@ async def test_strong_renewal_handoff_survives_cancellation() -> None:
     async with (
         index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=1, lock_lease=0.05) as storage,
+        IndexStorage(index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=0.05) as storage,
     ):
         lease = await storage._locker.acquire_lock(index, p)
         assert lease is not None
@@ -716,7 +764,7 @@ async def test_strong_background_renewal_interrupts_holder() -> None:
     async with (
         MemoryStorage("/") as index,
         MemoryStorage("/") as chunks,
-        IndexStorage(index, chunks, lock_timeout=0.2, lock_lease=0.03) as storage,
+        IndexStorage(index, chunks, lock_timeout=PATIENT_LOCK_TIMEOUT, lock_lease=0.03) as storage,
     ):
 
         async def steal() -> None:
