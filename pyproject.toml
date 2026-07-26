@@ -107,4 +107,3 @@ exclude_lines = [
   "@overload",
   "except ImportError:",
 ]
-omit = ["*/compat.py", "*/migrations/*"]
