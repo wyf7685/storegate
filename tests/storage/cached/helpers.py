@@ -1,15 +1,16 @@
 from storegate.storage.cached import CachedStorage
+from storegate.storage.cached.backend.base import DOWNLOAD, EXISTS, IS_DIR, IS_FILE, IS_SYMLINK, ITERDIR, LSTAT, STAT
 
 
 async def _clear_path(cached: CachedStorage, path: str) -> None:
     """Remove all cache entries for *path* (simulates a completely cold cache)."""
     await cached._cache.mdelete(
-        ("exists", path),
-        ("is_file", path),
-        ("is_dir", path),
-        ("is_symlink", path),
-        ("stat", path),
-        ("lstat", path),
-        ("download", path),
-        ("iterdir", path),
+        (EXISTS, path),
+        (IS_FILE, path),
+        (IS_DIR, path),
+        (IS_SYMLINK, path),
+        (STAT, path),
+        (LSTAT, path),
+        (DOWNLOAD, path),
+        (ITERDIR, path),
     )

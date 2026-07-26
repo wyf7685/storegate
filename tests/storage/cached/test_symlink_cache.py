@@ -7,6 +7,7 @@ import pytest
 
 from storegate.storage import AbstractStorage, EntryKind, FileInfo, WalkEntry
 from storegate.storage.cached import CachedStorage
+from storegate.storage.cached.backend.base import DOWNLOAD, ITERDIR, STAT
 from storegate.storage.memory import MemoryStorage
 from tests.storage.cached.helpers import _clear_path
 
@@ -167,8 +168,8 @@ async def test_symlink_failure_invalidates_overwrite_rollback_state(
 ) -> None:
     await cached.symlink("old-target", "link")
     await cached.lstat("link")
-    await cached._cache.set("stat", "link", FileInfo(path="/link", name="link", kind=EntryKind.FILE))
-    await cached._cache.set("download", "link", b"stale")
+    await cached._cache.set(STAT, "link", FileInfo(path="/link", name="link", kind=EntryKind.FILE))
+    await cached._cache.set(DOWNLOAD, "link", b"stale")
     original = cached._storage.symlink
 
     async def failed_overwrite(
@@ -231,8 +232,8 @@ async def test_nested_destination_invalidates_all_ancestor_listings(
         await cached.symlink("missing-target", source)
 
     assert await _listing_paths(cached, "") == [f"/{source}"]
-    await cached._cache.set("iterdir", "nested", [])
-    await cached._cache.set("iterdir", f"nested/{operation}", [])
+    await cached._cache.set(ITERDIR, "nested", [])
+    await cached._cache.set(ITERDIR, f"nested/{operation}", [])
 
     await getattr(cached, operation)(source, destination)
 
@@ -264,8 +265,8 @@ async def test_nested_destination_failure_invalidates_all_ancestor_listings(
         await cached.symlink("missing-target", source)
 
     assert await _listing_paths(cached, "") == [f"/{source}"]
-    await cached._cache.set("iterdir", "partial", [])
-    await cached._cache.set("iterdir", f"partial/{operation}", [])
+    await cached._cache.set(ITERDIR, "partial", [])
+    await cached._cache.set(ITERDIR, f"partial/{operation}", [])
     original = getattr(cached._storage, operation)
 
     async def partial_failure(src: str, dst: str, *, overwrite: bool = True) -> None:

@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from storegate.storage.cached import CachedStorage
+from storegate.storage.cached.backend.base import EXISTS, IS_SYMLINK
 from storegate.storage.dav import DavConfig, DavStorage
 from storegate.storage.memory import MemoryStorage
 from storegate.storage.s3 import S3Storage
@@ -291,8 +292,8 @@ async def test_cached_storage_preserves_memory_compare_exchange_contract() -> No
 
 async def test_cached_storage_rejects_invalid_paths_before_cache_lookup() -> None:
     cached = CachedStorage(MemoryStorage("/"))
-    await cached._cache.set("exists", "../escape", True)
-    await cached._cache.set("is_symlink", "../escape", False)
+    await cached._cache.set(EXISTS, "../escape", True)
+    await cached._cache.set(IS_SYMLINK, "../escape", False)
     with pytest.raises(ValueError, match="segments"):
         await cached.exists("../escape")
 

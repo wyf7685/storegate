@@ -2,7 +2,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from storegate.storage.abstract import EntryKind, FileInfo
 from storegate.storage.cached import CachedStorage
+from storegate.storage.cached.backend.base import DOWNLOAD, EXISTS, STAT
 from storegate.storage.cached.backend.memory import MemoryCacheBackend
 from storegate.storage.memory import MemoryStorage
 
@@ -91,12 +93,12 @@ async def test_two_async_with_lifecycles_preserve_namespaces_without_stale_value
 
 async def test_memory_configure_namespace_is_idempotent_and_rejects_conflicts() -> None:
     backend = MemoryCacheBackend(capacity=8)
-    backend.configure_namespace("exists", 30)
-    backend.configure_namespace("exists", 30)  # identical config is a no-op
+    backend.configure_namespace(EXISTS, 30)
+    backend.configure_namespace(EXISTS, 30)  # identical config is a no-op
     with pytest.raises(ValueError, match="already configured"):
-        backend.configure_namespace("exists", 60)
+        backend.configure_namespace(EXISTS, 60)
     with pytest.raises(ValueError, match="already configured"):
-        backend.configure_namespace("exists", 30, capacity=4)
+        backend.configure_namespace(EXISTS, 30, capacity=4)
 
 
 def test_cached_storage_rejects_invalid_configuration() -> None:
@@ -132,8 +134,9 @@ async def test_compare_exchange_proxies_capability_and_invalidates_caches() -> N
         assert snap["download"].get("cas.txt") == b"v1"
 
         # Seed a stale download/metadata view that CAS must replace.
-        await cached._cache.set("download", "cas.txt", b"stale")
-        await cached._cache.set("stat", "cas.txt", object())
+        await cached._cache.set(DOWNLOAD, "cas.txt", b"stale")
+        stale_info = FileInfo(path="cas.txt", name="cas.txt", kind=EntryKind.FILE, size=99)
+        await cached._cache.set(STAT, "cas.txt", stale_info)
 
         updated = await cached.compare_exchange("cas.txt", expected_token=created.token, data=b"v2")
         assert updated is not None

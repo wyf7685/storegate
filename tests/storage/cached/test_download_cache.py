@@ -3,6 +3,7 @@
 import pytest
 
 from storegate.storage.cached import CachedStorage
+from storegate.storage.cached.backend.base import DOWNLOAD
 from tests.support.ids import uid
 
 
@@ -62,7 +63,7 @@ class TestDownloadOffsetParity:
             with pytest.raises(ValueError, match="non-negative"):
                 await anext(cached.download_stream(path, offset=-1))
 
-            await cached._cache.delete("download", path)
+            await cached._cache.delete(DOWNLOAD, path)
             with pytest.raises(ValueError, match="non-negative"):
                 await anext(cached.download_stream(path, offset=-1))
         finally:
@@ -76,7 +77,7 @@ class TestDownloadOffsetParity:
             for offset in (len(data), len(data) + 1):
                 assert [chunk async for chunk in cached.download_stream(path, offset=offset)] == []
 
-            await cached._cache.delete("download", path)
+            await cached._cache.delete(DOWNLOAD, path)
             for offset in (len(data), len(data) + 1):
                 assert [chunk async for chunk in cached.download_stream(path, offset=offset)] == []
         finally:

@@ -2,7 +2,7 @@ from typing import Any, final, override
 
 from expiringdictx import ExpiringDict
 
-from .base import CacheBackend
+from .base import CacheBackend, Namespace
 
 
 @final
@@ -11,6 +11,9 @@ class MemoryCacheBackend(CacheBackend):
 
     All methods are ``async`` in signature but execute synchronously
     (there is no I/O).
+
+    Values are held as live objects, so the namespace codecs are unused here;
+    only the namespace name is needed to select a cache.
 
     Namespace configuration and cache objects survive :meth:`close`. Closing
     only clears each namespace's contents so a later reconnect reuses the same
@@ -36,7 +39,7 @@ class MemoryCacheBackend(CacheBackend):
     # ------------------------------------------------------------------
 
     @override
-    def configure_namespace(self, name: str, ttl: int, **opts: Any) -> None:
+    def configure_namespace(self, namespace: Namespace[Any], ttl: int, **opts: Any) -> None:
         if ttl <= 0:
             raise ValueError("ttl must be > 0")
         capacity = opts.get("capacity", self._default_capacity)
@@ -45,6 +48,7 @@ class MemoryCacheBackend(CacheBackend):
         if capacity < 1:
             raise ValueError("capacity must be >= 1")
 
+        name = namespace.name
         config = (ttl, capacity)
         existing = self._namespace_configs.get(name)
         if existing is not None:
@@ -81,50 +85,51 @@ class MemoryCacheBackend(CacheBackend):
     # ------------------------------------------------------------------
 
     @override
-    async def get(self, namespace: str, key: str) -> Any:
-        return self._caches[namespace].get(key)
+    async def get[T](self, namespace: Namespace[T], key: str) -> T | None:
+        value: T | None = self._caches[namespace.name].get(key)
+        return value
 
     @override
-    async def set(
+    async def set[T](
         self,
-        namespace: str,
+        namespace: Namespace[T],
         key: str,
-        value: Any,
+        value: T,
         ttl: int | None = None,
     ) -> None:
         # ttl is ignored: ExpiringDict has per-dict default_age, not per-key
-        self._caches[namespace][key] = value
+        self._caches[namespace.name][key] = value
 
     @override
-    async def delete(self, namespace: str, key: str) -> bool:
-        return self._caches[namespace].pop(key, None) is not None
+    async def delete(self, namespace: Namespace[Any], key: str) -> bool:
+        return self._caches[namespace.name].pop(key, None) is not None
 
     @override
-    async def clear(self, namespace: str | None = None) -> None:
+    async def clear(self, namespace: Namespace[Any] | None = None) -> None:
         if namespace is None:
             for cache in self._caches.values():
                 cache.clear()
         else:
-            self._caches[namespace].clear()
+            self._caches[namespace.name].clear()
 
     # ------------------------------------------------------------------
     # Batch / pipeline operations
     # ------------------------------------------------------------------
 
     @override
-    async def mget(self, *keys: tuple[str, str]) -> list[Any]:
-        return [self._caches[ns].get(key) for ns, key in keys]
+    async def mget(self, *keys: tuple[Namespace[Any], str]) -> list[Any]:
+        return [self._caches[ns.name].get(key) for ns, key in keys]
 
     @override
-    async def mset(self, *entries: tuple[str, str, Any]) -> None:
+    async def mset(self, *entries: tuple[Namespace[Any], str, Any]) -> None:
         for ns, key, value in entries:
-            self._caches[ns][key] = value
+            self._caches[ns.name][key] = value
 
     @override
-    async def mdelete(self, *keys: tuple[str, str]) -> int:
+    async def mdelete(self, *keys: tuple[Namespace[Any], str]) -> int:
         count = 0
         for ns, key in keys:
-            if self._caches[ns].pop(key, None) is not None:
+            if self._caches[ns.name].pop(key, None) is not None:
                 count += 1
         return count
 

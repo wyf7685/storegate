@@ -10,6 +10,7 @@ from pydantic import SecretStr
 
 from storegate.storage import EntryKind, FileInfo
 from storegate.storage.cached import CachedStorage, RedisCacheBackend
+from storegate.storage.cached.backend.base import EXISTS, IS_SYMLINK, ITERDIR, LSTAT, STAT
 from storegate.storage.dav.client import DavConfig
 from storegate.storage.local import LocalStorage
 from storegate.storage.s3.client import S3Config
@@ -91,7 +92,7 @@ def _install_fake_client(backend: RedisCacheBackend, redis: FakeRedis) -> None:
 def _backend(redis: FakeRedis, identity: str) -> RedisCacheBackend:
     backend = RedisCacheBackend()
     backend.bind_storage(identity)
-    backend.configure_namespace("exists", 30)
+    backend.configure_namespace(EXISTS, 30)
     _install_fake_client(backend, redis)
     return backend
 
@@ -121,23 +122,23 @@ async def test_auto_prefix_isolates_shared_redis() -> None:
     first = _backend(redis, '{"kind":"local","root":"/first"}')
     second = _backend(redis, '{"kind":"local","root":"/second"}')
 
-    await first.set("exists", "same.txt", True)
-    await second.set("exists", "same.txt", False)
-    await first.mset(("exists", "batch.txt", True))
-    await second.mset(("exists", "batch.txt", False))
+    await first.set(EXISTS, "same.txt", True)
+    await second.set(EXISTS, "same.txt", False)
+    await first.mset((EXISTS, "batch.txt", True))
+    await second.mset((EXISTS, "batch.txt", False))
 
-    assert await first.get("exists", "same.txt") is True
-    assert await second.get("exists", "same.txt") is False
-    assert await first.mget(("exists", "batch.txt")) == [True]
-    assert await second.mget(("exists", "batch.txt")) == [False]
+    assert await first.get(EXISTS, "same.txt") is True
+    assert await second.get(EXISTS, "same.txt") is False
+    assert await first.mget((EXISTS, "batch.txt")) == [True]
+    assert await second.mget((EXISTS, "batch.txt")) == [False]
 
-    await first.mdelete(("exists", "batch.txt"))
+    await first.mdelete((EXISTS, "batch.txt"))
     await first.clear()
 
-    assert await first.get("exists", "same.txt") is None
-    assert await second.get("exists", "same.txt") is False
-    assert await first.get("exists", "batch.txt") is None
-    assert await second.get("exists", "batch.txt") is False
+    assert await first.get(EXISTS, "same.txt") is None
+    assert await second.get(EXISTS, "same.txt") is False
+    assert await first.get(EXISTS, "batch.txt") is None
+    assert await second.get(EXISTS, "batch.txt") is False
     assert redis.scan_matches == [f"{first._scope_prefix()}:*"]
 
 
@@ -145,7 +146,7 @@ async def test_v2_file_info_roundtrip_and_strict_kind() -> None:
     redis = FakeRedis()
     backend = RedisCacheBackend()
     backend.bind_storage('{"kind":"local","root":"/schema"}')
-    for namespace in ("stat", "lstat", "iterdir", "is_symlink"):
+    for namespace in (STAT, LSTAT, ITERDIR, IS_SYMLINK):
         backend.configure_namespace(namespace, 30)
     _install_fake_client(backend, redis)
 
@@ -159,18 +160,18 @@ async def test_v2_file_info_roundtrip_and_strict_kind() -> None:
     )
     directory = FileInfo(path="/dir", name="dir", kind=EntryKind.DIRECTORY)
 
-    await backend.set("stat", "link", link)
-    await backend.set("lstat", "link", link)
-    await backend.set("iterdir", "", [directory, link])
-    await backend.set("is_symlink", "link", True)
+    await backend.set(STAT, "link", link)
+    await backend.set(LSTAT, "link", link)
+    await backend.set(ITERDIR, "", [directory, link])
+    await backend.set(IS_SYMLINK, "link", True)
 
     assert backend._scope_prefix().startswith("storegate:v3:")
-    assert await backend.get("stat", "link") == link
-    assert await backend.get("lstat", "link") == link
-    assert await backend.get("iterdir", "") == [directory, link]
-    assert await backend.get("is_symlink", "link") is True
-    assert b'"kind":"symlink"' in redis.values[backend._rk("stat", "link")]
-    assert b'"is_dir"' not in redis.values[backend._rk("stat", "link")]
+    assert await backend.get(STAT, "link") == link
+    assert await backend.get(LSTAT, "link") == link
+    assert await backend.get(ITERDIR, "") == [directory, link]
+    assert await backend.get(IS_SYMLINK, "link") is True
+    assert b'"kind":"symlink"' in redis.values[backend._rk(STAT, "link")]
+    assert b'"is_dir"' not in redis.values[backend._rk(STAT, "link")]
 
 
 @pytest.mark.parametrize(
@@ -184,12 +185,12 @@ async def test_file_info_decoder_rejects_legacy_or_invalid_kind(payload: bytes, 
     redis = FakeRedis()
     backend = RedisCacheBackend()
     backend.bind_storage('{"kind":"local","root":"/strict"}')
-    backend.configure_namespace("stat", 30)
+    backend.configure_namespace(STAT, 30)
     _install_fake_client(backend, redis)
-    redis.values[backend._rk("stat", "entry")] = payload
+    redis.values[backend._rk(STAT, "entry")] = payload
 
     with pytest.raises(error):
-        await backend.get("stat", "entry")
+        await backend.get(STAT, "entry")
 
 
 async def test_cached_storage_close_preserves_redis_entries(tmp_path: Path) -> None:
@@ -197,7 +198,7 @@ async def test_cached_storage_close_preserves_redis_entries(tmp_path: Path) -> N
     first_backend = RedisCacheBackend()
     _install_fake_client(first_backend, FakeRedis(values))
     first = CachedStorage(LocalStorage(tmp_path), cache=first_backend)
-    await first_backend.set("exists", "cached.txt", True)
+    await first_backend.set(EXISTS, "cached.txt", True)
 
     await first.close()
     assert first_backend._redis is None
@@ -206,7 +207,7 @@ async def test_cached_storage_close_preserves_redis_entries(tmp_path: Path) -> N
     _install_fake_client(second_backend, FakeRedis(values))
     CachedStorage(LocalStorage(tmp_path), cache=second_backend)
 
-    assert await second_backend.get("exists", "cached.txt") is True
+    assert await second_backend.get(EXISTS, "cached.txt") is True
 
 
 def test_auto_prefix_rejects_unknown_or_conflicting_storage() -> None:
@@ -221,7 +222,7 @@ def test_auto_prefix_rejects_unknown_or_conflicting_storage() -> None:
 
 def test_explicit_key_prefix_is_validated_and_compatible() -> None:
     backend = RedisCacheBackend(key_prefix="storegate")
-    assert backend._rk("exists", "file.txt") == "storegate:exists:file.txt"
+    assert backend._rk(EXISTS, "file.txt") == "storegate:exists:file.txt"
 
     with pytest.raises(ValueError, match="key_prefix"):
         RedisCacheBackend(key_prefix="invalid*")
