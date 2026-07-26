@@ -28,7 +28,7 @@ async def test_ping_failure_with_cleanup_failure_preserves_client_and_error_orde
     client = FakeDavClient()
     cleanup_error = OSError("cleanup failed")
     client.__aexit__ = AsyncMock(side_effect=cleanup_error)  # type: ignore[method-assign]
-    monkeypatch.setattr("storegate.storage.dav.storage.AsyncDavClient", lambda _config: client)
+    monkeypatch.setattr("storegate.storage.dav._base.AsyncDavClient", lambda _config: client)
     storage = DavStorage(dav_config)
     monkeypatch.setattr(storage, "ping", AsyncMock(return_value=False))
 
@@ -47,7 +47,7 @@ async def test_ping_failure_with_cleanup_failure_preserves_client_and_error_orde
 
 async def test_ping_success_publishes_connected_client(dav_config: DavConfig, monkeypatch: pytest.MonkeyPatch) -> None:
     client = FakeDavClient()
-    monkeypatch.setattr("storegate.storage.dav.storage.AsyncDavClient", lambda _config: client)
+    monkeypatch.setattr("storegate.storage.dav._base.AsyncDavClient", lambda _config: client)
     storage = DavStorage(dav_config)
     monkeypatch.setattr(storage, "ping", AsyncMock(return_value=True))
 
@@ -64,7 +64,7 @@ async def test_retry_cleans_retained_client_before_replacing_it(
     first.__aexit__ = AsyncMock(side_effect=[OSError("cleanup failed"), None])  # type: ignore[method-assign]
     second.__aexit__ = AsyncMock(return_value=None)  # type: ignore[method-assign]
     clients = iter((first, second))
-    monkeypatch.setattr("storegate.storage.dav.storage.AsyncDavClient", lambda _config: next(clients))
+    monkeypatch.setattr("storegate.storage.dav._base.AsyncDavClient", lambda _config: next(clients))
     storage = DavStorage(dav_config)
     monkeypatch.setattr(storage, "ping", AsyncMock(side_effect=[False, True]))
 
@@ -106,7 +106,7 @@ async def test_cancellation_during_retained_client_cleanup_is_safe(
     second.__aenter__ = AsyncMock(side_effect=cancelled_enter)  # type: ignore[method-assign]
     second.__aexit__ = AsyncMock(return_value=None)  # type: ignore[method-assign]
     clients = iter((first, second, third))
-    monkeypatch.setattr("storegate.storage.dav.storage.AsyncDavClient", lambda _config: next(clients))
+    monkeypatch.setattr("storegate.storage.dav._base.AsyncDavClient", lambda _config: next(clients))
     storage = DavStorage(dav_config)
     monkeypatch.setattr(storage, "ping", AsyncMock(side_effect=[False, True]))
 
