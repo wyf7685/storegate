@@ -1,5 +1,8 @@
 """IndexStorage behavior tests."""
 
+import pytest
+from pytest_mock import MockerFixture
+
 from storegate.storage.index import IndexStorage
 from tests.storage.index.helpers import BLOCK_SIZE, _hash_block, hash_to_path_stem, suppress_exc
 from tests.support.ids import uid
@@ -74,6 +77,48 @@ class TestRefCounting:
 
         # Verify FileMeta removed from index
         assert await index_storage._get_file_meta(path) is None
+
+    async def test_unlink_metadata_failure_keeps_file_readable(
+        self, index_storage: IndexStorage, mocker: MockerFixture
+    ):
+        """A failed metadata delete must not leave a file whose chunks were already reaped.
+
+        Regression: unlink used to decref every chunk (dropping refcounts to zero and
+        deleting the .bin) *before* removing the metadata. When the metadata delete
+        failed, the file stayed visible but every download raised "Chunk not found".
+        """
+        s = index_storage
+        data = b"M" * BLOCK_SIZE
+        path = f"test-refc-unlink-metafail-{uid()}"
+
+        await s.upload_bytes(data, path)
+        meta = await s._get_file_meta(path)
+        assert meta is not None
+        chunk_hashes = meta.chunks[:]
+
+        original_unlink = s._index.unlink
+
+        async def _fail_meta_unlink(remote_path: str, *, missing_ok: bool = False) -> None:
+            if str(remote_path) == f"/{path}":
+                raise OSError("simulated metadata delete failure")
+            await original_unlink(remote_path, missing_ok=missing_ok)
+
+        mocker.patch.object(s._index, "unlink", _fail_meta_unlink)
+
+        with pytest.raises(OSError, match="simulated metadata delete failure"):
+            await s.unlink(path)
+
+        mocker.stopall()
+
+        # The file survived the failure, so its chunk data must have survived too.
+        assert await s.download_bytes(path) == data
+        for chunk_hash in chunk_hashes:
+            assert await s._chunks.exists(f"{hash_to_path_stem(chunk_hash)}.bin")
+            refs = await s._refs.load_refs(chunk_hash)
+            assert refs is not None
+            assert f"/{path}" in refs
+
+        await s.delete(path)
 
     async def test_copy_increfs_chunks(self, index_storage: IndexStorage):
         data = b"C" * BLOCK_SIZE

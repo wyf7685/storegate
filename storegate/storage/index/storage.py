@@ -793,10 +793,18 @@ class IndexStorage(AbstractStorage):
                     return
                 raise FileNotFoundError(f"File not found: {path}")
             async with self._lock_chunks(meta.chunks):
-                async with anyio.create_task_group() as tg:
-                    for chunk_hash in meta.chunks:
-                        tg.start_soon(self._refs.decref, chunk_hash, path)
+                # Metadata is the authoritative pointer, so it is dropped first. The
+                # reverse order leaves a readable file whose chunks were already
+                # reaped when the delete fails — every later download_stream then
+                # raises "Chunk not found". A leaked chunk is recoverable; dangling
+                # metadata is silent data loss.
                 await self._index.unlink(path)
+                # The file is already gone for readers; finish the refcount bookkeeping
+                # even under cancellation so chunks are not stranded.
+                with anyio.CancelScope(shield=True):
+                    async with anyio.create_task_group() as tg:
+                        for chunk_hash in meta.chunks:
+                            tg.start_soon(self._refs.decref, chunk_hash, path)
         self.log.info(f"Deleted: {_colored_path} (<g>{meta.info.size}</g> bytes, <g>{len(meta.chunks)}</g> chunks)")
 
     @override
