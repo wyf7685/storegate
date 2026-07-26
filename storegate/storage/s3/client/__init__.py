@@ -2,7 +2,6 @@ from .client import AsyncS3Client
 from .errors import S3ClientError, S3HttpStatusError, S3ResponseParseError
 from .models import (
     CompletedPart,
-    CompleteMultipartUploadPayload,
     CopyObjectResult,
     CopyPartResult,
     HeadObjectOutput,
@@ -13,7 +12,6 @@ from .models import (
 
 __all__ = [
     "AsyncS3Client",
-    "CompleteMultipartUploadPayload",
     "CompletedPart",
     "CopyObjectResult",
     "CopyPartResult",

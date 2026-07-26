@@ -211,9 +211,6 @@ class CachedStorage(AbstractStorage):
             ("is_dir", np, info.kind is EntryKind.DIRECTORY),
         ]
 
-    async def _cache_lexical_info(self, info: FileInfo) -> None:
-        await self._cache.mset(*self._lexical_cache_entries(self._normalize(info.path), info))
-
     async def _cache_lexical_missing(self, np: str) -> None:
         await self._cache.mset(
             ("is_symlink", np, False),
@@ -668,6 +665,10 @@ class CachedStorage(AbstractStorage):
                 yield info
             return
 
+        # A partially consumed listing is never cached under "iterdir": the
+        # snapshot would be incomplete and later reads would miss entries. Per
+        # entry lexical metadata is still backfilled as it streams, so an early
+        # break is not wasted work.
         entries: list[FileInfo] = []
         async for info in self._storage.iterdir(path):
             entries.append(info)
@@ -675,6 +676,16 @@ class CachedStorage(AbstractStorage):
             yield info
         await self._cache.set("iterdir", np, entries.copy())
         self.log.debug(f"Cache miss: <le>iterdir</>(<y>{escape_tag(np)}</y>) → <g>{len(entries)}</g> entries")
+
+    @override
+    async def _is_dir_empty(self, path: PathLike) -> bool:
+        # Serve from a cached listing when present, otherwise delegate so
+        # backends with a cheap emptiness probe (S3 max_keys=2, DAV Depth:1)
+        # keep it instead of paying a full iterdir through this layer.
+        cached: list[FileInfo] | None = await self._cache.get("iterdir", self._normalize(path))
+        if cached is not None:
+            return not cached
+        return await self._storage._is_dir_empty(path)  # noqa: SLF001
 
     @override
     async def walk(self, path: PathLike) -> AsyncGenerator[WalkEntry]:

@@ -73,10 +73,6 @@ class CompletedPart(TypedDict):
     ETag: str
 
 
-class CompleteMultipartUploadPayload(TypedDict):
-    Part: list[CompletedPart]
-
-
 @dataclasses.dataclass(frozen=True, slots=True)
 class HeadObjectOutput:
     """Result of HeadObject (no XML body — fields come from response headers)."""

@@ -35,6 +35,11 @@ translator = ExceptionTranslator(
 
 _DAV_CAPABILITIES = StorageCapabilities()
 _UNSUPPORTED_ERRNO = getattr(errno, "ENOTSUP", errno.EOPNOTSUPP)
+# Statuses that make a server-side Depth:infinity COPY/MOVE fall back to the
+# explicit walk-and-copy path: 403/405/501 refuse the recursive operation and
+# 409 reports a missing intermediate collection (RFC 4918 §9.8.5). The fallback
+# creates every destination collection itself, so it resolves all four.
+_RECURSIVE_OP_FALLBACK_STATUSES = frozenset({403, 405, 409, 501})
 
 
 def _unsupported_entry(path: PathLike) -> UnsupportedOperationError:
@@ -151,9 +156,15 @@ class DavStorage(AbstractStorage):
 
     @override
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.__aexit__(None, None, None)
-            self._client = None
+        if (client := self._client) is not None:
+            # Shielded so a cancellation delivered mid-``aclose`` cannot leave
+            # ``_client`` pointing at a half-closed client and leak its sockets.
+            # The client is retained on failure so the next ``connect()`` retries
+            # closing it, mirroring the connect-rollback path above.
+            with anyio.CancelScope(shield=True):
+                await client.__aexit__(None, None, None)
+                if self._client is client:
+                    self._client = None
         self.log.debug("Disconnected")
 
     @override
@@ -318,13 +329,16 @@ class DavStorage(AbstractStorage):
         if root.kind is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Not a directory: {path}")
 
-        normalized = self.normalize_path(path)
-        entries = await self._scan_directory(normalized, strict=False)
-        yield WalkEntry(path=normalized.as_posix(), entries=entries)
-        for entry in entries:
-            if entry.kind is EntryKind.DIRECTORY:
-                async for child in self.walk(entry.path):
-                    yield child
+        # Iterative depth-first: each directory costs exactly one Depth:1
+        # PROPFIND. Recursing through the public generator would re-stat every
+        # level and bound the walk by the Python stack.
+        pending = [self.normalize_path(path)]
+        while pending:
+            current = pending.pop()
+            entries = await self._scan_directory(current, strict=False)
+            yield WalkEntry(path=current.as_posix(), entries=entries)
+            directories = [entry for entry in entries if entry.kind is EntryKind.DIRECTORY]
+            pending.extend(PurePosixPath(entry.path) for entry in reversed(directories))
 
     @override
     async def _is_dir_empty(self, path: PathLike) -> bool:
@@ -426,6 +440,14 @@ class DavStorage(AbstractStorage):
     @override
     @translator.wrap("Failed to remove directory {path}")
     async def rmdir(self, path: PathLike) -> None:
+        """Delete an empty collection.
+
+        WebDAV has no non-recursive collection delete, so emptiness is checked
+        with a Depth:1 PROPFIND before issuing DELETE. That check and the DELETE
+        are separate requests: an entry created in between is removed by the
+        recursive DELETE without error. Backends with a native non-recursive
+        rmdir (local, SFTP, FTP) do not have this window.
+        """
         rel = self._remote_path(path)
         if rel == "":
             raise OSError(f"Cannot remove root: {path}")
@@ -440,7 +462,8 @@ class DavStorage(AbstractStorage):
             raise OSError(f"Directory not empty: {path}")
 
         self.log.info(f"Delete dir: <y>{escape_tag(rel)}</y>")
-        # WebDAV DELETE is recursive, but we pre-checked emptiness above.
+        # WebDAV DELETE is recursive; emptiness was pre-checked above, but see
+        # the docstring for the race this leaves open.
         await self._ensure_client().delete(rel)
 
     @override
@@ -539,6 +562,7 @@ class DavStorage(AbstractStorage):
     # ------------------------------------------------------------------
 
     @override
+    @translator.wrap("Failed to move {src} → {dst} (overwrite={overwrite})")
     async def move(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
         src_np = self.normalize_path(src)
         dst_np = self.normalize_path(dst)
@@ -691,9 +715,11 @@ class DavStorage(AbstractStorage):
                 depth="infinity",
             )
         except DavHttpStatusError as exc:
-            if exc.status_code not in (403, 405, 409, 501):
+            if exc.status_code not in _RECURSIVE_OP_FALLBACK_STATUSES:
                 raise
-            # Server does not support recursive COPY — fall back below.
+            # 403/405/501: server refuses recursive COPY. 409 (RFC 4918 §9.8.5):
+            # an intermediate collection is missing. Both are resolved by the
+            # walk fallback, which creates every destination directory itself.
         else:
             return
 
@@ -735,11 +761,12 @@ class DavStorage(AbstractStorage):
         try:
             await client.move(src_rel, dst_rel, overwrite=overwrite)
         except DavHttpStatusError as exc:
-            if exc.status_code not in (403, 405, 501):
+            if exc.status_code not in _RECURSIVE_OP_FALLBACK_STATUSES:
                 if exc.status_code == 404:
                     raise FileNotFoundError(f"Source not found: {src}") from exc
                 raise OSError(f"Failed to move tree: {src} → {dst}: {exc}") from exc
-            # Server does not support recursive MOVE — fall back to copy + rmtree.
+            # Same fallback set as copytree: the copy + rmtree path creates every
+            # destination collection explicitly, so it also resolves a 409.
             await self.copytree(src, dst, overwrite=overwrite)
             await self.rmtree(src)
 

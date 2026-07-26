@@ -201,6 +201,13 @@ class LocalStorage(AbstractStorage):
         return LocalStorage._classify_entry(path, result)
 
     def _validate_intermediate_components(self, logical: PurePosixPath) -> None:
+        """Reject a symlink, junction, or reparse point in an intermediate component.
+
+        Walking stops at the first missing component: nothing can exist below it,
+        so there is nothing further to classify. Callers that then create those
+        components (see :meth:`_ensure_parent_directory`) must re-validate
+        afterwards, because the newly present components were never checked.
+        """
         current = self._root
         for component in logical.relative_to("/").parts[:-1]:
             current /= component
@@ -336,6 +343,11 @@ class LocalStorage(AbstractStorage):
         self._validate_intermediate_components(logical)
         if create:
             local.parent.mkdir(parents=True, exist_ok=True)
+            # Components that did not exist during the check above are now
+            # present, so re-check the full chain rather than trusting the
+            # pre-create snapshot. This narrows, but cannot close, the race a
+            # local attacker can run against us (see the class docstring).
+            self._validate_intermediate_components(logical)
         parent_result = os.lstat(local.parent)
         if self._public_kind(local.parent, parent_result) is not EntryKind.DIRECTORY:
             raise NotADirectoryError(f"Parent is not a directory: {logical.parent}")

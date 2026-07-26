@@ -103,6 +103,12 @@ class CacheBackend(ABC):
 
         Returns ``True`` if the key existed and was removed, ``False``
         if it was not present.
+
+        Backend failures must be raised, never swallowed. A silently dropped
+        delete leaves a stale positive entry readable until its TTL expires,
+        which is a correctness failure rather than a degraded cache. This is
+        the opposite of :meth:`get` and :meth:`set`, where a failure only costs
+        a miss and may safely degrade.
         """
         raise NotImplementedError
 
@@ -112,6 +118,8 @@ class CacheBackend(ABC):
 
         - ``namespace is None`` -- clear **all** namespaces.
         - *namespace* is a string -- clear only that namespace.
+
+        Backend failures must be raised, for the same reason as :meth:`delete`.
         """
         raise NotImplementedError
 
@@ -144,6 +152,8 @@ class CacheBackend(ABC):
 
         Each element of *keys* is a ``(namespace, key)`` pair.
         Returns the total number of keys that existed and were removed.
+
+        Backend failures must be raised, for the same reason as :meth:`delete`.
         """
         raise NotImplementedError
 

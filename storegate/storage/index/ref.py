@@ -121,14 +121,13 @@ class ChunkRefManager:
             src_path = self.normalize_path(src_path).as_posix()
             dst_path = self.normalize_path(dst_path).as_posix()
             if src_path not in refs:
-                if missing_ok:
-                    self.log.warning(
-                        f"Chunk {_colored_hash} ref entry not found for transref: <i>{escape_tag(src_path)}</i>"
-                    )
-                else:
+                if not missing_ok:
                     raise FileNotFoundError(f"Chunk {chunk_hash} ref entry not found for transref: {src_path}")
-
-            refs.remove(src_path)
+                self.log.warning(
+                    f"Chunk {_colored_hash} ref entry not found for transref: <i>{escape_tag(src_path)}</i>"
+                )
+            else:
+                refs.remove(src_path)
             refs.add(dst_path)
 
         await self.chunks.upload_bytes("\n".join(refs).encode(), ref_path, overwrite=True)

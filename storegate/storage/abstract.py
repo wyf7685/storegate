@@ -481,8 +481,9 @@ class AbstractStorage(ABC):
         """Download as bytes."""
         remote_path = self.normalize_path(remote_path)
         buffer = bytearray()
-        async for chunk in self.download_stream(remote_path):
-            buffer.extend(chunk)
+        async with contextlib.aclosing(self.download_stream(remote_path)) as stream:
+            async for chunk in stream:
+                buffer.extend(chunk)
         return bytes(buffer)
 
     async def download_file(
@@ -492,8 +493,11 @@ class AbstractStorage(ABC):
     ) -> None:
         """Download to a local file."""
         remote_path = self.normalize_path(remote_path)
-        async with open_file_wb(Path(local_path)) as write:
-            async for chunk in self.download_stream(remote_path):
+        async with (
+            open_file_wb(Path(local_path)) as write,
+            contextlib.aclosing(self.download_stream(remote_path)) as stream,
+        ):
+            async for chunk in stream:
                 await write(chunk)
 
     # ------------------------------------------------------------------
@@ -830,6 +834,7 @@ class AbstractStorage(ABC):
 
     async def _is_dir_empty(self, path: PathLike) -> bool:
         """Check if a directory is empty."""
-        async for _ in self.iterdir(path):
-            return False
+        async with contextlib.aclosing(self.iterdir(path)) as entries:
+            async for _ in entries:
+                return False
         return True

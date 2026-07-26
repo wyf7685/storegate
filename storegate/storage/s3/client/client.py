@@ -4,6 +4,7 @@ import hashlib
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from types import TracebackType
 from typing import Literal, Self
 from urllib.parse import quote
@@ -341,7 +342,15 @@ class AsyncS3Client:
         last_modified_str = response.headers.get("Last-Modified")
         if last_modified_str is None or last_modified_str == "":
             raise S3ResponseParseError("Missing Last-Modified in head_object response")
-        last_modified = datetime.strptime(last_modified_str, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=UTC)
+        # RFC 1123 dates are always English; ``strptime`` would match ``%a``/``%b``
+        # against the process locale and fail outside an English one.
+        try:
+            last_modified = parsedate_to_datetime(last_modified_str)
+        except (TypeError, ValueError) as err:
+            raise S3ResponseParseError("Invalid Last-Modified in head_object response") from err
+        last_modified = (
+            last_modified.replace(tzinfo=UTC) if last_modified.tzinfo is None else last_modified.astimezone(UTC)
+        )
         return HeadObjectOutput(content_length=content_length, etag=etag, last_modified=last_modified)
 
     async def get_object(self, key: str, range: tuple[int, int] | None = None) -> bytes:  # noqa: A002

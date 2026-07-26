@@ -381,8 +381,13 @@ async def test_strong_takeover_cancellation_cleans_lock() -> None:
             assert not await hk.exists(p)
 
 
-async def test_visible_lock_file_remains_listed() -> None:
-    """User .lock file remains visible, downloadable, and refcount-safe."""
+async def test_reserved_lock_suffix_is_rejected() -> None:
+    """User paths ending in a reserved lock suffix are refused, not silently collided.
+
+    A file named ``<name>.lock`` would occupy the lock slot of ``<name>``, making
+    the subject permanently un-writable (lock acquisition times out against the
+    user payload). The same applies to ``.tree`` and tree operations.
+    """
     idx = MemoryStorage("/")
     ch = MemoryStorage("/")
     s = IndexStorage(idx, ch, lock_mode="best_effort")
@@ -391,12 +396,17 @@ async def test_visible_lock_file_remains_listed() -> None:
     async with idx, ch, s:
         base = "test-vl"
         await s.mkdir(base)
-        await s.upload_bytes(b"user data", f"{base}/visible.lock")
+        with pytest.raises(ValueError, match="reserves"):
+            await s.upload_bytes(b"user data", f"{base}/visible.lock")
+        with pytest.raises(ValueError, match="reserves"):
+            await s.upload_bytes(b"user data", f"{base}/visible.tree")
+        with pytest.raises(ValueError, match="reserves"):
+            await s.mkdir(f"{base}/dir.lock")
+        # An ordinary name is unaffected, including one merely containing "lock".
+        await s.upload_bytes(b"user data", f"{base}/lockfile.txt")
         names = {e.name async for e in s.iterdir(base)}
-        assert "visible.lock" in names
-        assert await s.download_bytes(f"{base}/visible.lock") == b"user data"
+        assert names == {"lockfile.txt"}
         await s.rmtree(base)
-        assert not await s.exists(f"{base}/visible.lock")
 
 
 async def test_strong_renewal_handoff_survives_cancellation() -> None:

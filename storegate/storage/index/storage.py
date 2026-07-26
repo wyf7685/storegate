@@ -38,6 +38,11 @@ CHUNKS_INDEX_FILE = "/__chunks_index_id__"
 MIN_LOCK_LEASE = 0.03
 DEFAULT_LOCK_TIMEOUT = 30.0
 DEFAULT_LOCK_LEASE = 300.0
+# Lock objects live beside their subject in the index storage: ``<path>.lock``
+# for a file and ``<path>.tree`` for a tree operation. A user file carrying one
+# of these suffixes would occupy its own lock slot, so it is rejected outright
+# rather than allowed to collide with lease payloads and tombstones.
+RESERVED_SUFFIXES = (".lock", ".tree")
 
 
 class FileMeta(BaseModel):
@@ -112,6 +117,19 @@ class IndexStorage(AbstractStorage):
             lock_chunk=self._lock_chunk,
         )
         self._pending_rollback: list[AbstractStorage] = []
+
+    @staticmethod
+    def _reject_reserved(*paths: PathLike) -> None:
+        """Reject user paths that would collide with IndexStorage lock objects.
+
+        Locks are stored beside their subject as ``<path>.lock`` / ``<path>.tree``
+        in the index storage, so a user entry with one of those suffixes would
+        share a key with lease payloads and tombstones.
+        """
+        for path in paths:
+            name = AbstractStorage.normalize_path(path).name
+            if name.endswith(RESERVED_SUFFIXES):
+                raise ValueError(f"IndexStorage reserves the {RESERVED_SUFFIXES} suffixes for locks: {path}")
 
     @property
     @override
@@ -455,6 +473,7 @@ class IndexStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
+        self._reject_reserved(remote_path)
         remote_path = self.normalize_path(remote_path)
 
         try:
@@ -816,6 +835,7 @@ class IndexStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
+        self._reject_reserved(src, dst)
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
         try:
@@ -910,6 +930,7 @@ class IndexStorage(AbstractStorage):
         *,
         overwrite: bool = True,
     ) -> None:
+        self._reject_reserved(src, dst)
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
         try:
@@ -993,6 +1014,7 @@ class IndexStorage(AbstractStorage):
         parents: bool = False,
         exist_ok: bool = False,
     ) -> None:
+        self._reject_reserved(path)
         path = self.normalize_path(path)
         await lstat_private_entry_or_none(self._index, path, label="index entry")
         await self._index.mkdir(path, parents=parents, exist_ok=exist_ok)
@@ -1209,6 +1231,7 @@ class IndexStorage(AbstractStorage):
 
     @override
     async def copytree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        self._reject_reserved(src, dst)
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
         try:
@@ -1242,6 +1265,7 @@ class IndexStorage(AbstractStorage):
 
     @override
     async def movetree(self, src: PathLike, dst: PathLike, *, overwrite: bool = True) -> None:
+        self._reject_reserved(src, dst)
         src = self.normalize_path(src)
         dst = self.normalize_path(dst)
         try:

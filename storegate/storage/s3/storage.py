@@ -38,10 +38,13 @@ from .client import (
 from .utils import MultipartUploadTask, deserialize_file_info, serialize_file_info
 
 UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB
-DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB — retained for copy multipart sizing only
 # Files larger than this are copied via multipart upload to stay within
 # the CopyObject 5 GiB limit and to allow parallel part copies.
 COPY_MULTIPART_THRESHOLD = 4 * 1024 * 1024  # 4MB
+# Upper bound on concurrent per-file copies during copytree. Each copy issues
+# several sequential requests, so an unbounded fan-out would queue one task per
+# file behind the client semaphore.
+COPYTREE_MAX_WORKERS = 8
 
 
 translator = ExceptionTranslator(
@@ -753,11 +756,19 @@ class S3Storage(AbstractStorage):
                     )
                     await client.put_object(key=dir_key, data=serialize_file_info(info))
 
-            async with anyio.create_task_group() as tg:
+            async def copy_worker(
+                paths: AsyncIterable[tuple[PurePosixPath, PurePosixPath]],
+            ) -> None:
+                async for src_file, dst_file in paths:
+                    await self.copy(src_file, dst_file)
+
+            send, recv = anyio.create_memory_object_stream[tuple[PurePosixPath, PurePosixPath]](COPYTREE_MAX_WORKERS)
+            async with anyio.create_task_group() as tg, send:
+                for _ in range(COPYTREE_MAX_WORKERS):
+                    tg.start_soon(copy_worker, recv.clone())
+                recv.close()
                 for src_file in file_paths:
-                    dst_file = dst.joinpath(src_file.relative_to(src))
-                    tg.start_soon(self.copy, src_file, dst_file)
-                    await anyio.lowlevel.checkpoint()
+                    await send.send((src_file, dst.joinpath(src_file.relative_to(src))))
         except BaseException as exc:
             self.log.error(  # noqa: TRY400
                 f"Failed to copy tree: <y>{escape_tag(src)}</y> → <y>{escape_tag(dst)}</y> "

@@ -231,10 +231,9 @@ class RedisCacheBackend(CacheBackend):
 
     @override
     async def delete(self, namespace: str, key: str) -> bool:
-        try:
-            return await self._ensure_client().delete(self._rk(namespace, key)) > 0
-        except Exception:
-            return False
+        # Deliberately unguarded: a dropped delete leaves a stale positive
+        # entry readable until TTL, so the caller must see the failure.
+        return await self._ensure_client().delete(self._rk(namespace, key)) > 0
 
     @override
     async def clear(self, namespace: str | None = None) -> None:
@@ -242,13 +241,12 @@ class RedisCacheBackend(CacheBackend):
         scope_prefix = self._scope_prefix()
         pattern = f"{scope_prefix}:{namespace}:*" if namespace is not None else f"{scope_prefix}:*"
         cursor = 0
-        with contextlib.suppress(Exception):
-            while True:
-                cursor, keys = await r.scan(cursor, match=pattern, count=100)
-                if keys:
-                    await r.delete(*keys)
-                if cursor == 0:
-                    break
+        while True:
+            cursor, keys = await r.scan(cursor, match=pattern, count=100)
+            if keys:
+                await r.delete(*keys)
+            if cursor == 0:
+                break
 
     # ------------------------------------------------------------------
     # Batch / pipeline operations
@@ -260,11 +258,14 @@ class RedisCacheBackend(CacheBackend):
         for ns, key in keys:
             pipe.get(self._rk(ns, key))
         try:
-            raws: list[bytes | None] = await pipe.execute()
+            raws: list[str | bytes | None] = await pipe.execute()
         except Exception:
             return [None] * len(keys)
+        # Mirrors ``get``: a client configured with decode_responses=True hands
+        # back ``str``, which the deserializers cannot consume.
         return [
-            self._deserializers[ns](raw) if raw is not None else None for (ns, _), raw in zip(keys, raws, strict=True)
+            self._deserializers[ns](raw.encode() if isinstance(raw, str) else raw) if raw is not None else None
+            for (ns, _), raw in zip(keys, raws, strict=True)
         ]
 
     @override
@@ -282,10 +283,8 @@ class RedisCacheBackend(CacheBackend):
         pipe = self._ensure_client().pipeline(transaction=False)
         for ns, key in keys:
             pipe.delete(self._rk(ns, key))
-        try:
-            results: list[int] = await pipe.execute()
-        except Exception:
-            return 0
+        # Unguarded for the same reason as ``delete``.
+        results: list[int] = await pipe.execute()
         return sum(1 for r in results if r > 0)
 
 
