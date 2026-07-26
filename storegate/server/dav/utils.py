@@ -104,3 +104,38 @@ async def call_with_catch(resource: BaseDAVResource, func: Callable[[], Awaitabl
         logger.opt(colors=True, depth=1).exception(f"Error in DAV operation for path <y>{escape_tag(resource.path)}</>")
 
     return [(resource.get_href(), dav_error.DAVError(error))] if error is not None else True
+
+
+def _status_for(exc: Exception) -> int:
+    match exc:
+        case NotADirectoryError():
+            return dav_error.HTTP_METHOD_NOT_ALLOWED
+        case FileExistsError():
+            return dav_error.HTTP_PRECONDITION_FAILED
+        case IsADirectoryError():
+            return dav_error.HTTP_FORBIDDEN
+        case FileNotFoundError():
+            return dav_error.HTTP_NOT_FOUND
+        case PermissionError():
+            return dav_error.HTTP_FORBIDDEN
+        case _:
+            return dav_error.HTTP_INTERNAL_ERROR
+
+
+async def raise_with_catch[T](path: str, func: Callable[[], Awaitable[T]]) -> T:
+    """Run *func*, converting a storage error into a bare :class:`DAVError`.
+
+    Used by write paths that must raise rather than return a handler result.
+    wsgidav embeds ``src_exception``'s repr in the HTML error body, so the
+    original exception is logged server-side and never attached to the
+    response — backend keys, bucket names, and remote hosts stay internal.
+    """
+    try:
+        return await func()
+    except DAVError:
+        raise
+    except Exception as exc:
+        status = _status_for(exc)
+        if status == dav_error.HTTP_INTERNAL_ERROR:
+            logger.opt(colors=True, depth=1).exception(f"Error in DAV operation for path <y>{escape_tag(path)}</>")
+        raise dav_error.DAVError(status) from None

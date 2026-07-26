@@ -78,6 +78,16 @@ class WSGIMiddlewareWithLifespan(WSGIMiddleware):
 class DAVServer(AbstractServer):
     """Asynchronous WebDAV server backed by an ``AbstractStorage`` implementation.
 
+    .. warning::
+
+        **Trusted networks only.** This server performs no authentication:
+        every request is served anonymously with full read/write access to the
+        backing storage, and there is no credential option. It also speaks
+        plaintext HTTP with no TLS. Deploy it only on a loopback interface or
+        behind a reverse proxy that terminates TLS and enforces authentication.
+        Binding to a non-loopback address therefore requires an explicit
+        ``allow_insecure_public=True``.
+
     Usage::
 
         storage = MemoryStorage()
@@ -96,11 +106,23 @@ class DAVServer(AbstractServer):
         port: int = 8080,
         read_only: bool = False,
         allow_insecure_public: bool = False,
+        workers: int = 10,
+        limit_concurrency: int | None = None,
     ) -> None:
         super().__init__(storage)
+        if workers <= 0:
+            raise ValueError("workers must be a positive integer")
+        if limit_concurrency is not None and limit_concurrency <= 0:
+            raise ValueError("limit_concurrency must be a positive integer or None")
         self.host = host
         self.port = port
         self.read_only = read_only
+        self.workers = workers
+        # Every request occupies one WSGI worker thread for its whole duration
+        # and blocks there without a timeout, so the thread pool is the real
+        # capacity limit. Cap accepted connections at the pool size by default
+        # instead of letting excess connections queue invisibly.
+        self.limit_concurrency = limit_concurrency if limit_concurrency is not None else workers
 
         if not _is_loopback(host) and not allow_insecure_public:
             raise ValueError(
@@ -114,7 +136,7 @@ class DAVServer(AbstractServer):
         import uvicorn
 
         wsgi_app = create_wsgi_app(self.storage, self.host, self.port, read_only=self.read_only)
-        app = WSGIMiddlewareWithLifespan(wsgi_app, lifespan=self.storage)
+        app = WSGIMiddlewareWithLifespan(wsgi_app, workers=self.workers, lifespan=self.storage)
         config = uvicorn.Config(
             app,
             host=self.host,
@@ -123,6 +145,7 @@ class DAVServer(AbstractServer):
             log_config=None,
             lifespan="on",
             interface="asgi3",
+            limit_concurrency=self.limit_concurrency,
         )
         server = uvicorn.Server(config)
 

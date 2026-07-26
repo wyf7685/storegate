@@ -131,6 +131,19 @@ class StorageFTPProtocolServer(aioftp.Server):
 
 @final
 class FTPServer(AbstractServer):
+    """Asynchronous FTP server backed by an ``AbstractStorage`` implementation.
+
+    .. warning::
+
+        **Trusted networks only.** This server performs no authentication:
+        any ``USER`` is accepted anonymously with full read/write access to the
+        backing storage, and there is no credential option. Only plain FTP is
+        supported — no FTPS/TLS — so commands and data travel in cleartext.
+        Deploy it only on a loopback interface or an otherwise trusted network
+        segment. Binding to a non-loopback address therefore requires an
+        explicit ``allow_insecure_public=True``.
+    """
+
     def __init__(
         self,
         storage: AbstractStorage,
@@ -139,11 +152,15 @@ class FTPServer(AbstractServer):
         port: int = 2121,
         read_only: bool = False,
         allow_insecure_public: bool = False,
+        maximum_connections: int | None = 64,
     ) -> None:
         super().__init__(storage)
+        if maximum_connections is not None and maximum_connections <= 0:
+            raise ValueError("maximum_connections must be a positive integer or None")
         self.host = host
         self.port = port
         self.read_only = read_only
+        self.maximum_connections = maximum_connections
 
         if not _is_loopback(host) and not allow_insecure_public:
             raise ValueError(
@@ -152,9 +169,12 @@ class FTPServer(AbstractServer):
                 "is intentional."
             )
 
+        # Each connection pins a backend lease and a transfer buffer, so the
+        # default caps concurrent clients instead of leaving it unbounded.
         self.server = StorageFTPProtocolServer(
             users=[aioftp.User(login=None, password=None, base_path=str(Path()), home_path="/")],
             path_io_factory=StoragePathIO.with_storage(storage),
+            maximum_connections=maximum_connections,
         )
         self.server.read_only = read_only
         self.server.commands_mapping.pop("appe")

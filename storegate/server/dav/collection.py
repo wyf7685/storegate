@@ -12,6 +12,7 @@ from .utils import (
     NativeHandlerResult,
     call_with_catch,
     lstat_visible,
+    raise_with_catch,
     reject_hidden_destination,
     require_visible_directory,
     run_async,
@@ -63,7 +64,7 @@ class StorageCollection(BaseDAVCollection):
             run_async(reject_hidden_destination, self._storage, path)
         except FileNotFoundError as exc:
             raise dav_error.DAVError(dav_error.HTTP_NOT_FOUND, path) from exc
-        run_async(self._storage.upload_bytes, b"", path, overwrite=False)
+        run_async(raise_with_catch, path, functools.partial(self._storage.upload_bytes, b"", path, overwrite=False))
         return StorageResource(path, self.environ, self._storage, read_only=self._read_only)
 
     @override
@@ -75,7 +76,7 @@ class StorageCollection(BaseDAVCollection):
             run_async(reject_hidden_destination, self._storage, path)
         except FileNotFoundError as exc:
             raise dav_error.DAVError(dav_error.HTTP_NOT_FOUND, path) from exc
-        run_async(self._storage.mkdir, path)
+        run_async(raise_with_catch, path, functools.partial(self._storage.mkdir, path))
         return StorageCollection(path, self.environ, self._storage, read_only=self._read_only)
 
     @override
@@ -170,6 +171,3 @@ class StorageCollection(BaseDAVCollection):
     @override
     def support_recursive_move(self, dest_path: str) -> bool:
         return True
-
-    # @override
-    # def move_recursive(self, dest_path: str): ...

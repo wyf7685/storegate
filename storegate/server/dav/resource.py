@@ -13,6 +13,7 @@ from .utils import (
     NativeHandlerResult,
     call_with_catch,
     current_event_loop_token,
+    raise_with_catch,
     reject_hidden_destination,
     require_visible_file,
     run_async,
@@ -214,7 +215,10 @@ class StorageResource(DAVNonCollection):
 
     async def _upload_visible(self, stream: AsyncIterable[bytes]) -> None:
         await require_visible_file(self._storage, self.path)
-        await self._storage.upload_stream(stream, remote_path=self.path, overwrite=True)
+        await raise_with_catch(
+            self.path,
+            functools.partial(self._storage.upload_stream, stream, remote_path=self.path, overwrite=True),
+        )
 
     @override
     def begin_write(self, *, content_type: object = None) -> DAVWriter:
@@ -275,10 +279,8 @@ class StorageResource(DAVNonCollection):
             raise dav_error.DAVError(dav_error.HTTP_FORBIDDEN, "Server is read-only")
         run_async(require_visible_file, self._storage, self.path)
         run_async(reject_hidden_destination, self._storage, dest_path)
-        if is_move:
-            run_async(self._storage.move, self.path, dest_path)
-        else:
-            run_async(self._storage.copy, self.path, dest_path)
+        operation = self._storage.move if is_move else self._storage.copy
+        run_async(raise_with_catch, self.path, functools.partial(operation, self.path, dest_path))
 
     @override
     def support_recursive_move(self, dest_path: str) -> bool:
