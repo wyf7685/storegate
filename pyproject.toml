@@ -69,7 +69,7 @@ dev = [
   { include-group = "lint" },
   { include-group = "test" },
 ]
-lint = ["prek>=0.4.10", "ruff>=0.15.21", "ty>=0.0.61"]
+lint = ["prek>=0.4.11", "ruff>=0.16.0", "ty>=0.0.65"]
 test = [
   "storegate[standard]",
   "moto[server]>=5.2.2,<6",
