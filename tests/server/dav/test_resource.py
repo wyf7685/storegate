@@ -1,5 +1,7 @@
 """State and thread-bridge tests for DAV resources."""
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterable, AsyncIterator
 from unittest.mock import MagicMock
 

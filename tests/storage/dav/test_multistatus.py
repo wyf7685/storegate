@@ -1,5 +1,7 @@
 """Unit tests for WebDAV multistatus XML parsing (no network)."""
 
+from __future__ import annotations
+
 import pytest
 
 from storegate.storage.abstract import EntryKind, UnsupportedOperationError

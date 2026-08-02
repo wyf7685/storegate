@@ -1,5 +1,7 @@
 """Protocol-level tests for AsyncS3Client response handling."""
 
+from __future__ import annotations
+
 import contextlib
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator, Callable

@@ -1,5 +1,7 @@
 """FTPStorage behavior tests."""
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterator
 from datetime import UTC
 from pathlib import PurePosixPath

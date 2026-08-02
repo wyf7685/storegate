@@ -1,5 +1,7 @@
 """DavStorage error-path unit tests with a mocked client (no network)."""
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterator
 from pathlib import PurePosixPath
 from unittest.mock import AsyncMock, MagicMock

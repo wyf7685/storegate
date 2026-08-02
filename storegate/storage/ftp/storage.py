@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import AsyncGenerator, AsyncIterable
 from pathlib import PurePosixPath
 from typing import final, override

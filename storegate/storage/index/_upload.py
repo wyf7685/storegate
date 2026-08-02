@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 from collections.abc import AsyncIterable
 from datetime import UTC, datetime

@@ -1,5 +1,7 @@
 """FTPStorage behavior tests."""
 
+from __future__ import annotations
+
 import aioftp
 import pytest
 from pydantic import SecretStr

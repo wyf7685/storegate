@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from storegate.utils import requires_extra
 
 requires_extra("wsgidav", "a2wsgi", "uvicorn", extra_name="dav-server")

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import traceback
 from contextlib import AbstractAsyncContextManager
@@ -149,5 +151,8 @@ class DAVServer(AbstractServer):
         )
         server = uvicorn.Server(config)
 
-        with current_event_loop_token.set(anyio.lowlevel.current_token()):
+        _t = current_event_loop_token.set(anyio.lowlevel.current_token())
+        try:
             await server.serve()
+        finally:
+            current_event_loop_token.reset(_t)

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from storegate.storage.cached import CachedStorage
 from storegate.storage.cached.backend.base import DOWNLOAD, EXISTS, IS_DIR, IS_FILE, IS_SYMLINK, ITERDIR, LSTAT, STAT
 

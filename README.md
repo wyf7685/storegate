@@ -2,7 +2,7 @@
 
 # Storegate
 
-[![python](https://img.shields.io/badge/python-3.14+-blue?logo=python&logoColor=edb641)](https://www.python.org/)
+[![python](https://img.shields.io/badge/python-3.12+-blue?logo=python&logoColor=edb641)](https://www.python.org/)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![ty](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ty/main/assets/badge/v0.json)](https://github.com/astral-sh/ty)
@@ -77,7 +77,7 @@ flowchart LR
 
 ## 环境要求
 
-- Python `>= 3.14`
+- Python `>= 3.12`（CI 覆盖 Python 3.12、3.13 和 3.14）
 - [uv](https://docs.astral.sh/uv/)（推荐的依赖与运行环境管理工具）
 
 开发环境安装：

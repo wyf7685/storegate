@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import errno
 import inspect
 from collections.abc import AsyncGenerator, AsyncIterable, Callable

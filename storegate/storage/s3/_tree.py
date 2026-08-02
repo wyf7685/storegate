@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import itertools
 import uuid
 from collections.abc import AsyncIterable, Iterable

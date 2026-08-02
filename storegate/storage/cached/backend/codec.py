@@ -6,6 +6,8 @@ namespace with the codec for its value type, so a namespace's wire format is
 defined in exactly one place.
 """
 
+from __future__ import annotations
+
 import json
 from datetime import datetime
 from typing import Any

@@ -1,5 +1,7 @@
 """WebDAV multistatus XML parsing and ``DavResource`` → ``FileInfo`` conversion."""
 
+from __future__ import annotations
+
 import errno
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -101,7 +103,7 @@ def _successful_prop(response: ET.Element) -> ET.Element | None:
 def _parse_http_date(value: str) -> datetime | None:
     try:
         return parsedate_to_datetime(value)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
 
 

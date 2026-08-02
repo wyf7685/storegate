@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import hashlib
 from contextlib import AbstractContextManager

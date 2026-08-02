@@ -1,5 +1,7 @@
 """DavStorage integration tests against a local wsgidav server."""
 
+from __future__ import annotations
+
 import contextlib
 
 import pytest

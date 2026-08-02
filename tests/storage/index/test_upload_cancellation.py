@@ -1,5 +1,7 @@
 """Real AnyIO cancellation coverage for IndexStorage upload transactions."""
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterator
 
 import anyio

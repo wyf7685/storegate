@@ -13,6 +13,8 @@ The signing process:
    ``Authorization`` header.
 """
 
+from __future__ import annotations
+
 import hashlib
 import hmac
 from collections.abc import Mapping

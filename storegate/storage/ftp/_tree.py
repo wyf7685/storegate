@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import uuid
 from pathlib import PurePosixPath
 from typing import override

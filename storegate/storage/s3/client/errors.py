@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 class S3ClientError(RuntimeError):
     """Base exception raised by S3 client operations."""
 

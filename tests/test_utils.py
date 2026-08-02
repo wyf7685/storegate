@@ -1,5 +1,7 @@
 """Foundation utils contract tests."""
 
+from __future__ import annotations
+
 import contextlib
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock

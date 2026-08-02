@@ -1,5 +1,7 @@
 """Protocol integration tests for the aioftp-backed FTP server."""
 
+from __future__ import annotations
+
 from pathlib import PurePosixPath
 
 import aioftp

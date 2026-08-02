@@ -1,5 +1,7 @@
 """S3 marker-directory integration tests."""
 
+from __future__ import annotations
+
 import pytest
 
 from storegate.storage.s3 import S3Storage

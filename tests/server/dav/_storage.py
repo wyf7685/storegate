@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import errno
 from collections.abc import AsyncGenerator, AsyncIterable
 from datetime import UTC, datetime

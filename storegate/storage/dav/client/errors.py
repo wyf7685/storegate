@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 class DavClientError(RuntimeError):
     """Base exception raised by WebDAV client operations."""
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .client import AsyncS3Client
 from .errors import S3ClientError, S3HttpStatusError, S3ResponseParseError
 from .models import (

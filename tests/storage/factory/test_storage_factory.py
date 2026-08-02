@@ -1,5 +1,7 @@
 """Tests for storage factory type guards and JSON loading."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 

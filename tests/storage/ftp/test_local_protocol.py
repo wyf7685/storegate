@@ -1,5 +1,7 @@
 """FTP client integration against aioftp's local filesystem server."""
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterator
 from pathlib import Path, PurePosixPath
 

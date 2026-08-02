@@ -5,6 +5,8 @@ reference vector is the Get Object example from the AWS SigV4 documentation:
 https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
 """
 
+from __future__ import annotations
+
 from datetime import UTC, datetime
 
 from storegate.storage.s3.client.auth import AWSSigV4Signer

@@ -4,6 +4,8 @@ No real S3 credentials required — the client is replaced with a MagicMock
 and individual methods are patched per-test with ``AsyncMock`` side effects.
 """
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterator, Iterable
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from pathlib import PurePosixPath
@@ -38,7 +40,7 @@ class FileHandle(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def write(self, data: memoryview[int]) -> int:
+    async def write(self, data: memoryview) -> int:
         raise NotImplementedError
 
     @abstractmethod
@@ -99,7 +101,7 @@ class ReadHandle(FileHandle):
         return bytes(result)
 
     @override
-    async def write(self, data: memoryview[int]) -> int:
+    async def write(self, data: memoryview) -> int:
         raise NotImplementedError("Write operation is not supported for ReadHandle")
 
     @override
@@ -117,7 +119,7 @@ class WriteHandle(FileHandle):
         super().__init__(storage, path)
         self.closed = False
         self.task_group = None
-        self.send, self.recv = anyio.create_memory_object_stream[memoryview[int]](1)
+        self.send, self.recv = anyio.create_memory_object_stream[memoryview](1)
 
     @override
     async def seek(self, offset: int) -> int:
@@ -133,7 +135,7 @@ class WriteHandle(FileHandle):
             await self.storage.upload_stream(stream, self.path)
 
     @override
-    async def write(self, data: memoryview[int]) -> int:
+    async def write(self, data: memoryview) -> int:
         if self.closed:
             raise ValueError("I/O operation on closed file.")
         if self.task_group is None:

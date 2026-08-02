@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 import threading
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
@@ -129,8 +131,11 @@ class ResourceWriter:
             raise self._worker_error
 
     def _run(self) -> None:
-        with current_event_loop_token.set(self._token):
+        _t = current_event_loop_token.set(self._token)
+        try:
             run_async(self._arun)
+        finally:
+            current_event_loop_token.reset(_t)
 
     async def _arun(self) -> None:
         try:

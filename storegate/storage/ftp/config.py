@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import codecs
 from pathlib import Path, PurePosixPath
 from typing import Self

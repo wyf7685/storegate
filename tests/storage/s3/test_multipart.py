@@ -1,5 +1,7 @@
 """Focused tests for S3 multipart upload orchestration."""
 
+from __future__ import annotations
+
 from collections.abc import AsyncIterator
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock

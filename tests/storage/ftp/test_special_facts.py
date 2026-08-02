@@ -1,5 +1,7 @@
 """Explicit FTP MLSD/MLST fact classification tests."""
 
+from __future__ import annotations
+
 import errno
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager

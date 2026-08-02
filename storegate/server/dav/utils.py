@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import errno
 import functools
 from collections.abc import Awaitable, Callable, Coroutine

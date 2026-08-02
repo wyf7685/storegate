@@ -1,5 +1,7 @@
 """Tests for dict-driven object resolution."""
 
+from __future__ import annotations
+
 from copy import deepcopy
 
 import pytest

@@ -1,5 +1,7 @@
 """RedisCacheBackend tests."""
 
+from __future__ import annotations
+
 import fnmatch
 from datetime import UTC, datetime
 from pathlib import Path

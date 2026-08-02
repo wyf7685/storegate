@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import errno
@@ -367,7 +369,7 @@ class SFTPStorage(AbstractStorage):
             final = index == len(parts) - 1
             try:
                 attrs = await self._io(client.lstat(self._remote_path(current)))
-            except asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath:
+            except (asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath):
                 if allow_missing_final:
                     return None
                 raise
@@ -396,7 +398,7 @@ class SFTPStorage(AbstractStorage):
     async def _lstat_or_none(self, client: asyncssh.SFTPClient, logical: PurePosixPath) -> FileInfo | None:
         try:
             return await self._lstat_info(client, logical)
-        except asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath, FileNotFoundError:
+        except (asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath, FileNotFoundError):
             return None
 
     @staticmethod
@@ -502,7 +504,7 @@ class SFTPStorage(AbstractStorage):
     async def _stat_or_none(self, client: asyncssh.SFTPClient, logical: PurePosixPath) -> FileInfo | None:
         try:
             return await self._stat_info(client, logical)
-        except asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath, FileNotFoundError:
+        except (asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath, FileNotFoundError):
             return None
 
     @override

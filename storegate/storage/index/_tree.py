@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 from pathlib import PurePosixPath
 from typing import NoReturn, override
@@ -28,7 +30,7 @@ class IndexTreeMixin(IndexStorageBase):
         try:
             data = await download_private_file(self._index, entry_path, label="tree entry")
             return _is_tombstone(data)
-        except FileNotFoundError, OSError:
+        except (FileNotFoundError, OSError):
             return False
 
     async def _collect_tree(

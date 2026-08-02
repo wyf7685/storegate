@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from storegate.utils import httpx
 
 from .models import DavConfig

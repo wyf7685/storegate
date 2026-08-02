@@ -1,5 +1,7 @@
 """IndexStorage behavior tests."""
 
+from __future__ import annotations
+
 import contextlib
 
 from storegate.storage.index import IndexStorage

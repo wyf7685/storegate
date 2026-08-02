@@ -7,6 +7,7 @@ on:
     paths:
       - "storegate/**"
       - "tests/**"
+      - "scripts/**"
       - ".github/workflows/ci.yml"
       - "pyproject.toml"
       - "uv.lock"
@@ -17,6 +18,7 @@ on:
     paths:
       - "storegate/**"
       - "tests/**"
+      - "scripts/**"
       - ".github/workflows/ci.yml"
       - "pyproject.toml"
       - "uv.lock"
@@ -50,11 +52,16 @@ jobs:
         run: uv run --no-sync ty check
 
   test:
-    name: Test & Coverage
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
     concurrency:
-      group: test-coverage-${{ github.ref }}
+      group: test-${{ matrix.os }}-${{ matrix.python-version }}-${{ github.ref }}
       cancel-in-progress: true
 
     steps:
@@ -63,47 +70,27 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
 
       - name: Install dependencies
         run: uv sync --no-dev --group test && uv run --no-sync python -c "from storegate.utils import httpx; assert httpx.__name__ == 'httpx', httpx.__name__"
 
-      - name: Run Pytest
-        run: uv run --no-sync pytest -m "not s3" --cov=storegate --cov-branch --cov-report=xml
+      - name: Run tests
+        run: uv run --no-sync pytest -m "not s3" --cov=storegate --cov-branch --cov-report=xml -rs
 
       - name: Install dependencies with httpx2
+        if: runner.os == 'Linux'
         run: uv sync --no-dev --group test --extra httpx2 && uv run --no-sync python -c "from storegate.utils import httpx; assert httpx.__name__ == 'httpx2', httpx.__name__"
 
-      - name: Run Pytest with httpx2
+      - name: Run tests with httpx2
+        if: runner.os == 'Linux'
         run: uv run --no-sync pytest -m "httpx and not s3" --no-cov
 
       - name: Upload coverage report
+        if: runner.os == 'Linux' && matrix.python-version == '3.14'
         uses: codecov/codecov-action@v7
         with:
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-  windows:
-    name: Windows Test & Coverage
-    runs-on: windows-latest
-    needs: lint
-    concurrency:
-      group: windows-test-${{ github.ref }}
-      cancel-in-progress: true
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          python-version: "3.14"
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv sync --no-dev --group test
-
-      - name: Run tests with branch coverage and skip reasons
-        run: uv run --no-sync pytest -m "not s3" --cov=storegate --cov-branch --cov-report=xml -rs

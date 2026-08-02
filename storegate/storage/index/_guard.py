@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import errno
 
 from storegate.storage import AbstractStorage, EntryKind, FileInfo, UnsupportedOperationError

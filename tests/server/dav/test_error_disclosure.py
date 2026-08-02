@@ -6,6 +6,8 @@ escapes untranslated therefore leaks backend identifiers -- S3 keys, bucket
 names, SFTP hosts -- to whoever made the request.
 """
 
+from __future__ import annotations
+
 import functools
 from collections.abc import AsyncIterable, AsyncIterator
 from typing import override

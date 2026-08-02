@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from storegate.storage.abstract import AbstractStorage
 
 

@@ -1,5 +1,7 @@
 """Construction-time tests for the DAV server — no running server needed."""
 
+from __future__ import annotations
+
 from storegate.server.dav import DAVServer
 from storegate.storage.memory import MemoryStorage
 

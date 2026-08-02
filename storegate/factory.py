@@ -11,6 +11,8 @@ Usage:
     )
 """
 
+from __future__ import annotations
+
 from storegate.server.factory import resolve_server as resolve_server
 from storegate.storage.factory import resolve_storage as resolve_storage
 from storegate.utils import (

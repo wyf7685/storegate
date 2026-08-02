@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import functools
 import importlib
@@ -16,7 +18,7 @@ from collections.abc import (
 from enum import StrEnum
 from pathlib import Path
 from types import CoroutineType
-from typing import TYPE_CHECKING, Any, Concatenate, Literal, TypedDict, Unpack, cast
+from typing import TYPE_CHECKING, Any, Concatenate, Literal, TypedDict, Unpack, cast, get_type_hints
 
 from pydantic import TypeAdapter
 
@@ -37,7 +39,7 @@ else:
 try:
     import ayafileio as _ayafileio
 
-    async def open_file_rb(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> AsyncGenerator[memoryview[int]]:
+    async def open_file_rb(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> AsyncGenerator[memoryview]:
         async with _ayafileio.open(path, "rb") as file:
             async for chunk in file.chunk(chunk_size):
                 yield chunk
@@ -50,7 +52,7 @@ try:
 except ImportError:
     import anyio as _anyio
 
-    async def open_file_rb(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> AsyncGenerator[memoryview[int]]:
+    async def open_file_rb(path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> AsyncGenerator[memoryview]:
         async with await _anyio.open_file(path, "rb") as file:
             while True:
                 chunk = await file.read(chunk_size)
@@ -287,11 +289,14 @@ def resolve_object(
         raise AttributeError(f"Failed to resolve factory {factory_str!r}: {e}") from e
 
     if inspect.isclass(factory):
-        sig = inspect.signature(factory.__init__)
+        target = factory.__init__
     elif inspect.isfunction(factory):
-        sig = inspect.signature(factory)
+        target = factory
     else:
         raise TypeError(f"Factory is not a class or function: {factory.__class__.__name__!r}")
+
+    sig = inspect.signature(target)
+    type_hints = get_type_hints(target)
 
     if len(spec) == 1:
         return factory()
@@ -303,8 +308,10 @@ def resolve_object(
         if isinstance(value, dict) and _FACTORY_KEY in value:
             resolved_args[key] = resolve_object(value, mode=mode, _depth=_depth + 1)
         else:
-            if (param := sig.parameters.get(key)) and param.annotation is not param.empty:
-                value = TypeAdapter(param.annotation).validate_python(value)
+            if param := sig.parameters.get(key):
+                annotation = type_hints.get(key, param.annotation)
+                if annotation is not param.empty:
+                    value = TypeAdapter(annotation).validate_python(value)
             resolved_args[key] = value
     return factory(**resolved_args)
 

@@ -25,7 +25,7 @@ uv sync --group dev
 uv sync --no-dev --group test
 ```
 
-本项目使用 Python 3.14，包管理器为 `uv`。pytest 配置在 `pyproject.toml` 的 `[tool.pytest.ini_options]`，含 `asyncio_mode = "auto"`。已配置 `prek` pre-commit hooks（ruff 检查 + 格式化 + ty 检查）。
+本项目支持 Python 3.12 及以上版本，默认开发解释器为 Python 3.14，包管理器为 `uv`。pytest 配置在 `pyproject.toml` 的 `[tool.pytest.ini_options]`，含 `asyncio_mode = "auto"`。已配置 `prek` pre-commit hooks（ruff 检查 + 格式化 + ty 检查）。
 
 ### 包命名空间与可选依赖
 
@@ -63,7 +63,7 @@ Agent 编写代码时须遵守以下纪律：
 ## 代码风格
 
 **Ruff 配置** (`ruff.toml`)：
-- 行长 120 字符，缩进 4 空格，目标 Python 3.14
+- 行长 120 字符，缩进 4 空格，最低目标 Python 3.12
 - 格式化：双引号、LF 换行、空格缩进
 - 启用规则集：Pyflakes、pycodestyle、pyupgrade、Ruff、eradicate、flynt、refurb、isort、PEP8-naming、pandas-vet、Perflint、pygrep-hooks、tryceratops、flake8-async、flake8-annotations、flake8-bandit、flake8-builtins、flake8-bugbear、flake8-comprehensions、flake8-datetimez、flake8-debugger、flake8-errmsg、flake8-future-annotations、flake8-implicit-str-concat、flake8-import-conventions、flake8-pie、flake8-print、flake8-pyi、flake8-pytest-style、flake8-quotes、flake8-raise、flake8-return、flake8-self、flake8-simplify、flake8-slots、flake8-tidy-imports、flake8-unused-arguments、flake8-use-pathlib、flake8-type-checking、flake8-2020
 - 测试文件 (`tests/*.py`) 特殊豁免：允许 `print`、访问私有成员、硬编码密码（mock 用途）、阻塞方法

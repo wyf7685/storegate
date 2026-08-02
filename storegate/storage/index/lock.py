@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import dataclasses
 import json
@@ -104,7 +106,7 @@ class StorageFileLocker:
                 return
             await storage.unlink(lock_path, missing_ok=True)
             self.log.trace(f"Lock <y>{escape_tag(lock_path)}</y> released")
-        except FileNotFoundError, KeyError, TypeError, ValueError, UnicodeDecodeError:
+        except (FileNotFoundError, KeyError, TypeError, ValueError, UnicodeDecodeError):
             return
 
     async def _best_effort_renew(self, lease: LockLease) -> None:
@@ -179,7 +181,7 @@ class StorageFileLocker:
                                 try:
                                     lock_data = json.loads(lock_bytes.decode())
                                     stale = datetime.fromisoformat(lock_data["expires"]) <= datetime.now(UTC)
-                                except KeyError, TypeError, ValueError, UnicodeDecodeError:
+                                except (KeyError, TypeError, ValueError, UnicodeDecodeError):
                                     try:
                                         info = await lstat_private_entry(storage, lock_path, label="lock file")
                                         stale = (
@@ -314,7 +316,7 @@ class StorageFileLocker:
                             lock_data = json.loads(current_vb.data.decode())
                             stale = datetime.fromisoformat(lock_data["expires"]) <= datetime.now(UTC)
                             stale = stale or lock_data.get("released", False)
-                        except KeyError, TypeError, ValueError, UnicodeDecodeError:
+                        except (KeyError, TypeError, ValueError, UnicodeDecodeError):
                             stale = False
                         if stale:
                             expires = now + timedelta(seconds=handoff_timeout + self._renewal_validity())

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import dataclasses
 import errno
@@ -436,7 +438,7 @@ class AbstractStorage(ABC):
         remote_path = self.normalize_path(remote_path)
         buf = memoryview(data).toreadonly()
 
-        async def aiterable() -> AsyncIterable[memoryview[int]]:
+        async def aiterable() -> AsyncIterable[memoryview]:
             ptr = 0
             while ptr < len(buf):
                 yield buf[ptr : ptr + 8192]

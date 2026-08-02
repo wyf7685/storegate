@@ -1,5 +1,7 @@
 """Construction-time tests for the FTP server — no running server needed."""
 
+from __future__ import annotations
+
 from storegate.server.ftp import FTPServer
 from storegate.storage.memory import MemoryStorage
 

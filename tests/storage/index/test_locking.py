@@ -1,5 +1,7 @@
 """Bounded, owner-safe IndexStorage locking tests."""
 
+from __future__ import annotations
+
 import dataclasses
 import json
 import math

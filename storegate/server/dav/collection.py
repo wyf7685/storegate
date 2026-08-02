@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 from pathlib import PurePosixPath
 from typing import final, override

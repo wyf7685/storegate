@@ -1,5 +1,7 @@
 """IndexStorage behavior tests."""
 
+from __future__ import annotations
+
 import contextlib
 import hashlib
 from unittest.mock import AsyncMock

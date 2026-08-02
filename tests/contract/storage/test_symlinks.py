@@ -1,5 +1,7 @@
 """Capability-gated symbolic-link contracts for AbstractStorage."""
 
+from __future__ import annotations
+
 import contextlib
 import errno
 
